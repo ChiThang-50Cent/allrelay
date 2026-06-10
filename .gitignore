@@ -1,0 +1,45 @@
+# Build outputs
+scrcpy/x/
+scrcpy/server/build/
+scrcpy/server/.cxx/
+scrcpy/.gradle/
+scrcpy/build/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Gradle
+.gradle/
+local.properties
+
+# Built binaries (build scripts produce these)
+bin/*
+!bin/*.jar
+
+# C/C++
+*.o
+*.lo
+*.la
+*.a
+*.so
+*.so.*
+
+# Go
+cmd/mdns-discover/mdns-discover
+
+# Temporary logs / test output
+/tmp/
+*.log
+
+# Python
+__pycache__/
+*.pyc
