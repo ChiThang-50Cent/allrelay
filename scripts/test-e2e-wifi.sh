@@ -27,10 +27,14 @@ TEST_TIMEOUT=8  # seconds to let client run before verifying
 cleanup() {
     echo -e "\n${BLUE}[cleanup]${NC} Stopping server..."
     adb shell "pkill -f scrcpy-server" 2>/dev/null || true
+    if [ -n "$SERVER_SHELL_PID" ]; then
+        kill $SERVER_SHELL_PID 2>/dev/null || true
+    fi
     if [ -n "$CLIENT_PID" ]; then
         kill $CLIENT_PID 2>/dev/null || true
         wait $CLIENT_PID 2>/dev/null || true
     fi
+    rm -f "$SERVER_LOG" "$CLIENT_OUT" 2>/dev/null
 }
 
 trap cleanup EXIT INT TERM
@@ -103,14 +107,14 @@ adb shell "CLASSPATH=$SERVER_PATH app_process / com.genymobile.scrcpy.Server \
     send_device_meta=true \
     send_frame_meta=true \
     send_stream_meta=true \
-    log_level=info" > "$SERVER_LOG" 2>&1 &
+    log_level=debug" > "$SERVER_LOG" 2>&1 &
 SERVER_SHELL_PID=$!
 
-# Wait for server to be ready (poll port)
+# Wait for server to be ready (check log output)
 echo -n "Waiting for server..."
 for i in $(seq 1 10); do
     sleep 1
-    if timeout 1 bash -c "echo '' | nc -w 1 $PHONE_IP 5000 >/dev/null 2>&1"; then
+    if grep -q "Wi-Fi" "$SERVER_LOG" 2>/dev/null; then
         echo -e " ${GREEN}ready${NC}"
         SERVER_READY=true
         break
