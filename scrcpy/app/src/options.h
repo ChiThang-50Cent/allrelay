@@ -344,6 +344,7 @@ struct scrcpy_options {
     bool keep_active;
     bool flex_display;
     bool wifi_mode; // AllRelay: bypass ADB, connect directly via Wi-Fi
+    bool multistream; // AllRelay: enable multi-stream (screen + camera)
 };
 
 extern const struct scrcpy_options scrcpy_options_default;

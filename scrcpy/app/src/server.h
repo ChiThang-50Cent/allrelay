@@ -79,7 +79,8 @@ struct sc_server_params {
 
     // AllRelay Wi-Fi mode
     bool wifi_mode;     // bypass ADB, connect directly to phone IP
-    uint16_t wifi_port; // base port (video=port, audio=port+2, control=port+4)
+    uint16_t wifi_port; // base port (video=port+0, camera=port+1, mic=port+2, speaker=port+3, control=port+4)
+    bool multistream;   // enable multi-stream (screen + camera simultaneous)
 };
 
 struct sc_server {
@@ -99,7 +100,9 @@ struct sc_server {
     struct sc_adb_tunnel tunnel;
 
     sc_socket video_socket;
+    sc_socket camera_socket;
     sc_socket audio_socket;
+    sc_socket speaker_socket;
     sc_socket control_socket;
 
     const struct sc_server_callbacks *cbs;

@@ -50,6 +50,7 @@ enum {
     OPT_TUNNEL_PORT,
     OPT_WIFI_MODE,
     OPT_WIFI_PORT,
+    OPT_MULTISTREAM,
     OPT_NO_CLIPBOARD_AUTOSYNC,
     OPT_TCPIP,
     OPT_RAW_KEY_EVENTS,
@@ -934,8 +935,15 @@ static const struct sc_option options[] = {
         .longopt = "wifi-port",
         .argdesc = "port",
         .text = "Set the base TCP port for Wi-Fi connections (AllRelay). "
-                "Default is 5000. Streams use: port+0 (video), "
-                "port+2 (audio), port+4 (control).",
+                "Default is 5000. Streams use: port+0 (video screen), "
+                "port+1 (camera), port+2 (mic), port+3 (speaker), port+4 (control).",
+    },
+    {
+        .longopt_id = OPT_MULTISTREAM,
+        .longopt = "multistream",
+        .text = "Enable multi-stream mode: stream screen + camera "
+                "simultaneously on separate ports (AllRelay). "
+                "Requires --wifi.",
     },
     {
         .shortopt = 'v',
@@ -2583,6 +2591,9 @@ parse_args_with_getopt(struct scrcpy_cli_args *args, int argc, char *argv[],
                     return false;
                 }
                 break;
+            case OPT_MULTISTREAM:
+                opts->multistream = true;
+                break;
             case 'n':
                 opts->control = false;
                 break;
@@ -3213,6 +3224,11 @@ parse_args_with_getopt(struct scrcpy_cli_args *args, int argc, char *argv[],
         }
         LOGI("Wi-Fi mode: connecting to %08x:%u", opts->tunnel_host,
              opts->wifi_port);
+    }
+
+    if (opts->multistream && !opts->wifi_mode) {
+        LOGE("--multistream requires --wifi (Wi-Fi mode)");
+        return false;
     }
 
     if (opts->video_source == SC_VIDEO_SOURCE_CAMERA) {

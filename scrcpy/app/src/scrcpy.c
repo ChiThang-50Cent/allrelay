@@ -407,6 +407,7 @@ scrcpy(struct scrcpy_options *options) {
         .list = options->list,
         .wifi_mode = options->wifi_mode,
         .wifi_port = options->wifi_port,
+        .multistream = options->multistream,
     };
 
     static const struct sc_server_callbacks cbs = {
@@ -513,6 +514,10 @@ scrcpy(struct scrcpy_options *options) {
         sc_demuxer_init(&s->video_demuxer, "video", s->server.video_socket,
                         &video_demuxer_cbs, NULL);
     }
+
+    // TODO(Phase 3): Add demuxer for camera_socket (port+1).
+    // Currently connected but data is dropped — the Go server handles
+    // multi-stream in Phase 2. C client camera path will be wired in Phase 3.
 
     if (options->audio) {
         static const struct sc_demuxer_callbacks audio_demuxer_cbs = {

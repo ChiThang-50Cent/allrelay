@@ -2,7 +2,7 @@
 
 > Protocol version: 1  
 > Date: 2026-06-11  
-> Scope: Phase 1 (screen mirroring over raw TCP)
+> Scope: Phase 2 (multi-stream over raw TCP with 16-byte header)
 
 ---
 
@@ -14,13 +14,13 @@ audio, and control.
 
 ### Port Allocation
 
-| Stream  | Port Offset | Port (default) | Direction     |
-|---------|------------|----------------|---------------|
-| Video   | +0         | 5000           | Android → PC  |
-| Camera  | +1         | 5001           | Android → PC  |
-| Mic     | +2         | 5002           | Android → PC  |
-| Speaker | +3         | 5003           | PC → Android  |
-| Control | +4         | 5004           | Bidirectional |
+| Stream  | Port Offset | Port (default) | Stream ID | Direction     |
+|---------|------------|----------------|-----------|---------------|
+| Video   | +0         | 5000           | 0x00000001 (SCREEN) | Android → PC  |
+| Camera  | +1         | 5001           | 0x00000002 (CAMERA) | Android → PC  |
+| Mic     | +2         | 5002           | 0x00000003 (MIC)    | Android → PC  |
+| Speaker | +3         | 5003           | 0x00000004 (SPEAKER)| PC → Android  |
+| Control | +4         | 5004           | —          | Bidirectional |
 
 ---
 
@@ -81,7 +81,7 @@ any data packets. This tells the client which decoder to use.
 | FLAC     | 0x664C6143  | "fLaC"        |
 | RAW      | 0x00726177  | "\0raw"       |
 
-### Phase 4: Session Metadata (video only)
+### Phase 4: Session Metadata (video streams: screen + camera)
 
 ```
    │  16 bytes: session header       │  writeSessionMeta()
@@ -98,7 +98,7 @@ Layout (big-endian):
 | 12     | 4    | `packet_size` (= 0 for meta)|
 
 For session packets:
-- `stream_id`: enum value (SCREEN=1, CAMERA=2, MIC=3, SPEAKER=4)
+- `stream_id`: enum value (SCREEN=0x00000001, CAMERA=0x00000002, MIC=0x00000003, SPEAKER=0x00000004)
 - `flags`: `PACKET_FLAG_SESSION` (bit 63) set, bit 0 = client_resize flag
 - The width and height follow after this 16-byte header in the session payload
 
@@ -138,7 +138,7 @@ Byte offset  Content
 85+          Data packets (16-byte header + payload)
 ```
 
-### Example (H.264 screen mirroring)
+### Example (H.264 screen mirroring, port 5000)
 
 ```
 Offset  Hex                                          ASCII
@@ -146,9 +146,21 @@ Offset  Hex                                          ASCII
 00      AB                                           ·       [dummy byte]
 01      53 4D 2D 46 37 31 31 42 00 00 00 00 00 ...  SM-F711B [device name, 64B]
 41      68 32 36 34                                  h264    [codec: H.264]
-45      00 00 00 01 80 00 00 00 WW WW HH HH         ····.... [session: stream=1, WxH]
-55      SS SS SS SS PP PP PP PP PP PP PP PP LL LL    ········ [packet: stream+PTS+len]
+45      00 00 00 01 80 00 00 00 WW WW HH HH         ····.... [session: stream=1, W×H, flags=0x80...]
+55      SS SS SS SS PP PP PP PP PP PP PP PP LL LL    ········ [packet: stream+PTS+len, 16B header]
 65      <H.264 encoded frame data>                           [payload]
+```
+
+### Example (camera, port 5001)
+
+```
+Offset  Hex                                          ASCII
+──────  ───────────────────────────────────────────  ─────
+00      AB                                           ·       [dummy byte]
+41      68 32 36 34                                  h264    [codec: H.264]
+45      00 00 00 02 80 00 00 00 WW WW HH HH         ··...... [session: stream=CAMERA(2)]
+55      SS SS SS SS PP PP PP PP PP PP PP PP LL LL    ········ [packet: stream+PTS+len, 16B header]
+65      <H.264 camera frame data>                            [payload]
 ```
 
 ---
@@ -173,6 +185,9 @@ Offset  Hex                                          ASCII
 | Server lifecycle   | Started by client via ADB     | Must be pre-started        |
 | Device discovery   | ADB device list               | mDNS (_allrelay._tcp)      |
 | Control channel    | Bidirectional LocalSocket     | TCP port 5004 (Phase 3)    |
+| Header format      | Original scrcpy (12-byte)     | AllRelay 16-byte header    |
+| Camera stream      | Not supported                 | TCP port 5001              |
+| Speaker stream     | Not supported                 | TCP port 5003 (reverse)    |
 
 ---
 

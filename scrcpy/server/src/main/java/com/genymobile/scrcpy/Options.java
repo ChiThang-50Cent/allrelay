@@ -89,6 +89,7 @@ public class Options {
     // AllRelay Wi-Fi mode options
     private boolean wifiMode = false; // use direct Wi-Fi instead of ADB tunnel
     private int wifiPort = 5000; // base port for Wi-Fi connections
+    private boolean multistream = false; // enable multi-stream (screen + camera simultaneous)
 
     public Ln.Level getLogLevel() {
         return logLevel;
@@ -325,6 +326,10 @@ public class Options {
 
     public int getWifiPort() {
         return wifiPort;
+    }
+
+    public boolean isMultistream() {
+        return multistream;
     }
 
     @SuppressWarnings("MethodLength")
@@ -578,6 +583,9 @@ public class Options {
                     break;
                 case "wifi_port":
                     options.wifiPort = Integer.parseInt(value);
+                    break;
+                case "multistream":
+                    options.multistream = Boolean.parseBoolean(value);
                     break;
                 default:
                     Ln.w("Unknown server option: " + key);

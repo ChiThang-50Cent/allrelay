@@ -6,7 +6,9 @@ import com.genymobile.scrcpy.audio.AudioDirectCapture;
 import com.genymobile.scrcpy.audio.AudioEncoder;
 import com.genymobile.scrcpy.audio.AudioPlaybackCapture;
 import com.genymobile.scrcpy.audio.AudioRawRecorder;
+import com.genymobile.scrcpy.audio.AudioReversePlayback;
 import com.genymobile.scrcpy.audio.AudioSource;
+import com.genymobile.scrcpy.audio.WifiAudioEncoder;
 import com.genymobile.scrcpy.control.ControlChannel;
 import com.genymobile.scrcpy.control.Controller;
 import com.genymobile.scrcpy.device.DesktopConnection;
@@ -21,8 +23,10 @@ import com.genymobile.scrcpy.opengl.OpenGLRunner;
 import com.genymobile.scrcpy.util.Ln;
 import com.genymobile.scrcpy.util.LogUtils;
 
+import java.io.InputStream;
 import java.io.OutputStream;
 import com.genymobile.scrcpy.video.CameraCapture;
+import com.genymobile.scrcpy.video.MultiCapture;
 import com.genymobile.scrcpy.video.NewDisplayCapture;
 import com.genymobile.scrcpy.video.ScreenCapture;
 import com.genymobile.scrcpy.video.SurfaceCapture;
@@ -106,6 +110,7 @@ public final class Server {
         boolean audio = options.getAudio();
         boolean sendDummyByte = options.getSendDummyByte();
         boolean wifiMode = options.isWifiMode();
+        boolean multistream = options.isMultistream();
 
         Workarounds.apply();
 
@@ -122,9 +127,13 @@ public final class Server {
 
             // Note: mDNS is handled by AllRelayService Kotlin wrapper (needs Android Context)
 
+            boolean cameraEnabled = multistream && video;
+            boolean speakerEnabled = audio;
+
             WifiConnection wifiConn;
             try {
-                wifiConn = WifiConnection.open(video, audio, control, wifiPort);
+                wifiConn = WifiConnection.open(video, cameraEnabled, audio,
+                        speakerEnabled, control, wifiPort);
             } catch (IOException e) {
                 Ln.e("Failed to open Wi-Fi connection: " + e.getMessage());
                 return;
@@ -141,47 +150,111 @@ public final class Server {
                 }
 
                 if (audio) {
-                    Ln.i("Audio streaming deferred to Phase 2 (Wi-Fi mode)");
+                    // Mic stream (port 5002): capture → encode → Wi-Fi
+                    OutputStream audioOutputStream = wifiConn.getAudioOutputStream();
+                    if (audioOutputStream != null) {
+                        AudioSource audioSource = options.getAudioSource();
+                        AudioCapture audioCapture;
+                        if (audioSource.isDirect()) {
+                            audioCapture = new AudioDirectCapture(audioSource);
+                        } else {
+                            audioCapture = new AudioPlaybackCapture(options.getAudioDup());
+                        }
+
+                        StreamId audioStreamId = audioSource.isDirect()
+                                ? StreamId.MIC : StreamId.SPEAKER;
+                        WifiStreamer audioStreamer = new WifiStreamer(audioOutputStream,
+                                options.getAudioCodec(), audioStreamId,
+                                options.getSendStreamMeta(), options.getSendFrameMeta());
+
+                        WifiAudioEncoder audioEncoder = new WifiAudioEncoder(
+                                audioCapture, audioStreamer, options);
+                        asyncProcessors.add(audioEncoder);
+                        Ln.i("Wi-Fi mic stream enabled on port " + (wifiPort + 2));
+                    }
+
+                    // Speaker stream (port 5003): PC → phone reverse audio
+                    InputStream speakerInputStream = wifiConn.getSpeakerInputStream();
+                    if (speakerInputStream != null) {
+                        AudioReversePlayback reversePlayback = new AudioReversePlayback(
+                                speakerInputStream);
+                        asyncProcessors.add(reversePlayback);
+                        Ln.i("Wi-Fi speaker stream enabled on port " + (wifiPort + 3));
+                    }
                 }
 
                 // Video streaming over Wi-Fi
                 if (video) {
-                    StreamId videoStreamId = options.getVideoSource() == VideoSource.CAMERA
-                            ? StreamId.CAMERA : StreamId.SCREEN;
                     OutputStream videoOutputStream = wifiConn.getVideoOutputStream();
+                    OutputStream cameraOutputStream = wifiConn.getCameraOutputStream();
 
-                    if (videoOutputStream != null) {
-                        WifiStreamer wifiStreamer = new WifiStreamer(videoOutputStream,
-                                options.getVideoCodec(), videoStreamId,
-                                options.getSendStreamMeta(), options.getSendFrameMeta());
+                    if (multistream) {
+                        // Multi-stream mode: screen + camera simultaneous
+                        Ln.i("Multi-stream mode: screen + camera enabled");
 
-                        // Note: writeVideoHeader() is called by WifiSurfaceEncoder.streamCapture()
+                        ScreenCapture screenCapture = new ScreenCapture(controller, options);
+                        CameraCapture cameraCapture = new CameraCapture(options);
 
-                        SurfaceCapture surfaceCapture;
-                        if (options.getVideoSource() == VideoSource.DISPLAY) {
-                            NewDisplay newDisplay = options.getNewDisplay();
-                            if (newDisplay != null) {
-                                surfaceCapture = new NewDisplayCapture(controller, options);
-                            } else {
-                                int displayId = options.getDisplayId();
-                                if (displayId == Device.DISPLAY_ID_NONE) {
-                                    displayId = 0;
-                                }
-                                surfaceCapture = new ScreenCapture(controller, options);
-                            }
-                        } else {
-                            surfaceCapture = new CameraCapture(options);
+                        WifiStreamer screenStreamer = null;
+                        WifiStreamer cameraStreamer = null;
+
+                        if (videoOutputStream != null) {
+                            screenStreamer = new WifiStreamer(videoOutputStream,
+                                    options.getVideoCodec(), StreamId.SCREEN,
+                                    options.getSendStreamMeta(), options.getSendFrameMeta());
+                        }
+                        if (cameraOutputStream != null) {
+                            cameraStreamer = new WifiStreamer(cameraOutputStream,
+                                    options.getVideoCodec(), StreamId.CAMERA,
+                                    options.getSendStreamMeta(), options.getSendFrameMeta());
                         }
 
-                        WifiSurfaceEncoder surfaceEncoder = new WifiSurfaceEncoder(
-                                surfaceCapture, wifiStreamer, options);
-                        asyncProcessors.add(surfaceEncoder);
+                        MultiCapture multiCapture = new MultiCapture(
+                                screenCapture, cameraCapture,
+                                screenStreamer, cameraStreamer,
+                                options);
+                        List<AsyncProcessor> processors = multiCapture.createProcessors();
+                        asyncProcessors.addAll(processors);
 
                         if (controller != null) {
-                            controller.setSurfaceCapture(surfaceCapture);
+                            controller.setSurfaceCapture(screenCapture);
                         }
                     } else {
-                        Ln.e("Failed to get video output stream");
+                        // Single-stream mode (original behavior)
+                        StreamId videoStreamId = options.getVideoSource() == VideoSource.CAMERA
+                                ? StreamId.CAMERA : StreamId.SCREEN;
+
+                        if (videoOutputStream != null) {
+                            WifiStreamer wifiStreamer = new WifiStreamer(videoOutputStream,
+                                    options.getVideoCodec(), videoStreamId,
+                                    options.getSendStreamMeta(), options.getSendFrameMeta());
+
+                            SurfaceCapture surfaceCapture;
+                            if (options.getVideoSource() == VideoSource.DISPLAY) {
+                                NewDisplay newDisplay = options.getNewDisplay();
+                                if (newDisplay != null) {
+                                    surfaceCapture = new NewDisplayCapture(controller, options);
+                                } else {
+                                    int displayId = options.getDisplayId();
+                                    if (displayId == Device.DISPLAY_ID_NONE) {
+                                        displayId = 0;
+                                    }
+                                    surfaceCapture = new ScreenCapture(controller, options);
+                                }
+                            } else {
+                                surfaceCapture = new CameraCapture(options);
+                            }
+
+                            WifiSurfaceEncoder surfaceEncoder = new WifiSurfaceEncoder(
+                                    surfaceCapture, wifiStreamer, options);
+                            asyncProcessors.add(surfaceEncoder);
+
+                            if (controller != null) {
+                                controller.setSurfaceCapture(surfaceCapture);
+                            }
+                        } else {
+                            Ln.e("Failed to get video output stream");
+                        }
                     }
                 }
 
@@ -197,9 +270,14 @@ public final class Server {
                 Looper.loop();
 
                 wifiConn.shutdown();
-                wifiConn.close();
             } catch (IOException e) {
                 Ln.e("Wi-Fi connection error: " + e.getMessage());
+            } finally {
+                try {
+                    wifiConn.close();
+                } catch (IOException e) {
+                    // Connection already closed or broken — ignore
+                }
             }
             return;
         }

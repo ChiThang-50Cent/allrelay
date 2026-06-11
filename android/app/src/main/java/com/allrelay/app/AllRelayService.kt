@@ -111,21 +111,33 @@ class AllRelayService : Service() {
         updateStreamConfig()
     }
 
+    // TODO(Phase 3): Replace broken app_process launch with Magisk daemon.
+    // The current command doesn't set CLASSPATH and doesn't work via Runtime.exec().
+    // Phase 3 will replace this with a native daemon started via Magisk module.
     private fun startScrcpyServer() {
         try {
+            val hasScreen = activeStreams.contains("screen")
+            val hasCamera = activeStreams.contains("camera")
+            val hasMic = activeStreams.contains("mic")
+            val hasSpeaker = activeStreams.contains("speaker")
+            val multistream = hasScreen && hasCamera
+
             // Build scrcpy-server command with Wi-Fi mode
             val cmd = buildString {
                 append("app_process / com.genymobile.scrcpy.Server")
                 append(" 4.0") // version
                 append(" wifi_mode=true")
                 append(" wifi_port=5000")
-                append(" video=${activeStreams.contains("screen") || activeStreams.contains("camera")}")
-                append(" audio=${activeStreams.contains("mic") || activeStreams.contains("speaker")}")
+                append(" video=${hasScreen || hasCamera}")
+                append(" audio=${hasMic || hasSpeaker}")
                 append(" control=true")
                 append(" send_device_meta=true")
                 append(" send_frame_meta=true")
                 append(" send_dummy_byte=true")
                 append(" send_stream_meta=true")
+                if (multistream) {
+                    append(" multistream=true")
+                }
             }
 
             Log.i(TAG, "Starting scrcpy-server: $cmd")

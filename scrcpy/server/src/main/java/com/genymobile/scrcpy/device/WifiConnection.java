@@ -4,6 +4,7 @@ import com.genymobile.scrcpy.util.Ln;
 
 import java.io.Closeable;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
@@ -43,17 +44,24 @@ public final class WifiConnection implements Closeable {
     private static final int DUMMY_BYTE = 0xAB;
 
     private final Socket videoSocket;
+    private final Socket cameraSocket;
     private final Socket audioSocket;
+    private final Socket speakerSocket;
     private final Socket controlSocket;
 
     private ServerSocket videoServerSocket;
+    private ServerSocket cameraServerSocket;
     private ServerSocket audioServerSocket;
+    private ServerSocket speakerServerSocket;
     private ServerSocket controlServerSocket;
 
-    private WifiConnection(Socket videoSocket, Socket audioSocket,
+    private WifiConnection(Socket videoSocket, Socket cameraSocket,
+                           Socket audioSocket, Socket speakerSocket,
                            Socket controlSocket) throws IOException {
         this.videoSocket = videoSocket;
+        this.cameraSocket = cameraSocket;
         this.audioSocket = audioSocket;
+        this.speakerSocket = speakerSocket;
         this.controlSocket = controlSocket;
     }
 
@@ -63,21 +71,28 @@ public final class WifiConnection implements Closeable {
      * The PC client connects to these ports. Each accepted connection
      * sends a dummy byte so the client can detect a working connection.
      *
-     * @param video    whether to listen for video stream
-     * @param audio    whether to listen for audio stream
+     * @param video    whether to listen for video (screen) stream
+     * @param camera   whether to listen for camera stream
+     * @param audio    whether to listen for mic stream (outbound)
+     * @param speaker  whether to listen for speaker stream (inbound, PC→phone)
      * @param control  whether to listen for control channel
-     * @param basePort starting port number (video=basePort, camera=basePort+1, etc.)
+     * @param basePort starting port number (video=basePort, camera=basePort+1, mic=+2, spk=+3, ctrl=+4)
      * @return the established connection
      * @throws IOException if binding or accepting fails
      */
-    public static WifiConnection open(boolean video, boolean audio, boolean control,
+    public static WifiConnection open(boolean video, boolean camera, boolean audio,
+                                      boolean speaker, boolean control,
                                       int basePort) throws IOException {
         Socket videoSocket = null;
+        Socket cameraSocket = null;
         Socket audioSocket = null;
+        Socket speakerSocket = null;
         Socket controlSocket = null;
 
         ServerSocket videoServer = null;
+        ServerSocket cameraServer = null;
         ServerSocket audioServer = null;
+        ServerSocket speakerServer = null;
         ServerSocket controlServer = null;
 
         try {
@@ -86,9 +101,17 @@ public final class WifiConnection implements Closeable {
                 videoServer = bindAndListen(basePort);
                 Ln.d("Wi-Fi video listening on port " + basePort);
             }
+            if (camera) {
+                cameraServer = bindAndListen(basePort + 1); // PORT_CAMERA
+                Ln.d("Wi-Fi camera listening on port " + (basePort + 1));
+            }
             if (audio) {
                 audioServer = bindAndListen(basePort + 2); // PORT_MIC
-                Ln.d("Wi-Fi audio listening on port " + (basePort + 2));
+                Ln.d("Wi-Fi audio (mic) listening on port " + (basePort + 2));
+            }
+            if (speaker) {
+                speakerServer = bindAndListen(basePort + 3); // PORT_SPEAKER
+                Ln.d("Wi-Fi speaker listening on port " + (basePort + 3));
             }
             if (control) {
                 controlServer = bindAndListen(basePort + 4); // PORT_CONTROL
@@ -96,43 +119,60 @@ public final class WifiConnection implements Closeable {
             }
 
             // Accept connections (blocking, with timeout)
-            // Video is required, audio and control are optional
+            // Video is required, camera/audio/speaker/control are optional
             if (videoServer != null) {
                 videoSocket = acceptConnection(videoServer, "video");
             }
-            // Audio is optional - don't fail if client doesn't connect
+            if (cameraServer != null) {
+                try {
+                    cameraSocket = acceptConnection(cameraServer, "camera");
+                } catch (IOException e) {
+                    Ln.w("Camera connection not established (client may have skipped it): " + e.getMessage());
+                }
+            }
             if (audioServer != null) {
                 try {
                     audioSocket = acceptConnection(audioServer, "audio");
                 } catch (IOException e) {
                     Ln.w("Audio connection not established (client may have skipped it): " + e.getMessage());
-                    // Continue without audio socket
                 }
             }
-            // Control is optional - don't fail if client doesn't connect
+            if (speakerServer != null) {
+                try {
+                    speakerSocket = acceptConnection(speakerServer, "speaker");
+                } catch (IOException e) {
+                    Ln.w("Speaker connection not established (client may have skipped it): " + e.getMessage());
+                }
+            }
             if (controlServer != null) {
                 try {
                     controlSocket = acceptConnection(controlServer, "control");
                 } catch (IOException e) {
                     Ln.w("Control connection not established (client may have skipped it): " + e.getMessage());
-                    // Continue without control socket
                 }
             }
 
             // Close server sockets after all connections established
             closeServerSocket(videoServer);
+            closeServerSocket(cameraServer);
             closeServerSocket(audioServer);
+            closeServerSocket(speakerServer);
             closeServerSocket(controlServer);
 
-            return new WifiConnection(videoSocket, audioSocket, controlSocket);
+            return new WifiConnection(videoSocket, cameraSocket, audioSocket,
+                                     speakerSocket, controlSocket);
 
         } catch (IOException | RuntimeException e) {
             // Cleanup on failure
             closeSocket(videoSocket);
+            closeSocket(cameraSocket);
             closeSocket(audioSocket);
+            closeSocket(speakerSocket);
             closeSocket(controlSocket);
             closeServerSocket(videoServer);
+            closeServerSocket(cameraServer);
             closeServerSocket(audioServer);
+            closeServerSocket(speakerServer);
             closeServerSocket(controlServer);
             throw e;
         }
@@ -143,7 +183,7 @@ public final class WifiConnection implements Closeable {
      */
     public static WifiConnection open(boolean video, boolean audio,
                                       boolean control) throws IOException {
-        return open(video, audio, control, PORT_VIDEO);
+        return open(video, false, audio, false, control, PORT_VIDEO);
     }
 
     private static ServerSocket bindAndListen(int port) throws IOException {
@@ -214,8 +254,14 @@ public final class WifiConnection implements Closeable {
         if (videoSocket != null) {
             return videoSocket;
         }
+        if (cameraSocket != null) {
+            return cameraSocket;
+        }
         if (audioSocket != null) {
             return audioSocket;
+        }
+        if (speakerSocket != null) {
+            return speakerSocket;
         }
         return controlSocket;
     }
@@ -225,9 +271,17 @@ public final class WifiConnection implements Closeable {
             videoSocket.shutdownInput();
             videoSocket.shutdownOutput();
         }
+        if (cameraSocket != null) {
+            cameraSocket.shutdownInput();
+            cameraSocket.shutdownOutput();
+        }
         if (audioSocket != null) {
             audioSocket.shutdownInput();
             audioSocket.shutdownOutput();
+        }
+        if (speakerSocket != null) {
+            speakerSocket.shutdownInput();
+            speakerSocket.shutdownOutput();
         }
         if (controlSocket != null) {
             controlSocket.shutdownInput();
@@ -238,16 +292,34 @@ public final class WifiConnection implements Closeable {
     @Override
     public void close() throws IOException {
         closeSocket(videoSocket);
+        closeSocket(cameraSocket);
         closeSocket(audioSocket);
+        closeSocket(speakerSocket);
         closeSocket(controlSocket);
     }
 
     /**
-     * Get output stream for video data.
-     * Use this to write video packets to the PC client.
+     * Get output stream for video (screen) data.
+     * Use this to write screen video packets to the PC client.
      */
     public OutputStream getVideoOutputStream() throws IOException {
         return videoSocket != null ? videoSocket.getOutputStream() : null;
+    }
+
+    /**
+     * Get output stream for camera data.
+     * Use this to write camera video packets to the PC client.
+     */
+    public OutputStream getCameraOutputStream() throws IOException {
+        return cameraSocket != null ? cameraSocket.getOutputStream() : null;
+    }
+
+    /**
+     * Get input stream for speaker data (PC → phone reverse audio).
+     * Use this to read Opus-encoded speaker audio from the PC client.
+     */
+    public InputStream getSpeakerInputStream() throws IOException {
+        return speakerSocket != null ? speakerSocket.getInputStream() : null;
     }
 
     /**

@@ -569,7 +569,9 @@ sc_server_init(struct sc_server *server, const struct sc_server_params *params,
     server->stopped = false;
 
     server->video_socket = SC_SOCKET_NONE;
+    server->camera_socket = SC_SOCKET_NONE;
     server->audio_socket = SC_SOCKET_NONE;
+    server->speaker_socket = SC_SOCKET_NONE;
     server->control_socket = SC_SOCKET_NONE;
 
     sc_adb_tunnel_init(&server->tunnel);
@@ -605,8 +607,10 @@ device_read_info(struct sc_intr *intr, sc_socket device_socket,
  * Connect to Android device via direct Wi-Fi (AllRelay mode).
  *
  * Connects to separate ports for each stream:
- *   base_port + 0 = video
- *   base_port + 2 = audio
+ *   base_port + 0 = video (screen)
+ *   base_port + 1 = camera (when multistream)
+ *   base_port + 2 = audio (mic)
+ *   base_port + 3 = speaker (reverse, PC→phone)
  *   base_port + 4 = control
  *
  * The server (Android) sends a dummy byte on each connection.
@@ -614,6 +618,7 @@ device_read_info(struct sc_intr *intr, sc_socket device_socket,
 static bool
 sc_server_connect_wifi(struct sc_server *server, struct sc_server_info *info) {
     bool video = server->params.video;
+    bool multistream = server->params.multistream;
     bool audio = server->params.audio;
     bool control = server->params.control;
 
@@ -644,15 +649,35 @@ sc_server_connect_wifi(struct sc_server *server, struct sc_server_info *info) {
         }
     }
 
-    // Connect to audio port (base_port + 2)
+    // Connect to camera port (base_port + 1), optional
+    if (multistream && video) {
+        uint16_t camera_port = base_port + 1;
+        LOGD("Connecting to camera port %u", camera_port);
+        server->camera_socket = connect_to_server(server, attempts, delay,
+                                                  host, camera_port);
+        if (server->camera_socket == SC_SOCKET_NONE) {
+            LOGW("Could not connect to camera port (stream may be disabled)");
+        }
+    }
+
+    // Connect to audio (mic) port (base_port + 2)
     if (audio) {
         uint16_t audio_port = base_port + 2;
-        LOGD("Connecting to audio port %u", audio_port);
+        LOGD("Connecting to audio (mic) port %u", audio_port);
         server->audio_socket = connect_to_server(server, attempts, delay,
                                                  host, audio_port);
         if (server->audio_socket == SC_SOCKET_NONE) {
             LOGE("Could not connect to audio port");
             goto fail;
+        }
+
+        // Connect to speaker port (base_port + 3) — reverse direction
+        uint16_t speaker_port = base_port + 3;
+        LOGD("Connecting to speaker port %u", speaker_port);
+        server->speaker_socket = connect_to_server(server, attempts, delay,
+                                                   host, speaker_port);
+        if (server->speaker_socket == SC_SOCKET_NONE) {
+            LOGW("Could not connect to speaker port (stream may be disabled)");
         }
     }
 
@@ -668,13 +693,13 @@ sc_server_connect_wifi(struct sc_server *server, struct sc_server_info *info) {
         }
     }
 
-    // Read device name from video socket (first stream to connect)
+    // Read device name from an inbound stream socket (skip speaker: it's PC→phone write-only)
     sc_socket info_socket = server->video_socket;
     if (info_socket == SC_SOCKET_NONE) {
-        info_socket = server->audio_socket;
+        info_socket = server->camera_socket;
     }
     if (info_socket == SC_SOCKET_NONE) {
-        info_socket = server->control_socket;
+        info_socket = server->audio_socket;
     }
     if (info_socket != SC_SOCKET_NONE) {
         bool ok = device_read_info(&server->intr, info_socket, info);
@@ -691,9 +716,17 @@ fail:
         net_close(server->video_socket);
         server->video_socket = SC_SOCKET_NONE;
     }
+    if (server->camera_socket != SC_SOCKET_NONE) {
+        net_close(server->camera_socket);
+        server->camera_socket = SC_SOCKET_NONE;
+    }
     if (server->audio_socket != SC_SOCKET_NONE) {
         net_close(server->audio_socket);
         server->audio_socket = SC_SOCKET_NONE;
+    }
+    if (server->speaker_socket != SC_SOCKET_NONE) {
+        net_close(server->speaker_socket);
+        server->speaker_socket = SC_SOCKET_NONE;
     }
     if (server->control_socket != SC_SOCKET_NONE) {
         net_close(server->control_socket);
@@ -1168,8 +1201,14 @@ run_server(void *data) {
         if (server->video_socket != SC_SOCKET_NONE) {
             net_interrupt(server->video_socket);
         }
+        if (server->camera_socket != SC_SOCKET_NONE) {
+            net_interrupt(server->camera_socket);
+        }
         if (server->audio_socket != SC_SOCKET_NONE) {
             net_interrupt(server->audio_socket);
+        }
+        if (server->speaker_socket != SC_SOCKET_NONE) {
+            net_interrupt(server->speaker_socket);
         }
         if (server->control_socket != SC_SOCKET_NONE) {
             net_interrupt(server->control_socket);
@@ -1261,9 +1300,19 @@ run_server(void *data) {
         net_interrupt(server->video_socket);
     }
 
+    if (server->camera_socket != SC_SOCKET_NONE) {
+        // There is no camera_socket if camera is not enabled
+        net_interrupt(server->camera_socket);
+    }
+
     if (server->audio_socket != SC_SOCKET_NONE) {
         // There is no audio_socket if --no-audio is set
         net_interrupt(server->audio_socket);
+    }
+
+    if (server->speaker_socket != SC_SOCKET_NONE) {
+        // There is no speaker_socket if audio is not enabled
+        net_interrupt(server->speaker_socket);
     }
 
     if (server->control_socket != SC_SOCKET_NONE) {
@@ -1333,8 +1382,14 @@ sc_server_destroy(struct sc_server *server) {
     if (server->video_socket != SC_SOCKET_NONE) {
         net_close(server->video_socket);
     }
+    if (server->camera_socket != SC_SOCKET_NONE) {
+        net_close(server->camera_socket);
+    }
     if (server->audio_socket != SC_SOCKET_NONE) {
         net_close(server->audio_socket);
+    }
+    if (server->speaker_socket != SC_SOCKET_NONE) {
+        net_close(server->speaker_socket);
     }
     if (server->control_socket != SC_SOCKET_NONE) {
         net_close(server->control_socket);
