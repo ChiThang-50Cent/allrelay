@@ -1,6 +1,6 @@
 # AllRelay - Current Work
 
-> **Last updated:** 2026-06-11 14:15
+> **Last updated:** 2026-06-11 23:00
 > **Current phase:** Phase 4 — Root & Polish ✅ (ALL TASKS DONE)
 > **Next milestone:** Tag v0.4.0-alpha, flash Magisk module qua Manager
 
@@ -328,6 +328,10 @@ Phase 4: Root & Polish       [██████████] 100%  Target: Week
 | 2026-06-11 | Speaker live capture works (pulsesrc @DEFAULT_MONITOR@) ONLY after pipewire restart. CBR opusenc frame-size=20 needed for Android MediaCodec. |
 | 2026-06-11 | AudioReversePlayback: fixed CHANNEL_IN_STEREO→CHANNEL_OUT_STEREO, config packet handling, first-payload alignment. |
 | 2026-06-11 | Phase 4 COMPLETE ✅ - All 8/8 tasks done, ADB-tested on SM-F711B. Fixed wifi_mode=true bug in daemon/service.sh |
+| 2026-06-11 | Mic handler rewrite: FIFO + filesrc + pulsesink approach (reliable). Buffer 25 packets before pipeline start. Ogg CRC32 fixed (non-reflected polynomial). PulseAudio null-sink + remap-source for Edge detection. |
+| 2026-06-11 | Camera: ffmpeg YUYV 1920x1080 via v4l2loopback with exclusive_caps=1. Edge detects as "AllRelay Cam". |
+| 2026-06-11 | Edge audio fix: PulseAudio module-remap-source creates proper Audio/Source for Edge. Default source/sink set. |
+| 2026-06-11 | Speaker still blocked: PipeWire IEC958 graph suspend. PulseAudio null-sink created for Edge output. |
 | 2026-06-11 | Phase 4 STARTED 🔄 - Magisk module, root features, install script, docs, adaptive bitrate |
 | 2026-06-11 | Phase 3.5 CLEANUP ✅ - removed debug logs, updated docs, fixed TODOs, tag v0.3.0-alpha |
 | 2026-06-11 | Phase 3 COMPLETE ✅ All 6/6 tasks. MANUAL TESTED on SM-F711B (Android 15). Fixed 6 critical bugs (see Bug Fixes section) |
