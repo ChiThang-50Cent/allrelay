@@ -40,8 +40,8 @@ public final class WifiConnection implements Closeable {
     public static final int PORT_SPEAKER = 5003;
     public static final int PORT_CONTROL = 5004;
 
-    private static final int ACCEPT_TIMEOUT_MS = 30000; // 30 seconds (mandatory: video, control)
-    private static final int ACCEPT_TIMEOUT_OPTIONAL_MS = 3000; // 3 seconds (optional: camera, mic, speaker)
+    private static final int ACCEPT_TIMEOUT_MS = 10000; // 10 seconds (mandatory: video, control)
+    private static final int ACCEPT_TIMEOUT_OPTIONAL_MS = 10000; // 10 seconds (optional: camera, mic, speaker)
     private static final int DUMMY_BYTE = 0xAB;
 
     private final Socket videoSocket;
@@ -145,7 +145,9 @@ public final class WifiConnection implements Closeable {
                         // where client waits for device name but server waits
                         // for control/mic/speaker connections).
                         sendDeviceMetaAsync(acceptedVideo[0]);
-                    } catch (IOException ignored) {}
+                    } catch (IOException e) {
+                        closeServerSocket(fVideoServer);
+                    }
                 }, "accept-video");
                 acceptThreads.add(t);
                 t.start();
@@ -153,7 +155,7 @@ public final class WifiConnection implements Closeable {
             if (fCameraServer != null) {
                 Thread t = new Thread(() -> {
                     try { acceptedCamera[0] = acceptConnection(fCameraServer, "camera"); }
-                    catch (IOException ignored) {}
+                    catch (IOException e) { closeServerSocket(fCameraServer); }
                 }, "accept-camera");
                 acceptThreads.add(t);
                 t.start();
@@ -161,7 +163,7 @@ public final class WifiConnection implements Closeable {
             if (fAudioServer != null) {
                 Thread t = new Thread(() -> {
                     try { acceptedAudio[0] = acceptConnection(fAudioServer, "audio"); }
-                    catch (IOException ignored) {}
+                    catch (IOException e) { closeServerSocket(fAudioServer); }
                 }, "accept-audio");
                 acceptThreads.add(t);
                 t.start();
@@ -169,7 +171,7 @@ public final class WifiConnection implements Closeable {
             if (fSpeakerServer != null) {
                 Thread t = new Thread(() -> {
                     try { acceptedSpeaker[0] = acceptConnection(fSpeakerServer, "speaker"); }
-                    catch (IOException ignored) {}
+                    catch (IOException e) { closeServerSocket(fSpeakerServer); }
                 }, "accept-speaker");
                 acceptThreads.add(t);
                 t.start();
@@ -177,28 +179,27 @@ public final class WifiConnection implements Closeable {
             if (fControlServer != null) {
                 Thread t = new Thread(() -> {
                     try { acceptedControl[0] = acceptConnection(fControlServer, "control"); }
-                    catch (IOException ignored) {}
+                    catch (IOException e) { closeServerSocket(fControlServer); }
                 }, "accept-control");
                 acceptThreads.add(t);
                 t.start();
             }
 
-            // Wait for mandatory accept threads (video, control) to complete.
-            // Optional threads (camera, audio, speaker) join with a short timeout
-            // to avoid blocking startup when the client skips those ports.
-            final long OPTIONAL_TIMEOUT_MS = 4000;
+            // Wait for all accept threads with a shared deadline.
+            // Without a deadline, the main thread could block forever if
+            // a client skips some ports (e.g., camera-only mode).
+            // Each thread's ServerSocket also has a timeout, so they
+            // will complete on their own within ACCEPT_TIMEOUT_MS.
+            final long DEADLINE_MS = 12000; // overall deadline + buffer
+            final long deadline = System.currentTimeMillis() + DEADLINE_MS;
 
             for (Thread t : acceptThreads) {
-                String tname = t.getName();
-                boolean isOptional = tname.startsWith("accept-camera")
-                        || tname.startsWith("accept-audio")
-                        || tname.startsWith("accept-speaker");
+                long remaining = deadline - System.currentTimeMillis();
+                if (remaining <= 0) {
+                    break;
+                }
                 try {
-                    if (isOptional) {
-                        t.join(OPTIONAL_TIMEOUT_MS);
-                    } else {
-                        t.join();
-                    }
+                    t.join(remaining);
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                 }

@@ -23,6 +23,7 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/allrelay/allrelay-server/internal/bitrate"
 	"github.com/allrelay/allrelay-server/internal/control"
 	"github.com/allrelay/allrelay-server/internal/heartbeat"
 	"github.com/allrelay/allrelay-server/internal/input"
@@ -42,6 +43,7 @@ func main() {
 	noInput := flag.Bool("no-input", false, "Disable input capture (keyboard/mouse → phone)")
 	noHeartbeat := flag.Bool("no-heartbeat", false, "Disable heartbeat/status monitoring")
 	noReconnect := flag.Bool("no-reconnect", false, "Disable auto-reconnection")
+	noAdaptive := flag.Bool("no-adaptive", false, "Disable adaptive bitrate control")
 	verbose := flag.Bool("v", false, "Verbose debug output")
 	flag.Parse()
 
@@ -147,8 +149,10 @@ func main() {
 	slog.Info("Streaming... Press Ctrl+C to stop.")
 
 	// Start heartbeat monitor (UDP port 5005)
+	var hm *heartbeat.Monitor
 	if !*noHeartbeat {
-		hm, err := heartbeat.NewMonitor(heartbeat.DefaultPort)
+		var err error
+		hm, err = heartbeat.NewMonitor(heartbeat.DefaultPort)
 		if err != nil {
 			slog.Warn("Heartbeat monitor unavailable", "error", err)
 		} else {
@@ -157,6 +161,12 @@ func main() {
 			go displayStatus(hm, *noReconnect)
 			slog.Info("Heartbeat monitor: listening", "port", heartbeat.DefaultPort)
 		}
+	}
+
+	// Adaptive bitrate controller — adjusts video bitrates based on Wi-Fi quality
+	if !*noAdaptive && hm != nil && ctrl != nil {
+		go runAdaptiveBitrate(hm, ctrl)
+		slog.Info("Adaptive bitrate: enabled")
 	}
 
 	// Wait for interrupt or stream error
@@ -186,6 +196,10 @@ func makeScreenHandler(pipeline *video.Pipeline) protocol.StreamHandler {
 		byteCount += uint64(len(payload))
 
 		if header.IsConfig() {
+			// Skip the 4-byte codec ID header (not real config)
+			if len(payload) <= 4 {
+				return nil
+			}
 			haveConfig = true
 			annexB := video.ConfigToAnnexB(payload)
 			if _, err := pipeline.Write(annexB); err != nil {
@@ -231,9 +245,17 @@ func makeCameraHandler(pipeline *video.Pipeline) protocol.StreamHandler {
 		frameCount++
 		byteCount += uint64(len(payload))
 
-		// Write config (SPS/PPS) before any key frames
+		// Write config (SPS/PPS) before any key frames.
+		// Skip the 4-byte codec ID header (sent via writeVideoHeader)
+		// which is not real H.264 config data.
 		if header.IsConfig() {
+			if len(payload) <= 4 {
+				// Skip codec ID header — not SPS/PPS
+				slog.Debug("camera: skipping codec ID header", "bytes", len(payload))
+				return nil
+			}
 			haveConfig = true
+			slog.Debug("camera config hex", "hex", fmt.Sprintf("%x", payload))
 			// Convert to Annex B format for GStreamer byte-stream decoder
 			annexB := video.ConfigToAnnexB(payload)
 			if _, err := pipeline.Write(annexB); err != nil {
@@ -355,4 +377,31 @@ func displayStatus(hm *heartbeat.Monitor, noReconnect bool) {
 
 		_ = noReconnect // TODO(Phase 4): trigger reconnection on heartbeat loss
 	}
+}
+
+// runAdaptiveBitrate runs the adaptive bitrate control loop.
+// It monitors heartbeat status updates and adjusts video bitrates
+// based on Wi-Fi quality metrics (RTT, packet loss, jitter).
+func runAdaptiveBitrate(hm *heartbeat.Monitor, ctrl *control.Channel) {
+	// Create the bitrate setter callback
+	setter := func(streamID int, bitrateBPS int) error {
+		return ctrl.Send(control.Message{
+			Type:     control.TypeConfig,
+			StreamID: streamID,
+			Bitrate:  bitrateBPS,
+		})
+	}
+
+	cfg := bitrate.DefaultConfig()
+	streams := bitrate.DefaultStreamConfigs()
+	controller := bitrate.NewController(cfg, streams, setter)
+
+	for status := range hm.Updates() {
+		changes := controller.UpdateFromHeartbeat(status)
+		if len(changes) > 0 {
+			controller.ApplyChanges(changes)
+		}
+	}
+
+	slog.Info("Adaptive bitrate controller stopped")
 }

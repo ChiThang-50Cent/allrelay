@@ -1,0 +1,116 @@
+#!/system/bin/sh
+# AllRelay Daemon Wrapper
+#
+# This script launches the AllRelay Java server via app_process.
+# It's the entry point for the Magisk module service.
+#
+# Usage:
+#   allrelay-daemon [start|stop|status|restart]
+
+MODDIR="/data/adb/modules/allrelay"
+SERVER_JAR="$MODDIR/system/bin/scrcpy-server-allrelay.jar"
+PID_FILE="/data/allrelay/logs/allrelay.pid"
+LOG_FILE="/data/allrelay/logs/allrelay.log"
+
+log() {
+    echo "[$(date '+%H:%M:%S')] $1" >> "$LOG_FILE"
+}
+
+is_running() {
+    if [ -f "$PID_FILE" ]; then
+        local pid=$(cat "$PID_FILE")
+        if kill -0 "$pid" 2>/dev/null; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+do_start() {
+    if is_running; then
+        echo "AllRelay is already running (PID: $(cat "$PID_FILE"))"
+        return 0
+    fi
+
+    if [ ! -f "$SERVER_JAR" ]; then
+        echo "ERROR: Server JAR not found at $SERVER_JAR"
+        echo "Please reinstall the AllRelay Magisk module."
+        return 1
+    fi
+
+    log "Starting AllRelay daemon..."
+    
+    nohup sh -c "
+        CLASSPATH='$SERVER_JAR' \
+        app_process / com.genymobile.scrcpy.Server \
+            4.0 \
+            log_level=info \
+            max_size=2640 \
+            wifi_mode=true \
+            wifi_port=5000 \
+            max_fps=60 \
+            video_codec=h264 \
+            audio_source=mic \
+            multistream=true \
+            >> '$LOG_FILE' 2>&1
+    " &
+    
+    echo $! > "$PID_FILE"
+    log "Daemon started (PID: $!)"
+    echo "AllRelay started (PID: $!)"
+    
+    # Verify after 2 seconds
+    sleep 2
+    if is_running; then
+        echo "AllRelay is running ✓"
+    else
+        echo "WARNING: AllRelay may have failed to start. Check $LOG_FILE"
+    fi
+}
+
+do_stop() {
+    if is_running; then
+        local pid=$(cat "$PID_FILE")
+        log "Stopping AllRelay (PID: $pid)..."
+        kill "$pid" 2>/dev/null
+        sleep 1
+        # Force kill if still running
+        kill -9 "$pid" 2>/dev/null || true
+        rm -f "$PID_FILE"
+        pkill -f "scrcpy-server" 2>/dev/null || true
+        echo "AllRelay stopped"
+    else
+        echo "AllRelay is not running"
+    fi
+}
+
+do_status() {
+    if is_running; then
+        local pid=$(cat "$PID_FILE")
+        local uptime=$(ps -o etime= -p "$pid" 2>/dev/null | tr -d ' ')
+        echo "AllRelay is running"
+        echo "  PID:     $pid"
+        echo "  Uptime:  ${uptime:-unknown}"
+        echo "  Log:     $LOG_FILE"
+    else
+        echo "AllRelay is not running"
+    fi
+}
+
+do_restart() {
+    echo "Restarting AllRelay..."
+    do_stop
+    sleep 2
+    do_start
+}
+
+case "${1:-start}" in
+    start)   do_start ;;
+    stop)    do_stop ;;
+    status)  do_status ;;
+    restart) do_restart ;;
+    *)
+        echo "Usage: allrelay-daemon {start|stop|status|restart}"
+        exit 1
+        ;;
+esac

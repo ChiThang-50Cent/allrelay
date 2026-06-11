@@ -46,6 +46,18 @@ __pycache__/
 
 # Go binary (built in package root by accident)
 allrelay-server/allrelay-server
+allrelay-server/bin/
 
-# Phase 3 test script (generated, not for commit)
+# Magisk build artifact (rebuilt by scripts/build-magisk.sh)
+magisk/system/bin/scrcpy-server-allrelay.jar
+
+# Docs, plans, research (not code)
+AGENTS.md
+RESEARCH_REPORT.md
+SPEC.md
+docs/research/
+plans/
+
+# Generated test scripts
 scripts/test-phase3.sh
+allrelay-server/bin/

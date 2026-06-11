@@ -60,7 +60,9 @@ func NewPipeline(name, pipeline string) (*Pipeline, error) {
 		done:     make(chan error, 1),
 	}
 
-	if err := p.start(); err != nil {
+	// gst-launch-1.0 requires each token as a separate argument
+	args := append([]string{"-q"}, strings.Fields(pipeline)...)
+	if err := p.startCmd("gst-launch-1.0", args); err != nil {
 		return nil, fmt.Errorf("start pipeline %q: %w", name, err)
 	}
 
@@ -68,14 +70,10 @@ func NewPipeline(name, pipeline string) (*Pipeline, error) {
 	return p, nil
 }
 
-// start launches the gst-launch-1.0 subprocess.
-func (p *Pipeline) start() error {
-	// gst-launch-1.0 requires each token of the pipeline as a separate argument.
-	// For example: gst-launch-1.0 -q fdsrc fd=0 ! h264parse ! fakesink
-	// Not: gst-launch-1.0 -q "fdsrc fd=0 ! h264parse ! fakesink"
-	args := []string{"-q"}
-	args = append(args, strings.Fields(p.pipeline)...)
-	p.cmd = exec.Command("gst-launch-1.0", args...)
+// startCmd launches the given command as a subprocess and sets up
+// stdin piping and error monitoring.
+func (p *Pipeline) startCmd(command string, args []string) error {
+	p.cmd = exec.Command(command, args...)
 
 	var err error
 	p.stdin, err = p.cmd.StdinPipe()
@@ -92,12 +90,11 @@ func (p *Pipeline) start() error {
 
 	if err := p.cmd.Start(); err != nil {
 		p.stdin.Close()
-		return fmt.Errorf("start gst-launch-1.0: %w", err)
+		return fmt.Errorf("start %s: %w", command, err)
 	}
 
 	// Monitor the process in background
 	go func() {
-		// Read stderr for error messages
 		errBuf := make([]byte, 4096)
 		n, _ := stderr.Read(errBuf)
 		err := p.cmd.Wait()
@@ -181,18 +178,42 @@ func (p *Pipeline) Done() <-chan error {
 	return p.done
 }
 
-// CameraPipeline creates a pipeline that routes decoded video to a
-// v4l2loopback device, making it available as a virtual webcam.
-//
-// The pipeline: H.264 stdin → decode → convert to YUY2 → v4l2sink
+// CameraPipeline creates a pipeline that decodes H.264 from stdin and
+// writes decoded frames to a v4l2loopback device using FFmpeg.
+// FFmpeg handles the decode + YUY2 conversion + V4L2 output.
 //
 // device is the v4l2loopback device path, e.g. "/dev/video10".
 func CameraPipeline(device string) (*Pipeline, error) {
-	pipeline := fmt.Sprintf(
-		"fdsrc fd=0 ! h264parse ! avdec_h264 ! videoconvert ! video/x-raw,format=YUY2 ! v4l2sink device=%s sync=false",
+	// ffmpeg -loglevel error -f h264 -i pipe:0 -pix_fmt yuyv422 -f v4l2 /dev/video10
+	args := []string{
+		"-loglevel", "error",
+		"-f", "h264",
+		"-i", "pipe:0",
+		"-pix_fmt", "yuyv422",
+		"-f", "v4l2",
 		device,
-	)
-	return NewPipeline("camera", pipeline)
+	}
+	return NewCmdPipeline("camera", "ffmpeg", args)
+}
+
+// NewCmdPipeline creates a pipeline that runs an arbitrary command
+// and pipes data to its stdin.
+func NewCmdPipeline(name, command string, args []string) (*Pipeline, error) {
+	if name == "" {
+		return nil, errors.New("pipeline name required")
+	}
+
+	p := &Pipeline{
+		name: name,
+		done: make(chan error, 1),
+	}
+
+	if err := p.startCmd(command, args); err != nil {
+		return nil, fmt.Errorf("start pipeline %q: %w", name, err)
+	}
+
+	slog.Info("Pipeline started", "name", name, "cmd", command)
+	return p, nil
 }
 
 // MonitorPipeline creates a pipeline that displays decoded video

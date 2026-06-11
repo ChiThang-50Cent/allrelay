@@ -1,0 +1,93 @@
+# AllRelay SELinux Policy
+#
+# Defines the security context for the AllRelay daemon process.
+# This allows the daemon to access hardware devices (camera, audio,
+# display, input) while running in a confined domain.
+#
+# The policy is automatically loaded by Magisk 20.4+ from either:
+#   - sepolicy.rule file in the module root
+#   - sepolicy/ directory in the module root
+#
+# For Magisk >= 20.4, place this file at:
+#   /data/adb/modules/allrelay/sepolicy.rule
+#
+# Rule format: Magisk sepolicy rule syntax
+#   "allow source_type target_type:class { permissions };"
+
+# ─── Domain definition ────────────────────────────────────────────
+# Allow the daemon to transition to its own domain
+type allrelay_daemon, domain;
+type allrelay_daemon_exec, exec_type, file_type, system_file_type;
+allow allrelay_daemon allrelay_daemon_exec:file { read getattr map execute open execute_no_trans entrypoint };
+allow allrelay_daemon system_file:file { execute_no_trans };
+
+# ─── Camera access ────────────────────────────────────────────────
+# Grant access to camera HAL and camera devices
+allow allrelay_daemon camera_device:chr_file { open read write ioctl getattr };
+allow allrelay_daemon video_device:chr_file { open read write ioctl getattr };
+allow allrelay_daemon cameraserver_service:service_manager find;
+allow allrelay_daemon mediacodec_service:service_manager find;
+allow allrelay_daemon mediaextractor_service:service_manager find;
+
+# ─── Audio access ─────────────────────────────────────────────────
+# Grant access to audio hardware and AudioFlinger
+allow allrelay_daemon audio_device:chr_file { open read write ioctl getattr };
+allow allrelay_daemon sound_device:chr_file { open read write ioctl getattr };
+allow allrelay_daemon audioserver_service:service_manager find;
+allow allrelay_daemon mediaserver_service:service_manager find;
+
+# ─── Network access ───────────────────────────────────────────────
+# Wi-Fi data transport
+allow allrelay_daemon self:tcp_socket { create connect bind listen accept write read setopt getopt };
+allow allrelay_daemon self:udp_socket { create bind write read setopt getopt };
+allow allrelay_daemon node:tcp_socket node_bind;
+allow allrelay_daemon node:udp_socket node_bind;
+allow allrelay_daemon port:tcp_socket name_bind;
+allow allrelay_daemon port:udp_socket name_bind;
+
+# mDNS discovery (multicast)
+allow allrelay_daemon self:netlink_socket { create bind read write };
+# allow multicast for mDNS on port 5353
+# allow allrelay_daemon port:udp_socket { name_bind } 5353;
+
+# ─── Input injection ──────────────────────────────────────────────
+# Access to input devices for touch/keyboard injection
+allow allrelay_daemon input_device:chr_file { open read write ioctl getattr };
+allow allrelay_daemon inputflinger_service:service_manager find;
+allow allrelay_daemon uhid_device:chr_file { open read write ioctl getattr };
+
+# ─── Display/Surface access ───────────────────────────────────────
+# Screen capture via MediaProjection / SurfaceFlinger
+allow allrelay_daemon surfaceflinger_service:service_manager find;
+allow allrelay_daemon display_device:chr_file { open read write ioctl getattr };
+allow allrelay_daemon graphics_device:chr_file { open read write ioctl getattr };
+allow allrelay_daemon gpu_device:chr_file { open read write ioctl getattr };
+
+# ─── File system access ───────────────────────────────────────────
+# Read-only access to system files
+allow allrelay_daemon system_file:file { read getattr open };
+allow allrelay_daemon system_file:dir { read getattr open search };
+allow allrelay_daemon proc:file { read getattr open };
+
+# Read/write access to /data/allrelay/ (logs, PID files)
+allow allrelay_daemon system_data_file:dir { read write add_name remove_name create search getattr open };
+allow allrelay_daemon system_data_file:file { read write getattr open create };
+allow allrelay_daemon system_data_file:lnk_file { read getattr };
+
+# ─── Process permissions ──────────────────────────────────────────
+# Basic process capabilities
+allow allrelay_daemon self:capability { net_bind_service net_admin setuid setgid sys_nice };
+allow allrelay_daemon self:process { execmem signal sigchld fork };
+
+# ─── Binder IPC ───────────────────────────────────────────────────
+# Required for MediaCodec, AudioTrack, Camera2, etc.
+allow allrelay_daemon servicemanager:binder { call transfer };
+allow allrelay_daemon system_server:binder { call transfer };
+allow allrelay_daemon audioserver:binder { call transfer };
+allow allrelay_daemon mediaserver:binder { call transfer };
+allow allrelay_daemon cameraserver:binder { call transfer };
+allow allrelay_daemon surfaceflinger:binder { call transfer };
+
+# ─── Property access ──────────────────────────────────────────────
+allow allrelay_daemon system_prop:file { read getattr open };
+allow allrelay_daemon property_socket:sock_file write;

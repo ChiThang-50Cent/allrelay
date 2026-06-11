@@ -69,10 +69,11 @@ func Connect(host string, basePort uint16, connectVideo, connectCamera, connectM
 	}
 
 	if connectCamera {
-		conn.camera, err = connectPort(host, basePort+1, "camera")
-		if err != nil {
-			// Camera is optional
-			slog.Warn("Camera connection failed", "error", err)
+		// Camera port may take a moment to open if the server is still
+		// initializing. Retry on connection refused.
+		conn.camera = connectPortWithRetry(host, basePort+1, "camera", 8)
+		if conn.camera == nil {
+			slog.Warn("Camera connection failed (optional)")
 		}
 	}
 
@@ -101,6 +102,37 @@ func Connect(host string, basePort uint16, connectVideo, connectCamera, connectM
 	}
 
 	return conn, nil
+}
+
+// connectPortWithRetry attempts to connect to a port with retries on
+// connection refused. Returns nil if all attempts fail.
+func connectPortWithRetry(host string, port uint16, name string, maxRetries int) net.Conn {
+	for i := 0; i < maxRetries; i++ {
+		conn, err := connectPort(host, port, name)
+		if err == nil {
+			return conn
+		}
+		// Only retry on connection refused
+		if !isConnRefused(err) {
+			slog.Warn("Camera connection failed", "error", err)
+			return nil
+		}
+		if i < maxRetries-1 {
+			slog.Debug("Camera port not ready, retrying...", "attempt", i+1)
+			time.Sleep(time.Duration(i+1) * 500 * time.Millisecond)
+		}
+	}
+	return nil
+}
+
+// isConnRefused checks if the error is a "connection refused" error.
+func isConnRefused(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	return strings.Contains(errStr, "connection refused") ||
+		strings.Contains(errStr, "connectex: No connection could be made")
 }
 
 // connectPort connects to a single port, reads the dummy byte and device name,
@@ -138,21 +170,38 @@ func connectPort(host string, port uint16, name string) (net.Conn, error) {
 		return nil, fmt.Errorf("unexpected dummy byte (%s): 0x%02x", name, dummy[0])
 	}
 
-	// The video port (port 5000) receives a 64-byte device name from the
-	// Android server immediately after the dummy byte. Consume it so the
-	// AllRelay packet reader doesn't misinterpret it as a packet header.
-	if name == "video" {
-		deviceNameBuf := make([]byte, deviceNameLen)
-		if _, err := io.ReadFull(conn, deviceNameBuf); err != nil {
-			conn.Close()
-			return nil, fmt.Errorf("read device name: %w", err)
+	// The device sends a 64-byte device name on the first connected socket
+	// via getFirstSocket(). Detect and consume it before reading AllRelay
+	// headers. We peek at the first byte: AllRelay headers always start
+	// with 0x00 (stream_id high byte), device names start with ASCII (>0x20).
+	firstByte := make([]byte, 1)
+	if _, err := io.ReadFull(conn, firstByte); err != nil {
+		// No device name present — this is either a test mock or
+		// a port that doesn't receive the device name. Return
+		// the connection as-is; the caller handles the situation.
+		if err == io.EOF {
+			return conn, nil
 		}
-		// Extract null-terminated device name for logging
-		devName := string(deviceNameBuf)
+		conn.Close()
+		return nil, fmt.Errorf("peek after dummy (%s): %w", name, err)
+	}
+
+	if firstByte[0] >= 0x20 {
+		// Device name detected — read remaining 63 bytes
+		rest := make([]byte, deviceNameLen-1)
+		if _, err := io.ReadFull(conn, rest); err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("read device name (%s): %w", name, err)
+		}
+		devName := string(append(firstByte, rest...))
 		if idx := strings.IndexByte(devName, 0); idx >= 0 {
 			devName = devName[:idx]
 		}
-		slog.Info("Device name", "name", devName)
+		slog.Info("Device name", "name", devName, "port", name)
+	} else {
+		// No device name — this is packet data. We consumed 1 byte.
+		// Wrap conn to prepend it for the packet reader.
+		return &connWithPrepend{Conn: conn, prepend: firstByte}, nil
 	}
 
 	// Clear deadline after successful read
@@ -224,4 +273,25 @@ func (c *Connection) HasStream(id uint32) bool {
 	default:
 		return false
 	}
+}
+
+// connWithPrepend wraps a net.Conn and prepends bytes to the first read.
+// Used when we've peeked at the first byte of a stream and need to
+// feed it back to the packet reader.
+type connWithPrepend struct {
+	net.Conn
+	prepend []byte
+	prepended bool
+}
+
+func (c *connWithPrepend) Read(b []byte) (int, error) {
+	if !c.prepended && len(c.prepend) > 0 {
+		n := copy(b, c.prepend)
+		c.prepend = c.prepend[n:]
+		if len(c.prepend) == 0 {
+			c.prepended = true
+		}
+		return n, nil
+	}
+	return c.Conn.Read(b)
 }
