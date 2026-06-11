@@ -196,6 +196,22 @@ func CameraPipeline(device string) (*Pipeline, error) {
 	return NewCmdPipeline("camera", "ffmpeg", args)
 }
 
+// PipeWireCameraPipeline creates a PipeWire video source from v4l2loopback
+// so browsers see it via the camera portal.
+// Reads decoded frames from the v4l2loopback device (fed by ffmpeg) and
+// re-publishes through PipeWire with NV12 conversion for browser compat.
+func PipeWireCameraPipeline(device string) (*Pipeline, error) {
+	args := []string{
+		"-q",
+		"v4l2src", "device=" + device,
+		"!", "videoconvert",
+		"!", "video/x-raw,format=NV12,framerate=30/1",
+		"!", "pipewiresink", "mode=provide",
+		"stream-properties=p,media.class=Video/Source,media.role=Camera,node.name=allrelay-camera-pw,node.description=AllRelay_Camera",
+	}
+	return NewCmdPipeline("camera-pipewire", "gst-launch-1.0", args)
+}
+
 // NewCmdPipeline creates a pipeline that runs an arbitrary command
 // and pipes data to its stdin.
 func NewCmdPipeline(name, command string, args []string) (*Pipeline, error) {

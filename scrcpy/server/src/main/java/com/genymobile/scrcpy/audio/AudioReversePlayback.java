@@ -34,9 +34,10 @@ import java.nio.ByteOrder;
  */
 public final class AudioReversePlayback implements AsyncProcessor {
 
+    // Audio config for reverse playback (output to speaker)
     private static final int SAMPLE_RATE = AudioConfig.SAMPLE_RATE;
     private static final int CHANNELS = AudioConfig.CHANNELS;
-    private static final int CHANNEL_CONFIG = AudioConfig.CHANNEL_CONFIG;
+    private static final int CHANNEL_CONFIG = AudioFormat.CHANNEL_OUT_STEREO;
     private static final int ENCODING = AudioConfig.ENCODING;
 
     // 16-byte header: [stream_id(4)] [pts+flags(8)] [size(4)]
@@ -95,49 +96,65 @@ public final class AudioReversePlayback implements AsyncProcessor {
         boolean decoderStarted = false;
 
         try {
-            // First, read stream header to confirm stream ID
-            int read = readFully(inputStream, headerBuf, 0, HEADER_SIZE);
-            if (read < HEADER_SIZE) {
-                Ln.w("Speaker: connection closed before receiving header");
-                return;
-            }
+            // Read the first packet header to confirm stream ID
+        // and detect whether it's a config packet.
+        int read = readFully(inputStream, headerBuf, 0, HEADER_SIZE);
+        if (read < HEADER_SIZE) {
+            Ln.w("Speaker: connection closed before receiving header");
+            return;
+        }
 
-            int streamId = ByteBuffer.wrap(headerBuf, 0, 4).order(ByteOrder.BIG_ENDIAN).getInt();
-            if (streamId != StreamId.SPEAKER.getId()) {
-                Ln.e("Speaker: unexpected stream ID: 0x" + Integer.toHexString(streamId));
-                return;
-            }
+        int streamId = ByteBuffer.wrap(headerBuf, 0, 4).order(ByteOrder.BIG_ENDIAN).getInt();
+        if (streamId != StreamId.SPEAKER.getId()) {
+            Ln.e("Speaker: unexpected stream ID: 0x" + Integer.toHexString(streamId));
+            return;
+        }
 
-            long ptsAndFlags = ByteBuffer.wrap(headerBuf, 4, 8).order(ByteOrder.BIG_ENDIAN).getLong();
-            boolean isConfig = (ptsAndFlags & PACKET_FLAG_CONFIG) != 0;
-            int packetSize = ByteBuffer.wrap(headerBuf, 12, 4).order(ByteOrder.BIG_ENDIAN).getInt();
+        long firstPtsAndFlags = ByteBuffer.wrap(headerBuf, 4, 8).order(ByteOrder.BIG_ENDIAN).getLong();
+        boolean firstIsConfig = (firstPtsAndFlags & PACKET_FLAG_CONFIG) != 0;
+        int firstPacketSize = ByteBuffer.wrap(headerBuf, 12, 4).order(ByteOrder.BIG_ENDIAN).getInt();
 
-            Ln.i("Speaker stream connected, config=" + isConfig + " size=" + packetSize);
+        // Consume first packet payload (always, to stay aligned)
+        byte[] firstPayload = null;
+        if (firstPacketSize > 0) {
+            firstPayload = new byte[firstPacketSize];
+            readFully(inputStream, firstPayload, 0, firstPacketSize);
+        }
+
+        Ln.i("Speaker stream connected, config=" + firstIsConfig + " size=" + firstPacketSize);
 
             // Create MediaCodec decoder for Opus
             decoder = MediaCodec.createDecoderByType(AudioCodec.OPUS.getMimeType());
 
             MediaFormat format = MediaFormat.createAudioFormat(
                     AudioCodec.OPUS.getMimeType(), SAMPLE_RATE, CHANNELS);
+
+            // If first packet is config (OpusHead), attach it as CSD-0
+            // before configure() so the decoder has it during initialization.
+            if (firstIsConfig && firstPacketSize > 0) {
+                Ln.d("Speaker: feeding OpusHead config via configure, size=" + firstPacketSize);
+                ByteBuffer csd0 = ByteBuffer.allocateDirect(firstPacketSize);
+                csd0.put(firstPayload);
+                csd0.flip();
+                format.setByteBuffer("csd-0", csd0);
+            }
+
             decoder.configure(format, null, null, 0);
             decoder.start();
             decoderStarted = true;
 
-            // If first packet is config, feed it to decoder
-            if (isConfig && packetSize > 0) {
-                byte[] configData = new byte[packetSize];
-                readFully(inputStream, configData, 0, packetSize);
-                // Note: Opus config packet from scrcpy has special format,
-                // we just feed it to the decoder
+            // If first packet is audio (not config), feed it now
+            if (!firstIsConfig && firstPayload != null) {
+                Ln.d("Speaker: feeding first audio packet, size=" + firstPacketSize);
                 int inputBufferId = decoder.dequeueInputBuffer(10000);
                 if (inputBufferId >= 0) {
                     ByteBuffer inputBuffer = decoder.getInputBuffer(inputBufferId);
                     if (inputBuffer != null) {
                         inputBuffer.clear();
-                        inputBuffer.put(configData);
+                        inputBuffer.put(firstPayload);
                         inputBuffer.flip();
-                        decoder.queueInputBuffer(inputBufferId, 0, configData.length,
-                                0, MediaCodec.BUFFER_FLAG_CODEC_CONFIG);
+                        long pts = firstPtsAndFlags & 0x1FFFFFFFFFFFFFL;
+                        decoder.queueInputBuffer(inputBufferId, 0, firstPacketSize, pts, 0);
                     }
                 }
             }

@@ -156,3 +156,32 @@ func ConfigToAnnexB(config []byte) []byte {
 	}
 	return out
 }
+
+// FrameToAnnexB converts an AVCC-format frame (multiple NALs with
+// 4-byte length prefixes) to Annex B bytestream format.
+// If already Annex B, returns as-is.
+func FrameToAnnexB(frame []byte) []byte {
+	if len(frame) == 0 || IsAnnexB(frame) {
+		return frame
+	}
+
+	nals := SplitNALs(frame)
+	if len(nals) == 0 {
+		return frame
+	}
+	if len(nals) == 1 && &nals[0][0] == &frame[0] {
+		return ToAnnexB(frame)
+	}
+
+	var totalLen int
+	for _, nal := range nals {
+		totalLen += 4 + len(nal)
+	}
+
+	out := make([]byte, 0, totalLen)
+	for _, nal := range nals {
+		out = append(out, annexBStartCode4...)
+		out = append(out, nal...)
+	}
+	return out
+}

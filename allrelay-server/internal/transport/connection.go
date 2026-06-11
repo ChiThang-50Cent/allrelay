@@ -19,6 +19,7 @@ import (
 	"log/slog"
 	"net"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/allrelay/allrelay-server/internal/protocol"
@@ -50,55 +51,91 @@ type Connection struct {
 }
 
 // Connect establishes TCP connections to the Android server on all requested ports.
-// basePort is typically 5000.
+// basePort is typically 5000. All connections are made in parallel to avoid
+// cumulative timeout from sequential connects.
 func Connect(host string, basePort uint16, connectVideo, connectCamera, connectMic, connectSpeaker, connectControl bool) (*Connection, error) {
 	if basePort == 0 {
 		basePort = DefaultBasePort
 	}
 
-	conn := &Connection{host: host}
+	type result struct {
+		name string
+		conn net.Conn
+		err  error
+	}
 
-	var err error
+	var wg sync.WaitGroup
+	results := make(chan result, 5)
+
+	// Helper to launch a connect goroutine
+	launch := func(name string, port uint16, optional bool) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			c, err := connectPort(host, port, name)
+			if err != nil && optional {
+				slog.Warn(name+" connection failed (optional)", "error", err)
+				results <- result{name: name, conn: nil, err: nil}
+				return
+			}
+			results <- result{name: name, conn: c, err: err}
+		}()
+	}
 
 	if connectVideo {
-		conn.video, err = connectPort(host, basePort+0, "video")
-		if err != nil {
-			conn.Close()
-			return nil, fmt.Errorf("video: %w", err)
-		}
+		launch("video", basePort+0, false)
 	}
-
 	if connectCamera {
-		// Camera port may take a moment to open if the server is still
-		// initializing. Retry on connection refused.
-		conn.camera = connectPortWithRetry(host, basePort+1, "camera", 8)
-		if conn.camera == nil {
-			slog.Warn("Camera connection failed (optional)")
-		}
+		// Camera uses retry with backoff
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			c := connectPortWithRetry(host, basePort+1, "camera", 8)
+			if c == nil {
+				slog.Warn("Camera connection failed (optional)")
+			}
+			results <- result{name: "camera", conn: c, err: nil}
+		}()
 	}
-
 	if connectMic {
-		conn.mic, err = connectPort(host, basePort+2, "mic")
-		if err != nil {
-			conn.Close()
-			return nil, fmt.Errorf("mic: %w", err)
-		}
+		launch("mic", basePort+2, false)
 	}
-
 	if connectSpeaker {
-		conn.speaker, err = connectPort(host, basePort+3, "speaker")
-		if err != nil {
-			// Speaker is optional
-			slog.Warn("Speaker connection failed", "error", err)
+		launch("speaker", basePort+3, true)
+	}
+	if connectControl {
+		launch("control", basePort+4, false)
+	}
+
+	// Wait for all goroutines to finish
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	conn := &Connection{host: host}
+	var firstErr error
+	for r := range results {
+		if r.err != nil && firstErr == nil {
+			firstErr = r.err
+		}
+		switch r.name {
+		case "video":
+			conn.video = r.conn
+		case "camera":
+			conn.camera = r.conn
+		case "mic":
+			conn.mic = r.conn
+		case "speaker":
+			conn.speaker = r.conn
+		case "control":
+			conn.control = r.conn
 		}
 	}
 
-	if connectControl {
-		conn.control, err = connectPort(host, basePort+4, "control")
-		if err != nil {
-			conn.Close()
-			return nil, fmt.Errorf("control: %w", err)
-		}
+	if firstErr != nil {
+		conn.Close()
+		return nil, firstErr
 	}
 
 	return conn, nil
@@ -123,6 +160,14 @@ func connectPortWithRetry(host string, port uint16, name string, maxRetries int)
 		}
 	}
 	return nil
+}
+
+// isTimeout checks if the error is a timeout error.
+func isTimeout(err error) bool {
+	if netErr, ok := err.(net.Error); ok {
+		return netErr.Timeout()
+	}
+	return false
 }
 
 // isConnRefused checks if the error is a "connection refused" error.
@@ -176,10 +221,11 @@ func connectPort(host string, port uint16, name string) (net.Conn, error) {
 	// with 0x00 (stream_id high byte), device names start with ASCII (>0x20).
 	firstByte := make([]byte, 1)
 	if _, err := io.ReadFull(conn, firstByte); err != nil {
-		// No device name present — this is either a test mock or
-		// a port that doesn't receive the device name. Return
-		// the connection as-is; the caller handles the situation.
-		if err == io.EOF {
+		// No device name present (either EOF: connection closed,
+		// or timeout: this isn't the first socket). Return the
+		// connection as-is; the caller handles the situation.
+		if err == io.EOF || isTimeout(err) {
+			conn.SetReadDeadline(time.Time{})
 			return conn, nil
 		}
 		conn.Close()
@@ -201,6 +247,7 @@ func connectPort(host string, port uint16, name string) (net.Conn, error) {
 	} else {
 		// No device name — this is packet data. We consumed 1 byte.
 		// Wrap conn to prepend it for the packet reader.
+		conn.SetReadDeadline(time.Time{})
 		return &connWithPrepend{Conn: conn, prepend: firstByte}, nil
 	}
 

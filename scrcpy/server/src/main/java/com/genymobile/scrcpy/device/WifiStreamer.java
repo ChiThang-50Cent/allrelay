@@ -56,7 +56,9 @@ public final class WifiStreamer {
             buffer.flip();
             byte[] payload = new byte[buffer.remaining()];
             buffer.get(payload);
-            writePacket(ByteBuffer.wrap(payload), 0, true, false);
+            // Send codec ID as metadata, not config (config flag triggers
+            // Opus header validation which expects 16+ byte OpusHead packet).
+            writePacket(ByteBuffer.wrap(payload), 0, false, false);
         }
     }
 
@@ -67,7 +69,8 @@ public final class WifiStreamer {
             buffer.flip();
             byte[] payload = new byte[buffer.remaining()];
             buffer.get(payload);
-            writePacket(ByteBuffer.wrap(payload), 0, true, false);
+            // Send codec ID as metadata, not config.
+            writePacket(ByteBuffer.wrap(payload), 0, false, false);
         }
     }
 
