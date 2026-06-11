@@ -301,7 +301,7 @@ func makeMicHandler() protocol.StreamHandler {
 }
 
 // WriteSpeakerPacket writes an Opus-encoded speaker packet to the phone.
-// TODO(Phase 3): Implement PC → phone reverse audio via PipeWire RTP sink.
+// TODO(Phase 4): Implement PC → phone reverse audio via PipeWire RTP sink.
 // Currently the speaker connection is established but idle.
 func WriteSpeakerPacket(w io.Writer, pts uint64, payload []byte) error {
 	_ = w
@@ -353,6 +353,6 @@ func displayStatus(hm *heartbeat.Monitor, noReconnect bool) {
 			"cpu", fmt.Sprintf("%.1f%%", status.Device.CPUUsage),
 			"wifi_speed", fmt.Sprintf("%d Mbps", status.Device.WiFiLinkSpeed))
 
-		_ = noReconnect // TODO(Phase 3): trigger reconnection on heartbeat loss
+		_ = noReconnect // TODO(Phase 4): trigger reconnection on heartbeat loss
 	}
 }

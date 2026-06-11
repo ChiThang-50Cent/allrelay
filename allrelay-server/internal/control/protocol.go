@@ -221,7 +221,7 @@ func (ch *Channel) Hello(version, deviceName, model string, screenWidth, screenH
 	return ch.Send(Message{
 		Type: TypeHello,
 	})
-	// TODO(Phase 3): Send full hello with device info
+	// TODO(Phase 4): Send full hello with device info
 }
 
 // IsConnected returns true if the control channel is active.

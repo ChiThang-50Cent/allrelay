@@ -10,7 +10,6 @@ import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
-import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 
 /**
@@ -311,20 +310,6 @@ public final class WifiConnection implements Closeable {
             out.write(buffer);
             out.flush();
         }
-    }
-
-    /**
-     * Write a ByteBuffer to an OutputStream, flushing after.
-     */
-    private static void writeFully(OutputStream out, ByteBuffer buffer) throws IOException {
-        if (buffer.hasArray()) {
-            out.write(buffer.array(), buffer.arrayOffset() + buffer.position(), buffer.remaining());
-        } else {
-            byte[] buf = new byte[buffer.remaining()];
-            buffer.get(buf);
-            out.write(buf);
-        }
-        out.flush();
     }
 
     /**

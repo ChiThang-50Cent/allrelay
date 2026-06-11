@@ -2,7 +2,7 @@
 
 > Protocol version: 1  
 > Date: 2026-06-11  
-> Scope: Phase 2 (multi-stream over raw TCP with 16-byte header)
+> Scope: Phase 3 (multi-stream over raw TCP with 16-byte header, GStreamer pipelines, input capture)
 
 ---
 
@@ -61,117 +61,128 @@ video). The bytes are the UTF-8 device name (e.g. "SM-F711B"), null-padded to 64
 The client reads these 64 bytes via `device_read_info()` before starting any
 stream processing.
 
-### Phase 3: Codec Header
+### Phase 3: AllRelay Packets (16-byte header)
+
+After the device name, ALL data is wrapped in the AllRelay 16-byte packet format.
+This includes codec configuration, session metadata, and media frames.
+
+**Codec configuration** (`writeVideoHeader` / `writeAudioHeader`):
 
 ```
-   │  4 bytes: codec ID (big-endian) │  writeVideoHeader()
-   │ <────────────────────────────── │
-   │                                 │
+   │  16-byte header + 4-byte codec ID  │
+   │ <───────────────────────────────── │
 ```
 
-The server writes a 4-byte codec identifier to each stream socket, **before**
-any data packets. This tells the client which decoder to use.
+The codec ID (e.g., `h264`, `opus`) is sent as a config packet:
+- `stream_id`: the stream identifier
+- `flags`: `PACKET_FLAG_CONFIG` (bit 62)
+- `packet_size`: 4 (the codec ID length)
+- Payload: 4-byte big-endian codec ID
 
-| Codec    | ID (hex)    | Bytes (ASCII) |
-|----------|-------------|----------------|
-| H.264    | 0x68323634  | "h264"        |
-| H.265    | 0x68323635  | "h265"        |
-| AV1      | 0x00617631  | "\0av1"       |
-| Opus     | 0x6F707573  | "opus"        |
-| FLAC     | 0x664C6143  | "fLaC"        |
-| RAW      | 0x00726177  | "\0raw"       |
+**Session metadata** (video resolution/rotation changes):
 
-### Phase 4: Session Metadata (video streams: screen + camera)
-
-```
-   │  16 bytes: session header       │  writeSessionMeta()
-   │ <────────────────────────────── │
-   │                                 │
-```
-
-Layout (big-endian):
+Layout within the 16-byte header:
 
 | Offset | Size | Field                       |
 |--------|------|-----------------------------|
 | 0      | 4    | `stream_id`                 |
-| 4      | 8    | `pts + flags`               |
-| 12     | 4    | `packet_size` (= 0 for meta)|
+| 4      | 4    | `flags` (session bit 63 in MSB) |
+| 8      | 4    | `width`                     |
+| 12     | 4    | `height`                    |
 
-For session packets:
-- `stream_id`: enum value (SCREEN=0x00000001, CAMERA=0x00000002, MIC=0x00000003, SPEAKER=0x00000004)
-- `flags`: `PACKET_FLAG_SESSION` (bit 63) set, bit 0 = client_resize flag
-- The width and height follow after this 16-byte header in the session payload
+> **Note:** Session packets have a different header layout than media packets.
+> Bytes 8-11 contain `width` and bytes 12-15 contain `height` — NOT `pts_and_flags`
+> and `payload_size`. The payload size for session packets is always 0.
 
-### Phase 5: Data Packets
-
-```
-   │  per-frame:                     │
-   │  16-byte header + payload       │  writePacket()
-   │ <────────────────────────────── │
-   │                                 │
-```
-
-Each frame is wrapped in a 16-byte header followed by the encoded data:
+**Media frames**:
 
 | Offset | Size | Field                       |
 |--------|------|-----------------------------|
-| 0      | 4    | `stream_id`                 |
-| 4      | 8    | `pts + flags`               |
-| 12     | 4    | `packet_size`               |
+| 0      | 4    | `stream_id` (big-endian u32) |
+| 4      | 8    | `pts + flags` (big-endian u64) |
+| 12     | 4    | `packet_size` (big-endian u32) |
 
-Flags:
-- Bit 63 (`PACKET_FLAG_SESSION`): session metadata (only for session packets)
-- Bit 62 (`PACKET_FLAG_CONFIG`): codec configuration packet
+Flags (in `pts_and_flags`):
+- Bit 63 (`PACKET_FLAG_SESSION`): session metadata
+- Bit 62 (`PACKET_FLAG_CONFIG`): codec configuration
 - Bit 61 (`PACKET_FLAG_KEY_FRAME`): key frame
 
 ---
 
-## Complete Wire Format
+## Complete Wire Format (per socket)
+
+### Video port (5000) — Screen stream
 
 ```
 Byte offset  Content
 ───────────  ──────────────────────────────────────
 0            Dummy byte (0xAB)
 1-64         Device name (UTF-8, null-padded to 64)
-65-68        Codec ID (4 bytes, big-endian)
-69-84        Session header (16 bytes, video only)
-85+          Data packets (16-byte header + payload)
+65+          AllRelay 16-byte header packets (config → session → frames)
 ```
 
-### Example (H.264 screen mirroring, port 5000)
+> **Note:** Device name is only sent on the video port. Camera, mic, speaker,
+> and control ports skip directly to the 16-byte header packets after the
+> dummy byte.
+
+### Example — Screen stream (H.264) on port 5000
 
 ```
-Offset  Hex                                          ASCII
-──────  ───────────────────────────────────────────  ─────
-00      AB                                           ·       [dummy byte]
-01      53 4D 2D 46 37 31 31 42 00 00 00 00 00 ...  SM-F711B [device name, 64B]
-41      68 32 36 34                                  h264    [codec: H.264]
-45      00 00 00 01 80 00 00 00 WW WW HH HH         ····.... [session: stream=1, W×H, flags=0x80...]
-55      SS SS SS SS PP PP PP PP PP PP PP PP LL LL    ········ [packet: stream+PTS+len, 16B header]
-65      <H.264 encoded frame data>                           [payload]
+Byte offset  Hex                                             ASCII
+───────────  ──────────────────────────────────────────────  ──────
+00           AB                                              ·        [dummy byte]
+01           53 4D 2D 46 37 31 31 42 00 00 00 00 00 00 ...  SM-F711B  [device name, 64B]
+65           00 00 00 01 40 00 00 00 00 00 00 00 00 00 00 04  ··..@····  [config: stream=SCREEN, config flag, size=4]
+81           68 32 36 34                                     h264      [codec ID: H.264]
+85           00 00 00 01 80 00 00 00 WW WW HH HH             ··..····  [session: stream=SCREEN, session flag, W×H]
+101          SS SS SS SS PP PP PP PP PP PP PP PP LL LL        ········  [frame: stream+PTS+len, 16B header]
+117          <H.264 encoded frame data>                                [payload]
 ```
 
-### Example (camera, port 5001)
+### Camera port (5001)
 
 ```
-Offset  Hex                                          ASCII
-──────  ───────────────────────────────────────────  ─────
-00      AB                                           ·       [dummy byte]
-41      68 32 36 34                                  h264    [codec: H.264]
-45      00 00 00 02 80 00 00 00 WW WW HH HH         ··...... [session: stream=CAMERA(2)]
-55      SS SS SS SS PP PP PP PP PP PP PP PP LL LL    ········ [packet: stream+PTS+len, 16B header]
-65      <H.264 camera frame data>                            [payload]
+Byte offset  Hex                                             ASCII
+───────────  ──────────────────────────────────────────────  ──────
+00           AB                                              ·        [dummy byte]
+01           00 00 00 02 40 00 00 00 00 00 00 00 00 00 00 04  ··..@····  [config: stream=CAMERA, config flag, size=4]
+17           68 32 36 34                                     h264      [codec ID: H.264]
+21           SS SS SS SS PP PP PP PP PP PP PP PP LL LL        ········  [frame: stream+PTS+len, 16B header]
+37           <H.264 camera frame data>                                 [payload]
 ```
 
 ---
 
-## Client-Side Processing
+## Client-Side Processing (Go server)
 
-1. **`connect_and_read_byte()`** — TCP connect + read 1 dummy byte per socket
-2. **`device_read_info()`** — read 64 bytes from first socket → device name
-3. **`sc_demuxer_recv_codec_id()`** — read 4 bytes → codec selector
-4. **`sc_demuxer_recv_header()`** — read 16 bytes → check if session packet
-5. **`sc_demuxer_parse_packet()`** — read payload → decode frame
+1. **`connectPort()`** — TCP connect + read 1 dummy byte per socket
+2. **Video port only**: read 64 bytes device name
+3. **Create demuxer per stream** — reads 16-byte AllRelay headers
+4. **Session packets**: detected by bit 63, `PayloadSize` set to 0
+5. **Config packets**: bit 62, fed as Annex B to GStreamer pipeline
+6. **Media frames**: decoded via GStreamer pipeline
+
+### GStreamer Pipeline
+
+```
+fdsrc fd=0 ! h264parse ! avdec_h264 ! videoconvert ! autovideosink sync=false
+```
+
+H.264 data (config + frames) is piped to stdin of a `gst-launch-1.0`
+subprocess. Config data is converted to Annex B byte-stream format before
+feeding to the decoder.
+
+## Android Server Connection Accept (Phase 3)
+
+Connections are accepted in **parallel threads**, avoiding the sequential
+blocking issue from earlier versions:
+
+- **Video + Control**: mandatory, use `ACCEPT_TIMEOUT_MS` (30s)
+- **Camera + Audio + Speaker**: optional, use `ACCEPT_TIMEOUT_OPTIONAL_MS` (3s)
+- **Device name**: sent immediately from the video accept thread (not after all accepts)
+
+This prevents a deadlock where the PC client waits for the device name while
+the Android server waits for optional stream connections.
 
 ---
 
@@ -184,7 +195,7 @@ Offset  Hex                                          ASCII
 | Connection health  | Dummy byte on first socket    | Dummy byte on every socket |
 | Server lifecycle   | Started by client via ADB     | Must be pre-started        |
 | Device discovery   | ADB device list               | mDNS (_allrelay._tcp)      |
-| Control channel    | Bidirectional LocalSocket     | TCP port 5004 (Phase 3)    |
+| Control channel    | Bidirectional LocalSocket     | TCP port 5004 |
 | Header format      | Original scrcpy (12-byte)     | AllRelay 16-byte header    |
 | Camera stream      | Not supported                 | TCP port 5001              |
 | Speaker stream     | Not supported                 | TCP port 5003 (reverse)    |
