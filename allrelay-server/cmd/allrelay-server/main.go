@@ -319,14 +319,20 @@ func makeMicHandler() protocol.StreamHandler {
 		return func(header *protocol.Header, payload []byte) error { return nil }
 	}
 
-	// Start gst-launch reading from FIFO (uses pulsesink → null-sink → pw-loopback)
+	// Start gst-launch reading from FIFO, output via pipewiresink.
+	// pipewiresink mode=provide creates an Audio/Source node that
+	// browsers (Chrome, Edge) detect as a virtual microphone.
+	// This replaces the old pulsesink→null-sink→loopback approach
+	// which was unreliable with PipeWire.
 	cmd := exec.Command("gst-launch-1.0", "-q",
 		"filesrc", "location="+fifoPath,
 		"!", "oggdemux",
 		"!", "opusdec",
 		"!", "audioconvert",
 		"!", "audioresample",
-		"!", "pulsesink", "device=allrelay-mic-sink",
+		"!", "audio/x-raw,format=S16LE,rate=48000,channels=1",
+		"!", "pipewiresink", "mode=provide",
+		"stream-properties=p,media.class=Audio/Source,node.name=allrelay-mic,node.description=AllRelay_Microphone",
 	)
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
@@ -346,7 +352,7 @@ func makeMicHandler() protocol.StreamHandler {
 		return func(header *protocol.Header, payload []byte) error { return nil }
 	}
 
-	slog.Info("Mic: gst-launch pipeline started → allrelay-mic-sink", "pid", cmd.Process.Pid)
+	slog.Info("Mic: gst-launch pipeline started → allrelay-mic", "pid", cmd.Process.Pid)
 
 	go func() {
 		if err := cmd.Wait(); err != nil {
@@ -386,9 +392,10 @@ func makeMicHandler() protocol.StreamHandler {
 		// Buffer audio packets until we have config + a few packets.
 		// This prevents oggdemux from getting "EOS before finding a chain"
 		// when there's a gap between OpusHead and first audio data.
+		// Reduced from 25→5 packets (100ms buffer) for lower latency.
 		if !started {
 			pending = append(pending, payload)
-			if len(pendingCfg) > 0 && len(pending) >= 25 {
+			if len(pendingCfg) > 0 && len(pending) >= 5 {
 				// Write buffered config + all buffered audio now
 				writeOggPage(oggOut, serial, pageSeq, 0, [][]byte{pendingCfg})
 				pageSeq++
