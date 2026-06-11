@@ -37,12 +37,16 @@ func SpeakerCapturePipeline() (*CapturePipeline, error) {
 	// Use pulsesrc to capture system audio from the default monitor.
 	// @DEFAULT_MONITOR@ resolves via pipewire-pulse to the current default
 	// sink's monitor (e.g., alsa_output.xxx.monitor).
+	//
+	// Stereo (channels=2) matches the Android AudioTrack CHANNEL_OUT_STEREO.
+	// CBR 96 Kbps at 20ms frames = 240 bytes/packet for stereo (vs 64 Kbps mono).
+	// max-page-delay=20000 (20ms) keeps latency low for video sync.
 	args := []string{
 		"-q",
-		"pulsesrc", "device=@DEFAULT_MONITOR@",
-		"!", "audio/x-raw,rate=48000,channels=1",
-		"!", "opusenc", "bitrate=64000", "bitrate-type=cbr", "frame-size=20",
-		"!", "oggmux", "max-delay=0", "max-page-delay=2000000",
+		"pulsesrc", "device=allrelay-speaker-sink.monitor",
+		"!", "audio/x-raw,rate=48000,channels=2",
+		"!", "opusenc", "bitrate=96000", "bitrate-type=cbr", "frame-size=20",
+		"!", "oggmux", "max-delay=0", "max-page-delay=20000",
 		"!", "fdsink", "fd=1",
 	}
 	return NewCapturePipeline("speaker-capture", "gst-launch-1.0", args)

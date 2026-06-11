@@ -25,6 +25,7 @@ import (
 	"sync"
 	"syscall"
 
+	"github.com/allrelay/allrelay-server/internal/audio"
 	"github.com/allrelay/allrelay-server/internal/bitrate"
 	"github.com/allrelay/allrelay-server/internal/control"
 	"github.com/allrelay/allrelay-server/internal/heartbeat"
@@ -117,9 +118,10 @@ func main() {
 			makeMicHandler())
 	}
 
-	// Speaker — handled separately (PC sends data, doesn't receive)
+	// Speaker — PC captures system audio, encodes Opus, sends to phone
 	if !*noSpeaker && conn.HasStream(protocol.StreamSpeaker) {
-		slog.Info("Speaker stream: connected", "note", "ready for PC→phone audio (Phase 3)")
+		slog.Info("Speaker stream: connected")
+		go runSpeakerCapture(conn.SpeakerWriter())
 	}
 
 	// Set up control channel + input injection
@@ -511,14 +513,86 @@ func init() {
 	}
 }
 
-// WriteSpeakerPacket writes an Opus-encoded speaker packet to the phone.
-// TODO(Phase 4): Implement PC → phone reverse audio via PipeWire RTP sink.
-// Currently the speaker connection is established but idle.
-func WriteSpeakerPacket(w io.Writer, pts uint64, payload []byte) error {
-	_ = w
-	_ = pts
-	_ = payload
-	return nil
+// runSpeakerCapture starts the GStreamer speaker capture pipeline,
+// demuxes Ogg pages to extract raw Opus packets, and sends them
+// to the phone via the speaker TCP connection with 16-byte AllRelay headers.
+//
+// The first two packets (OpusHead + OpusTags) are sent with CONFIG flag.
+// Subsequent audio packets are sent with PTS for timing.
+//
+// Packet flow:
+//
+//	PipeWire → pulsesrc → opusenc → oggmux → fdsink stdout
+//	                                              ↓
+//	                              Go reads Ogg pages, extracts Opus packets
+//	                                              ↓
+//	                              Writes 16-byte header + raw Opus to TCP
+//	                                              ↓
+//	                              Android MediaCodec decodes → AudioTrack plays
+func runSpeakerCapture(w io.Writer) {
+	pipeline, err := audio.SpeakerCapturePipeline()
+	if err != nil {
+		slog.Error("Speaker: failed to start capture pipeline", "error", err)
+		return
+	}
+	defer pipeline.Close()
+
+	demux := audio.NewOggDemuxer(pipeline)
+
+	// Read and send OpusHead (codec config)
+	opusHead, err := demux.NextPacket()
+	if err != nil {
+		slog.Error("Speaker: failed to read OpusHead", "error", err)
+		return
+	}
+	if err := audio.WritePacket(w, protocol.StreamSpeaker, protocol.FlagConfig, 0, opusHead); err != nil {
+		slog.Error("Speaker: failed to send OpusHead", "error", err)
+		return
+	}
+	slog.Info("Speaker: sent OpusHead config", "bytes", len(opusHead))
+
+	// Read and send OpusTags (comment header)
+	opusTags, err := demux.NextPacket()
+	if err != nil {
+		slog.Warn("Speaker: no OpusTags packet", "error", err)
+		return
+	}
+	if err := audio.WritePacket(w, protocol.StreamSpeaker, protocol.FlagConfig, 0, opusTags); err != nil {
+		slog.Error("Speaker: failed to send OpusTags", "error", err)
+		return
+	}
+	slog.Debug("Speaker: sent OpusTags", "bytes", len(opusTags))
+
+	// Main loop: read Opus audio packets and forward to phone
+	var frameCount uint64
+	var byteCount uint64
+	for {
+		packet, err := demux.NextPacket()
+		if err != nil {
+			if err == io.EOF {
+				slog.Info("Speaker: capture pipeline ended", "frames", frameCount)
+			} else {
+				slog.Error("Speaker: read error", "error", err)
+			}
+			return
+		}
+
+		pts := frameCount * 20000 // 20ms per frame
+		if err := audio.WritePacket(w, protocol.StreamSpeaker, 0, pts, packet); err != nil {
+			slog.Error("Speaker: write error", "error", err)
+			return
+		}
+
+		frameCount++
+		byteCount += uint64(len(packet))
+
+		if frameCount%250 == 0 {
+			slog.Debug("Speaker stream",
+				"frames", frameCount,
+				"total_bytes", byteCount,
+				"packet_bytes", len(packet))
+		}
+	}
 }
 
 // forwardInputEvents reads captured input events from the input capturer

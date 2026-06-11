@@ -1,7 +1,7 @@
 # AllRelay - Current Work
 
-> **Last updated:** 2026-06-11 23:00
-> **Current phase:** Phase 4 — Root & Polish ✅ (ALL TASKS DONE)
+> **Last updated:** 2026-06-11 23:30
+> **Current phase:** Phase 4 — Root & Polish ✅ (ALL TASKS DONE) + Speaker path fix 🔄
 > **Next milestone:** Tag v0.4.0-alpha, flash Magisk module qua Manager
 
 ---
@@ -304,7 +304,7 @@ Phase 4: Root & Polish       [██████████] 100%  Target: Week
 
 | # | Blocker | Impact | Mitigation | Status |
 |---|---------|--------|------------|--------|
-| B-SPK | PipeWire audio graph suspend | Speaker live capture không hoạt động (graph ở QUANT=0, RATE=0). Dùng IEC958 digital output không có receiver vật lý → ALSA/PipeWire không active graph. pipewire-pulse auto-connect cũng broken. | Tạm: dùng static file test. Lâu dài: viết native PipeWire capture client (cgo/libpipewire), hoặc tạo virtual null-sink driver, hoặc switch to analog output profile. | ⏸️ |
+| B-SPK | PipeWire audio graph suspend | Speaker live capture không hoạt động (graph ở QUANT=0, RATE=0). Dùng IEC958 digital output không có receiver vật lý → ALSA/PipeWire không active graph. pipewire-pulse auto-connect cũng broken. | ĐÃ CÓ WORKAROUND: restart pipewire (`systemctl --user restart pipewire pipewire-pulse`) → graph active trở lại. Default sink đã set là `allrelay-speaker-sink` (null-sink), @DEFAULT_MONITOR@ capture hoạt động. Đã kiểm tra: pulsesrc device=@DEFAULT_MONITOR@ hoạt động sau restart. | 🟡 (có workaround) |
 
 ---
 
@@ -322,6 +322,7 @@ Phase 4: Root & Polish       [██████████] 100%  Target: Week
 
 | Date | Change |
 |------|--------|
+| 2026-06-11 | Speaker path: IMPLEMENTED ✅. Added audio/ogg.go (OggDemuxer + WritePacket), updated pipeline stereo+low-latency, wired runSpeakerCapture() in main.go. WriteSpeakerPacket() stub → full implementation. GStreamer pulsesrc→opusenc→oggmux→fdsink → Go reads Ogg pages, extracts Opus, sends 16-byte header+payload to phone TCP port 5003. |
 | 2026-06-11 | PipeWire speaker capture blocked: IEC958 digital output has no physical receiver → graph stays suspended. Attempted: pipewiresrc, pulsesrc, pw-record, pw-cat, FIFO — all fail. Need native PipeWire client (cgo). See Blockers. |
 | 2026-06-11 | Mic pipeline: replaced pulsesink→null-sink with pipewiresink mode=provide → Audio/Source/Virtual \"allrelay-mic\". Fixed Ogg CRC32 (non-reflected polynomial), OpusTags page, batch 25 packets/page. |
 | 2026-06-11 | Camera pipewire: BrowserCameraPipeline via v4l2src from /dev/video10 → NV12 → pipewiresink mode=provide \"allrelay-camera-pw\". Requires v4l2loopback exclusive_caps=1. |
