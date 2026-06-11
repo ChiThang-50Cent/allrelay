@@ -173,16 +173,21 @@ func main() {
 		slog.Info("Adaptive bitrate: enabled")
 	}
 
-	// Wait for interrupt or stream error
+	// Wait for interrupt signal (Ctrl+C) to shut down.
+	// Stream errors are logged individually and do NOT kill the entire server —
+	// each stream runs independently so one pipeline failure doesn't affect others.
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
-	select {
-	case <-sigCh:
-		slog.Info("Interrupted, shutting down...")
-	case err := <-md.Errors():
-		slog.Error("Stream error, shutting down...", "error", err)
-	}
+	// Monitor stream errors in background (log only, don't exit)
+	go func() {
+		for err := range md.Errors() {
+			slog.Error("Stream error (non-fatal)", "error", err)
+		}
+	}()
+
+	<-sigCh
+	slog.Info("Interrupted, shutting down...")
 
 	md.StopAll()
 	slog.Info("Done.")

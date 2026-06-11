@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"sync"
 )
 
@@ -77,10 +78,14 @@ func (d *Demuxer) Run() error {
 		}
 
 		// Dispatch to handler (synchronously for now; each stream
-		// typically has its own connection/goroutine)
+		// typically has its own connection/goroutine).
+		// Handler errors are logged but do NOT stop the demuxer —
+		// one stream's pipeline failure should not kill other streams.
 		if err := handler(header, payload); err != nil {
-			return fmt.Errorf("handler error (stream=%s): %w",
-				StreamName(header.StreamID), err)
+			// Log handler error but continue processing other packets.
+			// The handler itself should decide whether to stop.
+			// We use a package-level logger or just output to stderr.
+			fmt.Fprintf(os.Stderr, "[%s] handler error: %v\n", StreamName(header.StreamID), err)
 		}
 	}
 }

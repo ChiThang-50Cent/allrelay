@@ -101,7 +101,17 @@ func Connect(host string, basePort uint16, connectVideo, connectCamera, connectM
 		launch("mic", basePort+2, false)
 	}
 	if connectSpeaker {
-		launch("speaker", basePort+3, true)
+		// Speaker uses retry with backoff — Android server may need time
+		// to set up all ServerSockets before speaker is ready.
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			c := connectPortWithRetry(host, basePort+3, "speaker", 5)
+			if c == nil {
+				slog.Warn("Speaker connection failed (optional)")
+			}
+			results <- result{name: "speaker", conn: c, err: nil}
+		}()
 	}
 	if connectControl {
 		launch("control", basePort+4, false)
