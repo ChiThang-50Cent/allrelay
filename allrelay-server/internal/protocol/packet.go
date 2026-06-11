@@ -30,6 +30,7 @@ const (
 	StreamCamera  uint32 = 0x00000002
 	StreamMic     uint32 = 0x00000003
 	StreamSpeaker uint32 = 0x00000004
+	StreamControl uint32 = 0x00000005
 )
 
 // Flag bits in pts_and_flags.
@@ -51,6 +52,8 @@ func StreamName(id uint32) string {
 		return "mic"
 	case StreamSpeaker:
 		return "speaker"
+	case StreamControl:
+		return "control"
 	default:
 		return fmt.Sprintf("unknown(0x%08x)", id)
 	}
@@ -99,6 +102,10 @@ func (h *Header) MediaType() string {
 
 // ReadHeader reads and parses a 16-byte AllRelay header from the reader.
 // Returns io.EOF if the stream ends cleanly.
+//
+// Note: Session packets have a different byte layout than media/config packets.
+// For session packets, bytes 12-16 contain the new height, not payload size.
+// The payload size for session packets is always 0.
 func ReadHeader(r io.Reader) (*Header, error) {
 	buf := make([]byte, HeaderSize)
 	if _, err := io.ReadFull(r, buf); err != nil {
@@ -108,11 +115,20 @@ func ReadHeader(r io.Reader) (*Header, error) {
 		return nil, fmt.Errorf("read header: %w", err)
 	}
 
-	return &Header{
+	h := &Header{
 		StreamID:    binary.BigEndian.Uint32(buf[0:4]),
 		PTSAndFlags: binary.BigEndian.Uint64(buf[4:12]),
 		PayloadSize: binary.BigEndian.Uint32(buf[12:16]),
-	}, nil
+	}
+
+	// Session packets: bytes 12-16 contain height, not payload size.
+	// The session flag (bit 63) indicates this is a resolution/rotation change.
+	// Session packets have 16 bytes total with NO payload.
+	if h.IsSession() {
+		h.PayloadSize = 0
+	}
+
+	return h, nil
 }
 
 // ReadPayload reads exactly payloadSize bytes from the reader.

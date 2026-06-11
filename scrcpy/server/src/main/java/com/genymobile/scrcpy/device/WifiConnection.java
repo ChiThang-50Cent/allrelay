@@ -10,6 +10,7 @@ import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 
 /**
@@ -40,7 +41,8 @@ public final class WifiConnection implements Closeable {
     public static final int PORT_SPEAKER = 5003;
     public static final int PORT_CONTROL = 5004;
 
-    private static final int ACCEPT_TIMEOUT_MS = 30000; // 30 seconds
+    private static final int ACCEPT_TIMEOUT_MS = 30000; // 30 seconds (mandatory: video, control)
+    private static final int ACCEPT_TIMEOUT_OPTIONAL_MS = 3000; // 3 seconds (optional: camera, mic, speaker)
     private static final int DUMMY_BYTE = 0xAB;
 
     private final Socket videoSocket;
@@ -102,55 +104,112 @@ public final class WifiConnection implements Closeable {
                 Ln.d("Wi-Fi video listening on port " + basePort);
             }
             if (camera) {
-                cameraServer = bindAndListen(basePort + 1); // PORT_CAMERA
+                cameraServer = bindAndListenWithTimeout(basePort + 1, ACCEPT_TIMEOUT_OPTIONAL_MS); // PORT_CAMERA
                 Ln.d("Wi-Fi camera listening on port " + (basePort + 1));
             }
             if (audio) {
-                audioServer = bindAndListen(basePort + 2); // PORT_MIC
+                audioServer = bindAndListenWithTimeout(basePort + 2, ACCEPT_TIMEOUT_OPTIONAL_MS); // PORT_MIC
                 Ln.d("Wi-Fi audio (mic) listening on port " + (basePort + 2));
             }
             if (speaker) {
-                speakerServer = bindAndListen(basePort + 3); // PORT_SPEAKER
+                speakerServer = bindAndListenWithTimeout(basePort + 3, ACCEPT_TIMEOUT_OPTIONAL_MS); // PORT_SPEAKER
                 Ln.d("Wi-Fi speaker listening on port " + (basePort + 3));
             }
             if (control) {
-                controlServer = bindAndListen(basePort + 4); // PORT_CONTROL
+                controlServer = bindAndListen(basePort + 4); // PORT_CONTROL (long timeout — mandatory)
                 Ln.d("Wi-Fi control listening on port " + (basePort + 4));
             }
 
-            // Accept connections (blocking, with timeout)
-            // Video is required, camera/audio/speaker/control are optional
-            if (videoServer != null) {
-                videoSocket = acceptConnection(videoServer, "video");
+            // Accept connections in parallel to avoid blocking the control
+            // port behind optional camera/audio/speaker timeouts.
+            final Socket[] acceptedVideo = {null};
+            final Socket[] acceptedCamera = {null};
+            final Socket[] acceptedAudio = {null};
+            final Socket[] acceptedSpeaker = {null};
+            final Socket[] acceptedControl = {null};
+
+            // Capture references as final for lambda use
+            final ServerSocket fVideoServer = videoServer;
+            final ServerSocket fCameraServer = cameraServer;
+            final ServerSocket fAudioServer = audioServer;
+            final ServerSocket fSpeakerServer = speakerServer;
+            final ServerSocket fControlServer = controlServer;
+
+            java.util.List<Thread> acceptThreads = new java.util.ArrayList<>();
+
+            if (fVideoServer != null) {
+                Thread t = new Thread(() -> {
+                    try {
+                        acceptedVideo[0] = acceptConnection(fVideoServer, "video");
+                        // Send device name immediately after video connection,
+                        // before other accept threads complete (avoids deadlock
+                        // where client waits for device name but server waits
+                        // for control/mic/speaker connections).
+                        sendDeviceMetaAsync(acceptedVideo[0]);
+                    } catch (IOException ignored) {}
+                }, "accept-video");
+                acceptThreads.add(t);
+                t.start();
             }
-            if (cameraServer != null) {
+            if (fCameraServer != null) {
+                Thread t = new Thread(() -> {
+                    try { acceptedCamera[0] = acceptConnection(fCameraServer, "camera"); }
+                    catch (IOException ignored) {}
+                }, "accept-camera");
+                acceptThreads.add(t);
+                t.start();
+            }
+            if (fAudioServer != null) {
+                Thread t = new Thread(() -> {
+                    try { acceptedAudio[0] = acceptConnection(fAudioServer, "audio"); }
+                    catch (IOException ignored) {}
+                }, "accept-audio");
+                acceptThreads.add(t);
+                t.start();
+            }
+            if (fSpeakerServer != null) {
+                Thread t = new Thread(() -> {
+                    try { acceptedSpeaker[0] = acceptConnection(fSpeakerServer, "speaker"); }
+                    catch (IOException ignored) {}
+                }, "accept-speaker");
+                acceptThreads.add(t);
+                t.start();
+            }
+            if (fControlServer != null) {
+                Thread t = new Thread(() -> {
+                    try { acceptedControl[0] = acceptConnection(fControlServer, "control"); }
+                    catch (IOException ignored) {}
+                }, "accept-control");
+                acceptThreads.add(t);
+                t.start();
+            }
+
+            // Wait for mandatory accept threads (video, control) to complete.
+            // Optional threads (camera, audio, speaker) join with a short timeout
+            // to avoid blocking startup when the client skips those ports.
+            final long OPTIONAL_TIMEOUT_MS = 4000;
+
+            for (Thread t : acceptThreads) {
+                String tname = t.getName();
+                boolean isOptional = tname.startsWith("accept-camera")
+                        || tname.startsWith("accept-audio")
+                        || tname.startsWith("accept-speaker");
                 try {
-                    cameraSocket = acceptConnection(cameraServer, "camera");
-                } catch (IOException e) {
-                    Ln.w("Camera connection not established (client may have skipped it): " + e.getMessage());
+                    if (isOptional) {
+                        t.join(OPTIONAL_TIMEOUT_MS);
+                    } else {
+                        t.join();
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
                 }
             }
-            if (audioServer != null) {
-                try {
-                    audioSocket = acceptConnection(audioServer, "audio");
-                } catch (IOException e) {
-                    Ln.w("Audio connection not established (client may have skipped it): " + e.getMessage());
-                }
-            }
-            if (speakerServer != null) {
-                try {
-                    speakerSocket = acceptConnection(speakerServer, "speaker");
-                } catch (IOException e) {
-                    Ln.w("Speaker connection not established (client may have skipped it): " + e.getMessage());
-                }
-            }
-            if (controlServer != null) {
-                try {
-                    controlSocket = acceptConnection(controlServer, "control");
-                } catch (IOException e) {
-                    Ln.w("Control connection not established (client may have skipped it): " + e.getMessage());
-                }
-            }
+
+            videoSocket = acceptedVideo[0];
+            cameraSocket = acceptedCamera[0];
+            audioSocket = acceptedAudio[0];
+            speakerSocket = acceptedSpeaker[0];
+            controlSocket = acceptedControl[0];
 
             // Close server sockets after all connections established
             closeServerSocket(videoServer);
@@ -187,9 +246,13 @@ public final class WifiConnection implements Closeable {
     }
 
     private static ServerSocket bindAndListen(int port) throws IOException {
+        return bindAndListenWithTimeout(port, ACCEPT_TIMEOUT_MS);
+    }
+
+    private static ServerSocket bindAndListenWithTimeout(int port, int timeoutMs) throws IOException {
         ServerSocket serverSocket = new ServerSocket();
         serverSocket.setReuseAddress(true);
-        serverSocket.setSoTimeout(ACCEPT_TIMEOUT_MS);
+        serverSocket.setSoTimeout(timeoutMs);
         serverSocket.bind(new InetSocketAddress(port), 1);
         return serverSocket;
     }
@@ -247,6 +310,38 @@ public final class WifiConnection implements Closeable {
             OutputStream out = socket.getOutputStream();
             out.write(buffer);
             out.flush();
+        }
+    }
+
+    /**
+     * Write a ByteBuffer to an OutputStream, flushing after.
+     */
+    private static void writeFully(OutputStream out, ByteBuffer buffer) throws IOException {
+        if (buffer.hasArray()) {
+            out.write(buffer.array(), buffer.arrayOffset() + buffer.position(), buffer.remaining());
+        } else {
+            byte[] buf = new byte[buffer.remaining()];
+            buffer.get(buf);
+            out.write(buf);
+        }
+        out.flush();
+    }
+
+    /**
+     * Send device name to a specific socket (used by parallel accept thread).
+     */
+    private static void sendDeviceMetaAsync(Socket socket) {
+        if (socket == null) return;
+        try {
+            byte[] buffer = new byte[DEVICE_NAME_FIELD_LENGTH];
+            byte[] nameBytes = Device.getDeviceName().getBytes(StandardCharsets.UTF_8);
+            int len = Math.min(nameBytes.length, DEVICE_NAME_FIELD_LENGTH - 1);
+            System.arraycopy(nameBytes, 0, buffer, 0, len);
+            OutputStream out = socket.getOutputStream();
+            out.write(buffer);
+            out.flush();
+        } catch (IOException e) {
+            Ln.w("Failed to send device name: " + e.getMessage());
         }
     }
 

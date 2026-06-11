@@ -54,7 +54,9 @@ public final class WifiStreamer {
             ByteBuffer buffer = ByteBuffer.allocate(4);
             buffer.putInt(codec.getId());
             buffer.flip();
-            writeFully(buffer);
+            byte[] payload = new byte[buffer.remaining()];
+            buffer.get(payload);
+            writePacket(ByteBuffer.wrap(payload), 0, true, false);
         }
     }
 
@@ -63,7 +65,9 @@ public final class WifiStreamer {
             ByteBuffer buffer = ByteBuffer.allocate(4);
             buffer.putInt(codec.getId());
             buffer.flip();
-            writeFully(buffer);
+            byte[] payload = new byte[buffer.remaining()];
+            buffer.get(payload);
+            writePacket(ByteBuffer.wrap(payload), 0, true, false);
         }
     }
 

@@ -43,3 +43,9 @@ cmd/mdns-discover/mdns-discover
 # Python
 __pycache__/
 *.pyc
+
+# Go binary (built in package root by accident)
+allrelay-server/allrelay-server
+
+# Phase 3 test script (generated, not for commit)
+scripts/test-phase3.sh

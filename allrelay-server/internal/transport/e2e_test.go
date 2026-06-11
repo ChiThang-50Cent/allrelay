@@ -47,6 +47,13 @@ func TestE2EMultiStream(t *testing.T) {
 			// Send dummy byte
 			conn.Write([]byte{0xAB})
 
+			// Video port (basePort+0) also sends 64-byte device name
+			if idx == 0 {
+				deviceName := make([]byte, 64)
+				copy(deviceName, []byte("TestDevice\x00"))
+				conn.Write(deviceName)
+			}
+
 			// Send a tagged test packet
 			payload := fmt.Sprintf("HELLO_FROM_%s", name)
 			header := make([]byte, 16)

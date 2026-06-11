@@ -18,6 +18,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"strings"
 	"time"
 
 	"github.com/allrelay/allrelay-server/internal/protocol"
@@ -32,6 +33,9 @@ const (
 
 	// Dummy byte sent by server on connect
 	dummyByte = 0xAB
+
+	// Device name field length (matches DEVICE_NAME_FIELD_LENGTH in WifiConnection.java)
+	deviceNameLen = 64
 )
 
 // Connection holds all TCP connections to the Android server.
@@ -99,9 +103,12 @@ func Connect(host string, basePort uint16, connectVideo, connectCamera, connectM
 	return conn, nil
 }
 
-// connectPort connects to a single port, reads the dummy byte, and returns the connection.
+// connectPort connects to a single port, reads the dummy byte and device name,
+// and returns the connection.
 func connectPort(host string, port uint16, name string) (net.Conn, error) {
 	addr := fmt.Sprintf("%s:%d", host, port)
+
+	slog.Debug("connectPort: dialing", "name", name, "addr", addr)
 
 	dialer := net.Dialer{Timeout: connectTimeout}
 	conn, err := dialer.Dial("tcp", addr)
@@ -109,24 +116,54 @@ func connectPort(host string, port uint16, name string) (net.Conn, error) {
 		return nil, fmt.Errorf("dial %s: %w", name, err)
 	}
 
+	slog.Debug("connectPort: connected", "name", name)
+
 	// Enable TCP_NODELAY for low latency
 	if tcpConn, ok := conn.(*net.TCPConn); ok {
 		tcpConn.SetNoDelay(true)
 		tcpConn.SetReadBuffer(256 * 1024)
 	}
 
+	// Set a deadline for reading the dummy byte.
+	conn.SetReadDeadline(time.Now().Add(15 * time.Second))
+
 	// Read the dummy byte sent by the server
+	slog.Debug("connectPort: reading dummy", "name", name)
 	dummy := make([]byte, 1)
 	if _, err := io.ReadFull(conn, dummy); err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("read dummy byte (%s): %w", name, err)
 	}
 
+	slog.Debug("connectPort: got dummy", "name", name, "byte", fmt.Sprintf("0x%02x", dummy[0]))
+
 	if dummy[0] != dummyByte {
 		conn.Close()
 		return nil, fmt.Errorf("unexpected dummy byte (%s): 0x%02x", name, dummy[0])
 	}
 
+	// The video port (port 5000) receives a 64-byte device name from the
+	// Android server immediately after the dummy byte. Consume it so the
+	// AllRelay packet reader doesn't misinterpret it as a packet header.
+	if name == "video" {
+		slog.Debug("connectPort: reading device name", "name", name)
+		deviceNameBuf := make([]byte, deviceNameLen)
+		if _, err := io.ReadFull(conn, deviceNameBuf); err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("read device name: %w", err)
+		}
+		// Extract null-terminated device name for logging
+		devName := string(deviceNameBuf)
+		if idx := strings.IndexByte(devName, 0); idx >= 0 {
+			devName = devName[:idx]
+		}
+		slog.Info("Device name", "name", devName)
+	}
+
+	// Clear deadline after successful read
+	conn.SetReadDeadline(time.Time{})
+
+	slog.Debug("connectPort: done", "name", name)
 	return conn, nil
 }
 
@@ -188,6 +225,8 @@ func (c *Connection) HasStream(id uint32) bool {
 		return c.mic != nil
 	case protocol.StreamSpeaker:
 		return c.speaker != nil
+	case protocol.StreamControl:
+		return c.control != nil
 	default:
 		return false
 	}

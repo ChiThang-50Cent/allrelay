@@ -23,8 +23,12 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/allrelay/allrelay-server/internal/control"
+	"github.com/allrelay/allrelay-server/internal/heartbeat"
+	"github.com/allrelay/allrelay-server/internal/input"
 	"github.com/allrelay/allrelay-server/internal/protocol"
 	"github.com/allrelay/allrelay-server/internal/transport"
+	"github.com/allrelay/allrelay-server/internal/video"
 )
 
 func main() {
@@ -34,6 +38,10 @@ func main() {
 	noCamera := flag.Bool("no-camera", false, "Disable camera stream")
 	noMic := flag.Bool("no-mic", false, "Disable microphone stream")
 	noSpeaker := flag.Bool("no-speaker", false, "Disable speaker stream")
+	noControl := flag.Bool("no-control", false, "Disable control channel (input injection)")
+	noInput := flag.Bool("no-input", false, "Disable input capture (keyboard/mouse → phone)")
+	noHeartbeat := flag.Bool("no-heartbeat", false, "Disable heartbeat/status monitoring")
+	noReconnect := flag.Bool("no-reconnect", false, "Disable auto-reconnection")
 	verbose := flag.Bool("v", false, "Verbose debug output")
 	flag.Parse()
 
@@ -54,7 +62,7 @@ func main() {
 
 	// Connect to all enabled streams
 	conn, err := transport.Connect(*host, uint16(*port),
-		!*noScreen, !*noCamera, !*noMic, !*noSpeaker, false) // control deferred to Phase 3
+		!*noScreen, !*noCamera, !*noMic, !*noSpeaker, !*noControl)
 	if err != nil {
 		slog.Error("Connection failed", "error", err)
 		os.Exit(1)
@@ -69,15 +77,33 @@ func main() {
 	// Screen stream handler (stream ID 0x01)
 	if !*noScreen && conn.HasStream(protocol.StreamScreen) {
 		slog.Info("Screen stream: connected")
-		md.AddStream(protocol.StreamScreen, conn.VideoStream(),
-			makeScreenHandler())
+
+		screenPipeline, err := video.MonitorPipeline()
+		if err != nil {
+			slog.Error("Failed to start monitor pipeline", "error", err)
+		} else {
+			md.AddStream(protocol.StreamScreen, conn.VideoStream(),
+				makeScreenHandler(screenPipeline))
+		}
 	}
 
 	// Camera stream handler (stream ID 0x02)
 	if !*noCamera && conn.HasStream(protocol.StreamCamera) {
-		slog.Info("Camera stream: connected")
-		md.AddStream(protocol.StreamCamera, conn.CameraStream(),
-			makeCameraHandler())
+		cameraDev := video.GetCameraDevice()
+		slog.Info("Camera stream: connected", "device", cameraDev)
+
+		// Try to ensure v4l2loopback is loaded (non-fatal — user can fix later)
+		if err := video.EnsureV4L2Device(cameraDev); err != nil {
+			slog.Warn("v4l2loopback not ready", "error", err)
+		}
+
+		cameraPipeline, err := video.CameraPipeline(cameraDev)
+		if err != nil {
+			slog.Error("Failed to start camera pipeline", "error", err)
+		} else {
+			md.AddStream(protocol.StreamCamera, conn.CameraStream(),
+				makeCameraHandler(cameraPipeline))
+		}
 	}
 
 	// Mic stream handler (stream ID 0x03)
@@ -92,7 +118,46 @@ func main() {
 		slog.Info("Speaker stream: connected", "note", "ready for PC→phone audio (Phase 3)")
 	}
 
+	// Set up control channel + input injection
+	var ctrl *control.Channel
+	var inputCapture interface {
+		Events() <-chan input.Event
+		Close() error
+	}
+
+	if !*noControl && conn.HasStream(protocol.StreamControl) {
+		slog.Info("Control channel: connected")
+		ctrl = control.NewChannel(conn.ControlConn())
+		defer ctrl.Close()
+
+		// Input capture: forward PC keyboard/mouse → Android
+		if !*noInput {
+			var err error
+			inputCapture, err = input.NewBestCapture()
+			if err != nil {
+				slog.Warn("Input capture unavailable", "error", err)
+			} else {
+				slog.Info("Input capture: enabled (keyboard + mouse → phone)")
+				go forwardInputEvents(inputCapture.Events(), ctrl)
+				defer inputCapture.Close()
+			}
+		}
+	}
+
 	slog.Info("Streaming... Press Ctrl+C to stop.")
+
+	// Start heartbeat monitor (UDP port 5005)
+	if !*noHeartbeat {
+		hm, err := heartbeat.NewMonitor(heartbeat.DefaultPort)
+		if err != nil {
+			slog.Warn("Heartbeat monitor unavailable", "error", err)
+		} else {
+			defer hm.Close()
+			// Display status updates in background
+			go displayStatus(hm, *noReconnect)
+			slog.Info("Heartbeat monitor: listening", "port", heartbeat.DefaultPort)
+		}
+	}
 
 	// Wait for interrupt or stream error
 	sigCh := make(chan os.Signal, 1)
@@ -110,17 +175,25 @@ func main() {
 }
 
 // makeScreenHandler creates a handler for screen video packets.
-// Phase 2: logs statistics; Phase 3: routes to SDL2 window.
-func makeScreenHandler() protocol.StreamHandler {
+// Routes H.264 frames to a GStreamer pipeline with display sink.
+func makeScreenHandler(pipeline *video.Pipeline) protocol.StreamHandler {
 	var frameCount uint64
 	var byteCount uint64
+	var haveConfig bool
 
 	return func(header *protocol.Header, payload []byte) error {
 		frameCount++
 		byteCount += uint64(len(payload))
 
 		if header.IsConfig() {
-			slog.Debug("screen config", "bytes", len(payload))
+			haveConfig = true
+			annexB := video.ConfigToAnnexB(payload)
+			if _, err := pipeline.Write(annexB); err != nil {
+				return fmt.Errorf("screen config write: %w", err)
+			}
+			slog.Debug("screen config fed to pipeline",
+				"raw_bytes", len(payload),
+				"annexb_bytes", len(annexB))
 			return nil
 		}
 		if header.IsSession() {
@@ -128,7 +201,14 @@ func makeScreenHandler() protocol.StreamHandler {
 			return nil
 		}
 
-		// Log every 300 frames (~10 seconds at 30fps)
+		if !haveConfig && header.IsKeyFrame() {
+			slog.Warn("screen: keyframe without prior config, decode may fail")
+		}
+
+		if _, err := pipeline.Write(payload); err != nil {
+			return fmt.Errorf("screen frame write: %w", err)
+		}
+
 		if frameCount%300 == 0 {
 			slog.Debug("screen stream",
 				"frame", frameCount,
@@ -141,27 +221,54 @@ func makeScreenHandler() protocol.StreamHandler {
 }
 
 // makeCameraHandler creates a handler for camera video packets.
-// Phase 2: logs statistics; Phase 3: routes to v4l2loopback.
-func makeCameraHandler() protocol.StreamHandler {
+// Routes H.264 frames to a GStreamer pipeline → v4l2loopback.
+func makeCameraHandler(pipeline *video.Pipeline) protocol.StreamHandler {
 	var frameCount uint64
+	var byteCount uint64
+	var haveConfig bool
 
 	return func(header *protocol.Header, payload []byte) error {
 		frameCount++
+		byteCount += uint64(len(payload))
 
+		// Write config (SPS/PPS) before any key frames
 		if header.IsConfig() {
-			slog.Debug("camera config", "bytes", len(payload))
+			haveConfig = true
+			// Convert to Annex B format for GStreamer byte-stream decoder
+			annexB := video.ConfigToAnnexB(payload)
+			if _, err := pipeline.Write(annexB); err != nil {
+				return fmt.Errorf("camera config write: %w", err)
+			}
+			slog.Debug("camera config fed to pipeline",
+				"raw_bytes", len(payload),
+				"annexb_bytes", len(annexB))
 			return nil
 		}
+
+		// Session packets (resolution/rotation changes) are handled by GStreamer
+		// via SPS changes in the stream; log but don't feed to pipeline.
 		if header.IsSession() {
-			slog.Debug("camera session", "bytes", len(payload))
+			slog.Debug("camera session update", "bytes", len(payload))
 			return nil
+		}
+
+		// If we haven't received config yet, the decoder may fail on the
+		// first keyframe. This is normal — config is usually sent first.
+		if !haveConfig && header.IsKeyFrame() {
+			slog.Warn("camera: keyframe without prior config, decode may fail")
+		}
+
+		// Feed frame to GStreamer pipeline
+		if _, err := pipeline.Write(payload); err != nil {
+			return fmt.Errorf("camera frame write: %w", err)
 		}
 
 		if frameCount%150 == 0 {
 			slog.Debug("camera stream",
 				"frame", frameCount,
 				"size", len(payload),
-				"pts", header.PTS())
+				"pts", header.PTS(),
+				"total_bytes", byteCount)
 		}
 		return nil
 	}
@@ -201,4 +308,51 @@ func WriteSpeakerPacket(w io.Writer, pts uint64, payload []byte) error {
 	_ = pts
 	_ = payload
 	return nil
+}
+
+// forwardInputEvents reads captured input events from the input capturer
+// and sends them to the Android device via the control channel.
+//
+// Keyboard events: Linux/X11 keycode → Android keycode → control channel
+// Mouse events: left click → touch down/up, right click → Back
+func forwardInputEvents(events <-chan input.Event, ctrl *control.Channel) {
+	for event := range events {
+		switch event.Type {
+		case input.EventKeyDown:
+			if err := ctrl.SendKey("down", event.Keycode); err != nil {
+				slog.Debug("key down send failed", "keycode", event.Keycode, "error", err)
+			}
+		case input.EventKeyUp:
+			if err := ctrl.SendKey("up", event.Keycode); err != nil {
+				slog.Debug("key up send failed", "keycode", event.Keycode, "error", err)
+			}
+		case input.EventTouchDown:
+			if err := ctrl.SendTouch("down", event.X, event.Y); err != nil {
+				slog.Debug("touch down send failed", "error", err)
+			}
+		case input.EventTouchMove:
+			if err := ctrl.SendTouch("move", event.X, event.Y); err != nil {
+				slog.Debug("touch move send failed", "error", err)
+			}
+		case input.EventTouchUp:
+			if err := ctrl.SendTouch("up", event.X, event.Y); err != nil {
+				slog.Debug("touch up send failed", "error", err)
+			}
+		}
+	}
+	slog.Info("Input forwarder stopped")
+}
+
+// displayStatus monitors heartbeat updates and logs device status.
+// When noReconnect is false and heartbeat is lost, it triggers reconnection.
+func displayStatus(hm *heartbeat.Monitor, noReconnect bool) {
+	for status := range hm.Updates() {
+		slog.Info("Device status",
+			"battery", status.Device.Battery,
+			"wifi_rssi", status.Device.WiFiRSSI,
+			"cpu", fmt.Sprintf("%.1f%%", status.Device.CPUUsage),
+			"wifi_speed", fmt.Sprintf("%d Mbps", status.Device.WiFiLinkSpeed))
+
+		_ = noReconnect // TODO(Phase 3): trigger reconnection on heartbeat loss
+	}
 }

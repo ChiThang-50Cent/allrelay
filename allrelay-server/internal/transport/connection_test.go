@@ -6,7 +6,8 @@ import (
 	"time"
 )
 
-// TestConnectAndDummyByte verifies that connectPort reads the dummy byte correctly.
+// TestConnectAndDummyByte verifies that connectPort reads the dummy byte correctly
+// for a non-video port (no device name expected).
 func TestConnectAndDummyByte(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -17,7 +18,6 @@ func TestConnectAndDummyByte(t *testing.T) {
 	addr := listener.Addr().(*net.TCPAddr)
 	port := uint16(addr.Port)
 
-	// Accept in background
 	errCh := make(chan error, 1)
 	go func() {
 		conn, err := listener.Accept()
@@ -30,21 +30,52 @@ func TestConnectAndDummyByte(t *testing.T) {
 		errCh <- nil
 	}()
 
+	// Use "test" (not "video") to avoid device name read
 	conn, err := connectPort("127.0.0.1", port, "test")
 	if err != nil {
 		t.Fatalf("connectPort failed: %v", err)
 	}
 	conn.Close()
 
-	// Wait for accept goroutine
 	select {
 	case err := <-errCh:
 		if err != nil {
 			t.Logf("Accept error: %v", err)
 		}
 	case <-time.After(1 * time.Second):
-		t.Log("Accept goroutine timeout (expected if test finished first)")
 	}
+}
+
+// TestConnectAndDummyByteVideo verifies that connectPort reads the dummy byte
+// AND the device name for the video port.
+func TestConnectAndDummyByteVideo(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Failed to listen: %v", err)
+	}
+	defer listener.Close()
+
+	addr := listener.Addr().(*net.TCPAddr)
+	port := uint16(addr.Port)
+
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		// Send dummy byte + 64-byte device name
+		buf := make([]byte, 65)
+		buf[0] = 0xAB
+		copy(buf[1:], []byte("TestPhone\x00"))
+		conn.Write(buf)
+	}()
+
+	conn, err := connectPort("127.0.0.1", port, "video")
+	if err != nil {
+		t.Fatalf("connectPort video failed: %v", err)
+	}
+	conn.Close()
 }
 
 // TestConnectWrongDummyByte verifies error on wrong dummy byte.
@@ -83,7 +114,6 @@ func TestConnectionEmptyClose(t *testing.T) {
 
 // TestHasStream verifies stream presence checks.
 func TestHasStream(t *testing.T) {
-	// Create a mock connection to test HasStream
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("Failed to listen: %v", err)
@@ -102,13 +132,13 @@ func TestHasStream(t *testing.T) {
 		}
 	}()
 
-	conn, err := connectPort("127.0.0.1", port, "video")
+	// Use "control" to avoid device name read
+	conn, err := connectPort("127.0.0.1", port, "control")
 	if err != nil {
 		t.Fatalf("connectPort failed: %v", err)
 	}
 	defer conn.Close()
 
-	// Verify connection established
 	if conn == nil {
 		t.Fatal("Connection is nil")
 	}
