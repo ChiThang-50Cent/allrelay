@@ -306,26 +306,26 @@ func makeCameraHandler(pipeline *video.Pipeline) protocol.StreamHandler {
 }
 
 // makeMicHandler creates a handler for microphone Opus packets.
-// Routes phone mic audio → Ogg muxing → FIFO → gst-launch → pulsesink → null-sink,
-// then pw-loopback exposes the null-sink monitor as a virtual microphone source.
+// Routes phone mic audio → Ogg muxing → Go pipe → gst-launch → pipewiresink.
 //
-// Uses a FIFO + delayed gst-launch start to avoid "EOS before finding a chain"
-// from oggdemux (phone sends config immediately but audio data starts seconds later).
+// Uses a Go pipe (os.Pipe) instead of a FIFO to eliminate filesrc buffering
+// which was causing 10-15 second latency. fdsrc fd=0 reads directly from pipe.
+// Skips non-audio packets (session, codec ID, tiny metadata) to prevent stalls.
 func makeMicHandler() protocol.StreamHandler {
-	fifoPath := fmt.Sprintf("/tmp/allrelay-mic-%d.fifo", os.Getpid())
-	os.Remove(fifoPath)
-	if err := exec.Command("mkfifo", fifoPath).Run(); err != nil {
-		slog.Error("Mic: mkfifo failed", "error", err)
+	// Use a Go pipe instead of a FIFO for low latency.
+	// filesrc on a FIFO was causing 10-15 second buffering delays.
+	// fdsrc fd=0 reads directly from the pipe without extra buffering.
+	pipeR, pipeW, err := os.Pipe()
+	if err != nil {
+		slog.Error("Mic: pipe creation failed", "error", err)
 		return func(header *protocol.Header, payload []byte) error { return nil }
 	}
 
-	// Start gst-launch reading from FIFO, output via pipewiresink.
+	// Start gst-launch reading from stdin (fd 0 = pipeR).
 	// pipewiresink mode=provide creates an Audio/Source node that
 	// browsers (Chrome, Edge) detect as a virtual microphone.
-	// This replaces the old pulsesink→null-sink→loopback approach
-	// which was unreliable with PipeWire.
 	cmd := exec.Command("gst-launch-1.0", "-q",
-		"filesrc", "location="+fifoPath,
+		"fdsrc", "fd=0",
 		"!", "oggdemux",
 		"!", "opusdec",
 		"!", "audioconvert",
@@ -334,23 +334,16 @@ func makeMicHandler() protocol.StreamHandler {
 		"!", "pipewiresink", "mode=provide",
 		"stream-properties=p,media.class=Audio/Source,node.name=allrelay-mic,node.description=AllRelay_Microphone",
 	)
+	cmd.Stdin = pipeR
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
 		slog.Error("Mic: gst-launch start failed", "error", err)
-		os.Remove(fifoPath)
+		pipeR.Close()
+		pipeW.Close()
 		return func(header *protocol.Header, payload []byte) error { return nil }
 	}
-
-	// Open FIFO with O_RDWR — never blocks even without reader.
-	// This eliminates the race where gst-launch opens read-end and
-	// immediately closes it before we write the first byte.
-	oggOut, openErr := os.OpenFile(fifoPath, os.O_RDWR, 0)
-	if openErr != nil {
-		slog.Error("Mic: FIFO open failed", "error", openErr)
-		cmd.Process.Kill()
-		os.Remove(fifoPath)
-		return func(header *protocol.Header, payload []byte) error { return nil }
-	}
+	// Close our read-end — only gst-launch reads from it
+	pipeR.Close()
 
 	slog.Info("Mic: gst-launch pipeline started → allrelay-mic", "pid", cmd.Process.Pid)
 
@@ -358,8 +351,7 @@ func makeMicHandler() protocol.StreamHandler {
 		if err := cmd.Wait(); err != nil {
 			slog.Warn("Mic: gst-launch exited", "error", err)
 		}
-		oggOut.Close()
-		os.Remove(fifoPath)
+		pipeW.Close()
 	}()
 
 	var (
@@ -378,48 +370,64 @@ func makeMicHandler() protocol.StreamHandler {
 		mu.Lock()
 		defer mu.Unlock()
 
+		// Skip session packets (resolution changes, metadata)
+		if header.IsSession() {
+			return nil
+		}
+
+		// Collect config (OpusHead) for Ogg header
+		if header.IsConfig() {
+			if len(payload) >= 10 { // OpusHead is 19 bytes
+				pendingCfg = payload
+				slog.Debug("Mic: received OpusHead config", "bytes", len(payload))
+			}
+			return nil
+		}
+
+		// Skip non-audio packets (codec ID header, tiny metadata).
+		// Valid Opus packets are >= 10 bytes (minimum for 8kbps frames).
+		if len(payload) < 10 {
+			return nil
+		}
+
 		packetCount++
 		if packetCount <= 3 {
 			slog.Info("mic packet received", "num", packetCount, "isConfig", header.IsConfig(), "size", len(payload))
 		}
 		byteCount += uint64(len(payload))
 
-		if header.IsConfig() {
-			pendingCfg = payload
-			return nil
-		}
-
-		// Buffer audio packets until we have config + a few packets.
-		// This prevents oggdemux from getting "EOS before finding a chain"
-		// when there's a gap between OpusHead and first audio data.
-		// Reduced from 25→5 packets (100ms buffer) for lower latency.
+		// Buffer just 2 audio packets (40ms) before starting pipeline.
+		// This prevents oggdemux "EOS before finding a chain" when
+		// OpusHead and first audio data arrive separately.
 		if !started {
 			pending = append(pending, payload)
-			if len(pendingCfg) > 0 && len(pending) >= 5 {
-				// Write buffered config + all buffered audio now
-				writeOggPage(oggOut, serial, pageSeq, 0, [][]byte{pendingCfg})
+			if len(pendingCfg) > 0 && len(pending) >= 2 {
+				// Write OpusHead Ogg page (BOS)
+				writeOggPage(pipeW, serial, pageSeq, 0, [][]byte{pendingCfg})
 				pageSeq++
+				// Write OpusTags page
 				tagsPacket := make([]byte, 24)
 				copy(tagsPacket, "OpusTags")
 				tagsPacket[8] = 8
 				copy(tagsPacket[12:], "AllRelay")
-				writeOggPage(oggOut, serial, pageSeq, 0, [][]byte{tagsPacket})
+				writeOggPage(pipeW, serial, pageSeq, 0, [][]byte{tagsPacket})
 				pageSeq++
-				for _ = range pending {
+				for range pending {
 					granulePos += 960
 				}
-				writeOggPage(oggOut, serial, pageSeq, granulePos, pending)
+				writeOggPage(pipeW, serial, pageSeq, granulePos, pending)
 				pageSeq++
 				pending = nil
 				pendingCfg = nil
 				started = true
+				slog.Info("Mic: streaming started", "buffered", len(pending))
 			}
 			return nil
 		}
 
 		// Streaming mode: write one Ogg page per packet
 		granulePos += 960
-		writeOggPage(oggOut, serial, pageSeq, granulePos, [][]byte{payload})
+		writeOggPage(pipeW, serial, pageSeq, granulePos, [][]byte{payload})
 		pageSeq++
 
 		if packetCount%500 == 0 {
