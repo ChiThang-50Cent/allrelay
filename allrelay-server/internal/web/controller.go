@@ -493,11 +493,9 @@ func runSpeakerCapture(ctx context.Context, w io.Writer, onMetrics func(fps, bit
 func runCameraCapture(ctx context.Context, reader io.Reader) error {
 	device := video.GetCameraDevice()
 
-	// Reload v4l2loopback to ensure clean state for Chrome/Meet.
-	// Chrome uses V4L2 directly (not PipeWire portal).
-	if err := video.ReloadV4L2Loopback(device); err != nil {
-		slog.Warn("Camera: v4l2loopback reload failed", "error", err,
-			"hint", "Set ALLRELAY_SUDO_PASSWORD env or run manually")
+	// Ensure v4l2loopback device exists (module should be loaded at boot)
+	if err := video.EnsureV4L2Device(device); err != nil {
+		slog.Warn("Camera: v4l2 device check failed", "error", err)
 	}
 
 	slog.Info("Camera: opening v4l2 pipeline", "device", device)

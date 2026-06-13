@@ -179,29 +179,24 @@ func (p *Pipeline) Done() <-chan error {
 }
 
 // CameraPipeline creates a pipeline that decodes H.264 from stdin and
-// publishes decoded frames as a PipeWire video source.
+// writes decoded YUYV frames to a v4l2loopback device (/dev/video10).
 //
-// Firefox uses xdg-desktop-portal (works). Chrome/Chromium needs
-// --enable-features=WebRTCPipeWireCamera flag or the Video/Source must
-// be in "streaming" state before Chrome enumerates cameras.
+// This works with Chrome/Zoom/Meet (V4L2-based) and Firefox (falls back to V4L2).
+// PipeWire alternative exists in PipeWireCameraPipeline() for browsers that
+// support it natively, but V4L2 is universally compatible.
 //
-// Pipeline: H.264 stdin → h264parse → avdec_h264 → videorate → videoconvert → YUY2 → pipewiresink
+// device is the v4l2loopback device path, e.g. "/dev/video10".
 func CameraPipeline(device string) (*Pipeline, error) {
-	_ = device
+	// ffmpeg: H.264 stdin → decode → YUYV → v4l2 output
 	args := []string{
-		"-q",
-		"fdsrc", "fd=0",
-		"!", "h264parse",
-		"!", "avdec_h264",
-		"!", "videorate",
-		"!", "videoconvert",
-		"!", "video/x-raw,format=YUY2,framerate=30/1",
-		"!", "pipewiresink",
-		"mode=provide",
-		"stream-properties=p,media.class=Video/Source,media.role=Camera,node.name=allrelay-camera,node.description=AllRelay_Camera",
-		"client-name=AllRelay Camera",
+		"-loglevel", "error",
+		"-f", "h264",
+		"-i", "pipe:0",
+		"-pix_fmt", "yuyv422",
+		"-f", "v4l2",
+		device,
 	}
-	return NewCmdPipeline("camera", "gst-launch-1.0", args)
+	return NewCmdPipeline("camera", "ffmpeg", args)
 }
 
 // PipeWireCameraPipeline creates a PipeWire video source from v4l2loopback
