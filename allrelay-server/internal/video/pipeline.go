@@ -179,21 +179,27 @@ func (p *Pipeline) Done() <-chan error {
 }
 
 // CameraPipeline creates a pipeline that decodes H.264 from stdin and
-// writes decoded frames to a v4l2loopback device using FFmpeg.
-// FFmpeg handles the decode + YUY2 conversion + V4L2 output.
+// publishes decoded frames as a PipeWire video source for browsers.
 //
-// device is the v4l2loopback device path, e.g. "/dev/video10".
+// PipeWire replaces v4l2loopback — no kernel module, no sudo needed.
+// The video source appears in browsers (Zoom/Meet) via xdg-desktop-portal.
+//
+// Pipeline: H.264 stdin → h264parse → avdec_h264 → videoconvert → YUY2 → pipewiresink
 func CameraPipeline(device string) (*Pipeline, error) {
-	// ffmpeg -loglevel error -f h264 -i pipe:0 -pix_fmt yuyv422 -f v4l2 /dev/video10
+	_ = device // unused — PipeWire doesn't need a device path
 	args := []string{
-		"-loglevel", "error",
-		"-f", "h264",
-		"-i", "pipe:0",
-		"-pix_fmt", "yuyv422",
-		"-f", "v4l2",
-		device,
+		"-q",
+		"fdsrc", "fd=0",
+		"!", "h264parse",
+		"!", "avdec_h264",
+		"!", "videoconvert",
+		"!", "video/x-raw,format=YUY2",
+		"!", "pipewiresink",
+		"mode=provide",
+		"stream-properties=p,media.class=Video/Source,media.role=Camera,node.name=allrelay-camera,node.description=AllRelay_Camera",
+		"client-name=AllRelay Camera",
 	}
-	return NewCmdPipeline("camera", "ffmpeg", args)
+	return NewCmdPipeline("camera", "gst-launch-1.0", args)
 }
 
 // PipeWireCameraPipeline creates a PipeWire video source from v4l2loopback

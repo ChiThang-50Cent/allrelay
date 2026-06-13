@@ -491,16 +491,11 @@ func runSpeakerCapture(ctx context.Context, w io.Writer, onMetrics func(fps, bit
 // Android camera daemon sends AllRelay protocol packets (16-byte header + payload).
 // We use the demuxer to strip headers and forward only H.264 NAL units to FFmpeg.
 func runCameraCapture(ctx context.Context, reader io.Reader) error {
+	// PipeWire camera source — no device path needed, no v4l2loopback, no sudo.
+	// Browsers see it via xdg-desktop-portal.
 	device := video.GetCameraDevice()
 
-	// Reload v4l2loopback module to ensure clean state.
-	// Browsers (Zoom/Meet) enumerate cameras on page load —
-	// the module must be fresh and have exclusive_caps=1.
-	if err := video.ReloadV4L2Loopback(device); err != nil {
-		slog.Warn("Camera: v4l2loopback reload failed (may need sudo)", "error", err)
-	}
-
-	slog.Info("Camera: opening pipeline", "device", device)
+	slog.Info("Camera: opening PipeWire pipeline")
 
 	pipeline, err := video.CameraPipeline(device)
 	if err != nil {
@@ -522,18 +517,21 @@ func runCameraCapture(ctx context.Context, reader io.Reader) error {
 
 	demuxer := protocol.NewDemuxer(combinedReader)
 	demuxer.RegisterHandler(protocol.StreamCamera, func(header *protocol.Header, payload []byte) error {
-		// Skip codec config packets (they contain codec ID metadata, not H.264 config)
-		if header.IsConfig() {
-			slog.Debug("Camera: config packet", "size", len(payload))
-			return nil
-		}
-
-		// Skip zero-payload packets
+		// Skip zero-payload packets (session meta, etc.)
 		if len(payload) == 0 {
 			return nil
 		}
 
-		// Write H.264 NAL units to FFmpeg pipeline
+		// Only forward actual H.264 NAL units (start with Annex B start code).
+		// The first non-config packet is a codec ID ("h264") which we skip.
+		// Config packets contain SPS/PPS — h264parse needs these!
+		if !video.IsAnnexB(payload) {
+			slog.Debug("Camera: skipping non-H.264 packet", "len", len(payload),
+				"prefix", fmt.Sprintf("%x", payload[:min(len(payload), 4)]))
+			return nil
+		}
+
+		// Write H.264 NAL units to GStreamer pipeline
 		if _, err := pipeline.Write(payload); err != nil {
 			return fmt.Errorf("pipeline write: %w", err)
 		}
@@ -541,11 +539,6 @@ func runCameraCapture(ctx context.Context, reader io.Reader) error {
 		if !started {
 			slog.Info("Camera: received first frame", "bytes", len(payload))
 			started = true
-
-			// Start PipeWire camera source AFTER ffmpeg starts writing.
-			// Browsers (Zoom/Meet) use xdg-desktop-portal which requires
-			// a PipeWire video SOURCE, not just a v4l2 device.
-			go startPipeWireCameraSource(device)
 		}
 
 		frameCount++
@@ -579,22 +572,4 @@ func runCameraCapture(ctx context.Context, reader io.Reader) error {
 		slog.Info("Camera: demuxer ended", "frames", frameCount, "bytes", byteCount, "error", err)
 		return err
 	}
-}
-
-// startPipeWireCameraSource starts a PipeWire video source from the v4l2loopback device,
-// so that browsers (via xdg-desktop-portal) see it as a camera.
-// This must be started AFTER ffmpeg starts writing to the v4l2 device.
-func startPipeWireCameraSource(device string) {
-	slog.Info("Camera: starting PipeWire source", "device", device)
-	pw, err := video.PipeWireCameraPipeline(device)
-	if err != nil {
-		slog.Warn("Camera: PipeWire source failed", "error", err)
-		return
-	}
-	// PipeWire pipeline runs until the v4l2 device is closed or this process exits.
-	// It's started as a fire-and-forget since it auto-terminates when the v4l2 stream ends.
-	go func() {
-		<-pw.Done()
-		slog.Debug("Camera: PipeWire source ended")
-	}()
 }
