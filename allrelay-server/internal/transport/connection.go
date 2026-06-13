@@ -83,7 +83,16 @@ func Connect(host string, basePort uint16, connectVideo, connectCamera, connectM
 	}
 
 	if connectVideo {
-		launch("video", basePort+0, false)
+		// Video uses retry with backoff — Android daemon may be restarting
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			c := connectPortWithRetry(host, basePort+0, "video", 6)
+			if c == nil {
+				slog.Error("Video connection failed (mandatory)")
+			}
+			results <- result{name: "video", conn: c, err: nil}
+		}()
 	}
 	if connectCamera {
 		// Camera uses retry with backoff
@@ -148,6 +157,23 @@ func Connect(host string, basePort uint16, connectVideo, connectCamera, connectM
 		return nil, firstErr
 	}
 
+	// Drain unused ports to prevent Android server streams from blocking.
+	// Android server starts screen/camera/mic streams when connections exist.
+	// If we don't read from these ports, the server's TCP send buffers fill up,
+	// causing streams to block → 15s daemon timeout → speaker disconnects.
+	for name, c := range map[string]net.Conn{
+		"video":  conn.video,
+		"camera": conn.camera,
+		"mic":    conn.mic,
+	} {
+		if c != nil {
+			go func(n string, conn net.Conn) {
+				bytes, _ := io.Copy(io.Discard, conn)
+				slog.Debug("Drain finished", "port", n, "bytes", bytes)
+			}(name, c)
+		}
+	}
+
 	return conn, nil
 }
 
@@ -159,16 +185,13 @@ func connectPortWithRetry(host string, port uint16, name string, maxRetries int)
 		if err == nil {
 			return conn
 		}
-		// Only retry on connection refused
-		if !isConnRefused(err) {
-			slog.Warn("Camera connection failed", "error", err)
-			return nil
-		}
+		// Retry on any connection error — Android daemon may be restarting
 		if i < maxRetries-1 {
-			slog.Debug("Camera port not ready, retrying...", "attempt", i+1)
+			slog.Debug(name+" port not ready, retrying...", "attempt", i+1, "error", err)
 			time.Sleep(time.Duration(i+1) * 500 * time.Millisecond)
 		}
 	}
+	slog.Warn(name+" connection failed after retries", "attempts", maxRetries)
 	return nil
 }
 
@@ -207,10 +230,7 @@ func connectPort(host string, port uint16, name string) (net.Conn, error) {
 		tcpConn.SetReadBuffer(256 * 1024)
 	}
 
-	// Set a deadline for reading the dummy byte.
-	// The Android server may accept connections sequentially with timeouts,
-	// so a later port (e.g., control) may not send the dummy byte until
-	// earlier ports (camera/mic/speaker) time out.
+	// Set a deadline for reading the dummy byte
 	conn.SetReadDeadline(time.Now().Add(15 * time.Second))
 
 	// Read the dummy byte sent by the server
@@ -225,44 +245,18 @@ func connectPort(host string, port uint16, name string) (net.Conn, error) {
 		return nil, fmt.Errorf("unexpected dummy byte (%s): 0x%02x", name, dummy[0])
 	}
 
-	// The device sends a 64-byte device name on the first connected socket
-	// via getFirstSocket(). Detect and consume it before reading AllRelay
-	// headers. We peek at the first byte: AllRelay headers always start
-	// with 0x00 (stream_id high byte), device names start with ASCII (>0x20).
-	firstByte := make([]byte, 1)
-	if _, err := io.ReadFull(conn, firstByte); err != nil {
-		// No device name present (either EOF: connection closed,
-		// or timeout: this isn't the first socket). Return the
-		// connection as-is; the caller handles the situation.
-		if err == io.EOF || isTimeout(err) {
-			conn.SetReadDeadline(time.Time{})
-			return conn, nil
-		}
-		conn.Close()
-		return nil, fmt.Errorf("peek after dummy (%s): %w", name, err)
-	}
-
-	if firstByte[0] >= 0x20 {
-		// Device name detected — read remaining 63 bytes
-		rest := make([]byte, deviceNameLen-1)
-		if _, err := io.ReadFull(conn, rest); err != nil {
-			conn.Close()
-			return nil, fmt.Errorf("read device name (%s): %w", name, err)
-		}
-		devName := string(append(firstByte, rest...))
-		if idx := strings.IndexByte(devName, 0); idx >= 0 {
-			devName = devName[:idx]
-		}
-		slog.Info("Device name", "name", devName, "port", name)
-	} else {
-		// No device name — this is packet data. We consumed 1 byte.
-		// Wrap conn to prepend it for the packet reader.
-		conn.SetReadDeadline(time.Time{})
-		return &connWithPrepend{Conn: conn, prepend: firstByte}, nil
-	}
-
 	// Clear deadline after successful read
 	conn.SetReadDeadline(time.Time{})
+
+	// Only peek for device name on the video port (first connected port).
+	// Other ports (camera, mic, speaker, control) don't receive device name,
+	// and waiting for a 15-second timeout on every port causes race conditions
+	// with the Android server's daemon restart timer.
+	if name != "video" {
+		return conn, nil
+	}
+
+	// The device sends a 64-byte device name on the video socket.
 
 	return conn, nil
 }

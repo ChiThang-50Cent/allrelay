@@ -39,7 +39,7 @@ public class Options {
     private float angle;
     private boolean tunnelForward;
     private Rect crop;
-    private boolean control = true;
+    private boolean control = false;
     private int displayId;
     private String cameraId;
     private Size cameraSize;
@@ -90,6 +90,8 @@ public class Options {
     private boolean wifiMode = false; // use direct Wi-Fi instead of ADB tunnel
     private int wifiPort = 5000; // base port for Wi-Fi connections
     private boolean multistream = false; // enable multi-stream (screen + camera simultaneous)
+    private boolean speakerEnabled = true; // enable speaker stream (PC→phone) independently from mic
+    private boolean daemon = false; // keep server running after streams complete
 
     public Ln.Level getLogLevel() {
         return logLevel;
@@ -330,6 +332,14 @@ public class Options {
 
     public boolean isMultistream() {
         return multistream;
+    }
+
+    public boolean isSpeakerEnabled() {
+        return speakerEnabled;
+    }
+
+    public boolean isDaemon() {
+        return daemon;
     }
 
     @SuppressWarnings("MethodLength")
@@ -586,6 +596,15 @@ public class Options {
                     break;
                 case "multistream":
                     options.multistream = Boolean.parseBoolean(value);
+                    break;
+                case "speaker_enabled":
+                    options.speakerEnabled = Boolean.parseBoolean(value);
+                    break;
+                case "no_video":
+                    options.video = !Boolean.parseBoolean(value);
+                    break;
+                case "daemon":
+                    options.daemon = Boolean.parseBoolean(value);
                     break;
                 default:
                     Ln.w("Unknown server option: " + key);

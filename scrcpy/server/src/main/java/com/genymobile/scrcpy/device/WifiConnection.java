@@ -40,8 +40,8 @@ public final class WifiConnection implements Closeable {
     public static final int PORT_SPEAKER = 5003;
     public static final int PORT_CONTROL = 5004;
 
-    private static final int ACCEPT_TIMEOUT_MS = 10000; // 10 seconds (mandatory: video, control)
-    private static final int ACCEPT_TIMEOUT_OPTIONAL_MS = 10000; // 10 seconds (optional: camera, mic, speaker)
+    private static final int ACCEPT_TIMEOUT_MS = 2000; // 2 seconds (mandatory: video, control)
+    private static final int ACCEPT_TIMEOUT_OPTIONAL_MS = 5000; // 5 seconds (optional: camera, mic, speaker)
     private static final int DUMMY_BYTE = 0xAB;
 
     private final Socket videoSocket;
@@ -58,12 +58,22 @@ public final class WifiConnection implements Closeable {
 
     private WifiConnection(Socket videoSocket, Socket cameraSocket,
                            Socket audioSocket, Socket speakerSocket,
-                           Socket controlSocket) throws IOException {
+                           Socket controlSocket,
+                           ServerSocket videoServerSocket,
+                           ServerSocket cameraServerSocket,
+                           ServerSocket audioServerSocket,
+                           ServerSocket speakerServerSocket,
+                           ServerSocket controlServerSocket) throws IOException {
         this.videoSocket = videoSocket;
         this.cameraSocket = cameraSocket;
         this.audioSocket = audioSocket;
         this.speakerSocket = speakerSocket;
         this.controlSocket = controlSocket;
+        this.videoServerSocket = videoServerSocket;
+        this.cameraServerSocket = cameraServerSocket;
+        this.audioServerSocket = audioServerSocket;
+        this.speakerServerSocket = speakerServerSocket;
+        this.controlServerSocket = controlServerSocket;
     }
 
     /**
@@ -186,11 +196,9 @@ public final class WifiConnection implements Closeable {
             }
 
             // Wait for all accept threads with a shared deadline.
-            // Without a deadline, the main thread could block forever if
-            // a client skips some ports (e.g., camera-only mode).
-            // Each thread's ServerSocket also has a timeout, so they
-            // will complete on their own within ACCEPT_TIMEOUT_MS.
-            final long DEADLINE_MS = 12000; // overall deadline + buffer
+            // Each stream has its own timeout so one slow stream doesn't
+            // block others. The deadline is a safety net for the main thread.
+            final long DEADLINE_MS = 18000; // 18s overall deadline (3s buffer beyond per-stream timeout)
             final long deadline = System.currentTimeMillis() + DEADLINE_MS;
 
             for (Thread t : acceptThreads) {
@@ -211,15 +219,13 @@ public final class WifiConnection implements Closeable {
             speakerSocket = acceptedSpeaker[0];
             controlSocket = acceptedControl[0];
 
-            // Close server sockets after all connections established
-            closeServerSocket(videoServer);
-            closeServerSocket(cameraServer);
-            closeServerSocket(audioServer);
-            closeServerSocket(speakerServer);
-            closeServerSocket(controlServer);
+            // Don't close server sockets here — they're stored in WifiConnection
+            // and will be closed when WifiConnection.close() is called
 
             return new WifiConnection(videoSocket, cameraSocket, audioSocket,
-                                     speakerSocket, controlSocket);
+                                     speakerSocket, controlSocket,
+                                     videoServer, cameraServer, audioServer,
+                                     speakerServer, controlServer);
 
         } catch (IOException | RuntimeException e) {
             // Cleanup on failure
@@ -243,6 +249,23 @@ public final class WifiConnection implements Closeable {
     public static WifiConnection open(boolean video, boolean audio,
                                       boolean control) throws IOException {
         return open(video, false, audio, false, control, PORT_VIDEO);
+    }
+
+    /**
+     * Open only the speaker port for reverse audio streaming (PC → phone).
+     * Returns immediately after accepting the speaker connection — no waiting
+     * for video or other ports. Used for low-latency speaker-only mode.
+     */
+    public static WifiConnection openSpeakerOnly(int port) throws IOException {
+        ServerSocket speakerServer = bindAndListenWithTimeout(port, ACCEPT_TIMEOUT_OPTIONAL_MS);
+        Ln.d("Wi-Fi speaker listening on port " + port);
+
+        Socket speakerSocket = acceptConnection(speakerServer, "speaker");
+
+        return new WifiConnection(null, null, null,
+                speakerSocket, null,
+                null, null, null,
+                speakerServer, null);
     }
 
     private static ServerSocket bindAndListen(int port) throws IOException {
@@ -377,6 +400,13 @@ public final class WifiConnection implements Closeable {
         closeSocket(audioSocket);
         closeSocket(speakerSocket);
         closeSocket(controlSocket);
+        
+        // Also close server sockets
+        closeServerSocket(videoServerSocket);
+        closeServerSocket(cameraServerSocket);
+        closeServerSocket(audioServerSocket);
+        closeServerSocket(speakerServerSocket);
+        closeServerSocket(controlServerSocket);
     }
 
     /**

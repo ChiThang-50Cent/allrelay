@@ -59,18 +59,40 @@ public final class Server {
 
     private static class Completion {
         private int running;
-        private boolean fatalError;
+        private int failed;
+        private boolean daemon;
+        private volatile boolean timedOut;
 
-        Completion(int running) {
+        Completion(int running, boolean daemon) {
             this.running = running;
+            this.daemon = daemon;
+            
+            // Daemon mode: no global timeout.
+            // Each stream independently reports fatal errors (e.g., TCP disconnect).
+            // When all streams complete (either fatally or normally), the daemon
+            // restarts automatically. If a stream is truly stuck, the TCP stack
+            // will eventually timeout (typically 2+ minutes) and trigger a fatal error.
+            // This ensures one healthy stream is never killed because another is stuck.
         }
 
         synchronized void addCompleted(boolean fatalError) {
+            if (timedOut) return; // Already timed out
+            
             --running;
             if (fatalError) {
-                this.fatalError = true;
+                ++failed;
+                Ln.w("Stream failed (" + failed + "/" + (running + failed) + ") — other streams continue");
             }
-            if (running == 0 || this.fatalError) {
+            // Only quit when ALL streams are done (not on first failure)
+            if (running == 0) {
+                if (daemon) {
+                    Ln.i("All streams completed — daemon mode will restart");
+                } else if (failed > 0) {
+                    Ln.w("All streams completed (" + failed + " had errors)");
+                } else {
+                    Ln.i("All streams completed successfully");
+                }
+                // Always quit Looper so code can continue
                 Looper.getMainLooper().quitSafely();
             }
         }
@@ -114,175 +136,271 @@ public final class Server {
 
         Workarounds.apply();
 
-        List<AsyncProcessor> asyncProcessors = new ArrayList<>();
-
-        // Use WifiConnection for direct Wi-Fi mode, DesktopConnection for ADB tunnel
-        FileDescriptor videoFd;
-        FileDescriptor audioFd;
-
         if (wifiMode) {
             int wifiPort = options.getWifiPort();
-            Ln.i("Wi-Fi mode enabled, port " + wifiPort +
-                 ", address " + WifiConnection.getLocalIpAddress());
-
-            // Note: mDNS is handled by AllRelayService Kotlin wrapper (needs Android Context)
-
             boolean cameraEnabled = multistream && video;
-            boolean speakerEnabled = audio;
+            boolean micEnabled = audio;
+            boolean speakerEnabled = options.isSpeakerEnabled();
+            boolean daemon = options.isDaemon();
 
-            WifiConnection wifiConn;
-            try {
-                wifiConn = WifiConnection.open(video, cameraEnabled, audio,
-                        speakerEnabled, control, wifiPort);
-            } catch (IOException e) {
-                Ln.e("Failed to open Wi-Fi connection: " + e.getMessage());
-                return;
-            }
-            try {
-                if (options.getSendDeviceMeta()) {
-                    wifiConn.sendDeviceMeta(Device.getDeviceName());
-                }
+            // Daemon mode: loop forever, restarting after streams complete.
+            // Outer try-catch ensures no single exception kills the server process.
+            while (true) {
+                try {
+                Ln.i("DEBUG: speaker=" + speakerEnabled + " video=" + video + " camera=" + cameraEnabled + " mic=" + micEnabled + " control=" + control + " daemon=" + daemon);
+                Ln.i("Wi-Fi mode enabled, port " + wifiPort +
+                     ", address " + WifiConnection.getLocalIpAddress());
 
-                Controller controller = null;
+                WifiConnection wifiConn;
+                try {
+                    // Fast path: speaker-only daemon mode.
+                    // Keep speaker port open permanently, accept connections in a loop.
+                    // No restart — just accept new connection when old one ends.
+                    if (speakerEnabled && !video && !cameraEnabled && !micEnabled && !control && daemon) {
+                        int speakerPort = wifiPort + 3;
+                        java.net.ServerSocket speakerServer = null;
+                        try {
+                            speakerServer = new java.net.ServerSocket();
+                            speakerServer.setReuseAddress(true);
+                            speakerServer.bind(new java.net.InetSocketAddress(speakerPort));
+                            Ln.i("Speaker daemon listening on port " + speakerPort);
 
-                if (control) {
-                    Ln.i("Control channel deferred to Phase 3 (Wi-Fi mode)");
-                }
+                            while (true) {
+                                java.net.Socket speakerSocket = null;
+                                try {
+                                    Ln.i("Waiting for speaker client on port " + speakerPort + "...");
+                                    speakerSocket = speakerServer.accept();
+                                    speakerSocket.setTcpNoDelay(true);
+                                    speakerSocket.getOutputStream().write(0xAB);
+                                    speakerSocket.getOutputStream().flush();
+                                    Ln.i("Wi-Fi speaker client connected from " + speakerSocket.getRemoteSocketAddress());
 
-                if (audio) {
-                    // Mic stream (port 5002): capture → encode → Wi-Fi
-                    OutputStream audioOutputStream = wifiConn.getAudioOutputStream();
-                    if (audioOutputStream != null) {
-                        AudioSource audioSource = options.getAudioSource();
-                        AudioCapture audioCapture;
-                        if (audioSource.isDirect()) {
-                            audioCapture = new AudioDirectCapture(audioSource);
-                        } else {
-                            audioCapture = new AudioPlaybackCapture(options.getAudioDup());
-                        }
+                                    InputStream input = speakerSocket.getInputStream();
+                                    AudioReversePlayback reversePlayback = new AudioReversePlayback(input);
+                                    Completion completion = new Completion(1, true);
+                                    reversePlayback.start((fatalError) -> completion.addCompleted(fatalError));
 
-                        StreamId audioStreamId = audioSource.isDirect()
-                                ? StreamId.MIC : StreamId.SPEAKER;
-                        WifiStreamer audioStreamer = new WifiStreamer(audioOutputStream,
-                                options.getAudioCodec(), audioStreamId,
-                                options.getSendStreamMeta(), options.getSendFrameMeta());
-
-                        WifiAudioEncoder audioEncoder = new WifiAudioEncoder(
-                                audioCapture, audioStreamer, options);
-                        asyncProcessors.add(audioEncoder);
-                        Ln.i("Wi-Fi mic stream enabled on port " + (wifiPort + 2));
-                    }
-
-                    // Speaker stream (port 5003): PC → phone reverse audio
-                    InputStream speakerInputStream = wifiConn.getSpeakerInputStream();
-                    if (speakerInputStream != null) {
-                        AudioReversePlayback reversePlayback = new AudioReversePlayback(
-                                speakerInputStream);
-                        asyncProcessors.add(reversePlayback);
-                        Ln.i("Wi-Fi speaker stream enabled on port " + (wifiPort + 3));
-                    }
-                }
-
-                // Video streaming over Wi-Fi
-                if (video) {
-                    OutputStream videoOutputStream = wifiConn.getVideoOutputStream();
-                    OutputStream cameraOutputStream = wifiConn.getCameraOutputStream();
-
-                    if (multistream) {
-                        // Multi-stream mode: screen + camera simultaneous
-                        Ln.i("Multi-stream mode: screen + camera enabled");
-
-                        ScreenCapture screenCapture = new ScreenCapture(controller, options);
-                        CameraCapture cameraCapture = new CameraCapture(options);
-
-                        WifiStreamer screenStreamer = null;
-                        WifiStreamer cameraStreamer = null;
-
-                        if (videoOutputStream != null) {
-                            screenStreamer = new WifiStreamer(videoOutputStream,
-                                    options.getVideoCodec(), StreamId.SCREEN,
-                                    options.getSendStreamMeta(), options.getSendFrameMeta());
-                        }
-                        if (cameraOutputStream != null) {
-                            cameraStreamer = new WifiStreamer(cameraOutputStream,
-                                    options.getVideoCodec(), StreamId.CAMERA,
-                                    options.getSendStreamMeta(), options.getSendFrameMeta());
-                        }
-
-                        MultiCapture multiCapture = new MultiCapture(
-                                screenCapture, cameraCapture,
-                                screenStreamer, cameraStreamer,
-                                options);
-                        List<AsyncProcessor> processors = multiCapture.createProcessors();
-                        asyncProcessors.addAll(processors);
-
-                        if (controller != null) {
-                            controller.setSurfaceCapture(screenCapture);
-                        }
-                    } else {
-                        // Single-stream mode (original behavior)
-                        StreamId videoStreamId = options.getVideoSource() == VideoSource.CAMERA
-                                ? StreamId.CAMERA : StreamId.SCREEN;
-
-                        if (videoOutputStream != null) {
-                            WifiStreamer wifiStreamer = new WifiStreamer(videoOutputStream,
-                                    options.getVideoCodec(), videoStreamId,
-                                    options.getSendStreamMeta(), options.getSendFrameMeta());
-
-                            SurfaceCapture surfaceCapture;
-                            if (options.getVideoSource() == VideoSource.DISPLAY) {
-                                NewDisplay newDisplay = options.getNewDisplay();
-                                if (newDisplay != null) {
-                                    surfaceCapture = new NewDisplayCapture(controller, options);
-                                } else {
-                                    int displayId = options.getDisplayId();
-                                    if (displayId == Device.DISPLAY_ID_NONE) {
-                                        displayId = 0;
+                                    Looper.loop(); // blocks until stream completes
+                                    Ln.i("Speaker stream ended, accepting next connection...");
+                                } catch (IOException e) {
+                                    Ln.e("Speaker accept error: " + e.getMessage());
+                                    if (speakerSocket != null) {
+                                        try { speakerSocket.close(); } catch (IOException ignored) {}
                                     }
-                                    surfaceCapture = new ScreenCapture(controller, options);
+                                    try { Thread.sleep(500); } catch (InterruptedException ignored) {}
+                                }
+                            }
+                        } catch (IOException e) {
+                            Ln.e("Speaker daemon: " + e.getMessage());
+                            try { Thread.sleep(500); } catch (InterruptedException ignored) {}
+                        } finally {
+                            if (speakerServer != null) {
+                                try { speakerServer.close(); } catch (IOException ignored) {}
+                            }
+                        }
+                        continue;
+                    }
+
+                    // Fast path: speaker-only (non-daemon) — one-shot.
+                    if (speakerEnabled && !video && !cameraEnabled && !micEnabled && !control) {
+                        wifiConn = WifiConnection.openSpeakerOnly(wifiPort + 3);
+                    } else {
+                        wifiConn = WifiConnection.open(video, cameraEnabled, micEnabled,
+                                speakerEnabled, control, wifiPort);
+                    }
+                } catch (IOException e) {
+                    Ln.e("Failed to open Wi-Fi connection: " + e.getMessage());
+                    if (daemon) {
+                        Ln.i("Daemon mode: retrying...");
+                        try { Thread.sleep(500); } catch (InterruptedException ignored) {}
+                        continue;
+                    }
+                    return;
+                }
+
+                try {
+                    if (options.getSendDeviceMeta()) {
+                        wifiConn.sendDeviceMeta(Device.getDeviceName());
+                    }
+
+                    Controller controller = null;
+
+                    if (control) {
+                        Ln.i("Control channel deferred to Phase 3 (Wi-Fi mode)");
+                    }
+
+                    List<AsyncProcessor> asyncProcessors = new ArrayList<>();
+
+                    // === MIC STREAM ===
+                    if (micEnabled) {
+                        try {
+                            OutputStream audioOutputStream = wifiConn.getAudioOutputStream();
+                            if (audioOutputStream != null) {
+                                AudioSource audioSource = options.getAudioSource();
+                                AudioCapture audioCapture;
+                                if (audioSource.isDirect()) {
+                                    audioCapture = new AudioDirectCapture(audioSource);
+                                } else {
+                                    audioCapture = new AudioPlaybackCapture(options.getAudioDup());
+                                }
+
+                                StreamId audioStreamId = audioSource.isDirect()
+                                        ? StreamId.MIC : StreamId.SPEAKER;
+                                WifiStreamer audioStreamer = new WifiStreamer(audioOutputStream,
+                                        options.getAudioCodec(), audioStreamId,
+                                        options.getSendStreamMeta(), options.getSendFrameMeta());
+
+                                WifiAudioEncoder audioEncoder = new WifiAudioEncoder(
+                                        audioCapture, audioStreamer, options);
+                                asyncProcessors.add(audioEncoder);
+                                Ln.i("Wi-Fi mic stream enabled on port " + (wifiPort + 2));
+                            }
+                        } catch (Exception e) {
+                            Ln.e("Failed to start mic stream: " + e.getMessage());
+                        }
+                    }
+
+                    // === SPEAKER STREAM ===
+                    if (speakerEnabled) {
+                        try {
+                            InputStream speakerInputStream = wifiConn.getSpeakerInputStream();
+                            if (speakerInputStream != null) {
+                                AudioReversePlayback reversePlayback = new AudioReversePlayback(
+                                        speakerInputStream);
+                                asyncProcessors.add(reversePlayback);
+                                Ln.i("Wi-Fi speaker stream enabled on port " + (wifiPort + 3));
+                            }
+                        } catch (Exception e) {
+                            Ln.e("Failed to start speaker stream: " + e.getMessage());
+                        }
+                    }
+
+                    // === VIDEO STREAMS ===
+                    if (video) {
+                        try {
+                            OutputStream videoOutputStream = wifiConn.getVideoOutputStream();
+                            OutputStream cameraOutputStream = wifiConn.getCameraOutputStream();
+
+                            if (multistream) {
+                                Ln.i("Multi-stream mode: screen + camera enabled");
+
+                                ScreenCapture screenCapture = new ScreenCapture(controller, options);
+                                CameraCapture cameraCapture = new CameraCapture(options);
+
+                                WifiStreamer screenStreamer = null;
+                                WifiStreamer cameraStreamer = null;
+
+                                if (videoOutputStream != null) {
+                                    screenStreamer = new WifiStreamer(videoOutputStream,
+                                            options.getVideoCodec(), StreamId.SCREEN,
+                                            options.getSendStreamMeta(), options.getSendFrameMeta());
+                                }
+                                if (cameraOutputStream != null) {
+                                    cameraStreamer = new WifiStreamer(cameraOutputStream,
+                                            options.getVideoCodec(), StreamId.CAMERA,
+                                            options.getSendStreamMeta(), options.getSendFrameMeta());
+                                }
+
+                                MultiCapture multiCapture = new MultiCapture(
+                                        screenCapture, cameraCapture,
+                                        screenStreamer, cameraStreamer,
+                                        options);
+                                List<AsyncProcessor> processors = multiCapture.createProcessors();
+                                asyncProcessors.addAll(processors);
+
+                                if (controller != null) {
+                                    controller.setSurfaceCapture(screenCapture);
                                 }
                             } else {
-                                surfaceCapture = new CameraCapture(options);
-                            }
+                                StreamId videoStreamId = options.getVideoSource() == VideoSource.CAMERA
+                                        ? StreamId.CAMERA : StreamId.SCREEN;
 
-                            WifiSurfaceEncoder surfaceEncoder = new WifiSurfaceEncoder(
-                                    surfaceCapture, wifiStreamer, options);
-                            asyncProcessors.add(surfaceEncoder);
+                                if (videoOutputStream != null) {
+                                    WifiStreamer wifiStreamer = new WifiStreamer(videoOutputStream,
+                                            options.getVideoCodec(), videoStreamId,
+                                            options.getSendStreamMeta(), options.getSendFrameMeta());
 
-                            if (controller != null) {
-                                controller.setSurfaceCapture(surfaceCapture);
+                                    SurfaceCapture surfaceCapture;
+                                    if (options.getVideoSource() == VideoSource.DISPLAY) {
+                                        NewDisplay newDisplay = options.getNewDisplay();
+                                        if (newDisplay != null) {
+                                            surfaceCapture = new NewDisplayCapture(controller, options);
+                                        } else {
+                                            int displayId = options.getDisplayId();
+                                            if (displayId == Device.DISPLAY_ID_NONE) {
+                                                displayId = 0;
+                                            }
+                                            surfaceCapture = new ScreenCapture(controller, options);
+                                        }
+                                    } else {
+                                        surfaceCapture = new CameraCapture(options);
+                                    }
+
+                                    WifiSurfaceEncoder surfaceEncoder = new WifiSurfaceEncoder(
+                                            surfaceCapture, wifiStreamer, options);
+                                    asyncProcessors.add(surfaceEncoder);
+
+                                    if (controller != null) {
+                                        controller.setSurfaceCapture(surfaceCapture);
+                                    }
+                                } else {
+                                    Ln.e("Failed to get video output stream");
+                                }
                             }
-                        } else {
-                            Ln.e("Failed to get video output stream");
+                        } catch (Exception e) {
+                            Ln.e("Failed to start video stream: " + e.getMessage());
                         }
+                    }
+
+                    // Start async processors
+                    if (asyncProcessors.isEmpty()) {
+                        Ln.w("No streams started — all streams failed or disabled");
+                        if (daemon) {
+                            wifiConn.close();
+                            Ln.i("Daemon mode: retrying...");
+                            try { Thread.sleep(500); } catch (InterruptedException ignored) {}
+                            continue;
+                        }
+                        return;
+                    }
+
+                    Completion completion = new Completion(asyncProcessors.size(), daemon);
+                    for (AsyncProcessor asyncProcessor : asyncProcessors) {
+                        asyncProcessor.start((fatalError) -> {
+                            completion.addCompleted(fatalError);
+                        });
+                    }
+
+                    // Block until completion
+                    Looper.loop();
+
+                    wifiConn.shutdown();
+                } catch (IOException e) {
+                    Ln.e("Wi-Fi connection error: " + e.getMessage());
+                } finally {
+                    try {
+                        wifiConn.close();
+                    } catch (IOException e) {
+                        // ignore
                     }
                 }
 
-                // Start async processors
-                Completion completion = new Completion(asyncProcessors.size());
-                for (AsyncProcessor asyncProcessor : asyncProcessors) {
-                    asyncProcessor.start((fatalError) -> {
-                        completion.addCompleted(fatalError);
-                    });
+                if (!daemon) {
+                    return;
                 }
 
-                // Block until completion or interruption
-                Looper.loop();
-
-                wifiConn.shutdown();
-            } catch (IOException e) {
-                Ln.e("Wi-Fi connection error: " + e.getMessage());
-            } finally {
-                try {
-                    wifiConn.close();
-                } catch (IOException e) {
-                    // Connection already closed or broken — ignore
+                Ln.i("Daemon mode: streams completed, restarting...");
+                try { Thread.sleep(500); } catch (InterruptedException ignored) {}
+                } catch (Throwable t) {
+                    Ln.e("Daemon loop error, restarting in 2 seconds: " + t.getMessage(), t);
+                    try { Thread.sleep(2000); } catch (InterruptedException ignored) {}
+                    // Loop continues — server never dies
                 }
             }
-            return;
         }
 
         // Original ADB mode
+        List<AsyncProcessor> asyncProcessors = new ArrayList<>();
         DesktopConnection connection = DesktopConnection.open(scid, tunnelForward, video, audio, control, sendDummyByte);
         try {
             if (options.getSendDeviceMeta()) {
@@ -344,7 +462,7 @@ public final class Server {
                 }
             }
 
-            Completion completion = new Completion(asyncProcessors.size());
+            Completion completion = new Completion(asyncProcessors.size(), false); // ADB mode doesn't need daemon
             for (AsyncProcessor asyncProcessor : asyncProcessors) {
                 asyncProcessor.start((fatalError) -> {
                     completion.addCompleted(fatalError);

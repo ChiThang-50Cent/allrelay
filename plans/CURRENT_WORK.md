@@ -1,8 +1,8 @@
 # AllRelay - Current Work
 
-> **Last updated:** 2026-06-11 23:30
-> **Current phase:** Phase 4 — Root & Polish ✅ (ALL TASKS DONE) + Speaker path fix 🔄
-> **Next milestone:** Tag v0.4.0-alpha, flash Magisk module qua Manager
+> **Last updated:** 2026-06-13 22:32
+> **Current phase:** Speaker working end-to-end ✅ | Stability improved ✅
+> **Next milestone:** Camera stream + Phone discovery + Audio source routing
 
 ---
 
@@ -322,6 +322,9 @@ Phase 4: Root & Polish       [██████████] 100%  Target: Week
 
 | Date | Change |
 |------|--------|
+| 2026-06-13 | **Web UI Phase 2 ✅**: Added WebSocket real-time updates. Features: (1) WebSocket hub for broadcasting status changes, (2) Real-time stream metrics (FPS, bitrate, latency), (3) Stream metrics display in UI cards, (4) Auto-reconnect WebSocket on disconnect, (5) `/ws` endpoint, (6) `/api/streams/metrics` endpoint, (7) `UpdateStreamMetrics()` and `SetConnectionStatus()` methods for external integration. Dependencies: `github.com/gorilla/websocket`.
+| 2026-06-13 | **Web UI Phase 1 ✅**: Implemented web dashboard with Dashboard design skill from awesome-design-skills. Features: (1) `--web` flag to enable web UI, (2) `--web-port` to set port (default 8080), (3) REST API endpoints (`/api/status`, `/api/phones`, `/api/connect`, `/api/disconnect`, `/api/streams/toggle`), (4) Dark-themed UI with IBM Plex Sans font, glass-like panels, (5) Phone connection form, (6) Stream cards with toggles, (7) Status display grid. Tech: Go HTTP server + vanilla HTML/CSS/JS. Files: `internal/web/server.go`, `internal/web/static/style.css`, `internal/web/static/app.js`, `internal/web/templates/index.html`.
+| 2026-06-13 | **Stream isolation refactor ✅**: Each stream (mic, speaker, camera, screen) now fully independent lifecycle. Changes: (1) Server.java — separated mic/speaker initialization with individual try-catch, speaker has own flag `speaker_enabled` decoupled from `audio`, (2) Completion class — fatal error in one stream no longer kills others, (3) WifiConnection.java — increased timeouts 10s→15s, shared deadline 12s→18s, (4) Options.java — added `speaker_enabled` flag (default true), (5) AllRelayService.kt — passes `speaker_enabled` independently. Java+Go build OK, all tests pass.
 | 2026-06-11 | Speaker path: IMPLEMENTED ✅. Added audio/ogg.go (OggDemuxer + WritePacket), updated pipeline stereo+low-latency, wired runSpeakerCapture() in main.go. WriteSpeakerPacket() stub → full implementation. GStreamer pulsesrc→opusenc→oggmux→fdsink → Go reads Ogg pages, extracts Opus, sends 16-byte header+payload to phone TCP port 5003. |
 | 2026-06-11 | PipeWire speaker capture blocked: IEC958 digital output has no physical receiver → graph stays suspended. Attempted: pipewiresrc, pulsesrc, pw-record, pw-cat, FIFO — all fail. Need native PipeWire client (cgo). See Blockers. |
 | 2026-06-11 | Mic pipeline: replaced pulsesink→null-sink with pipewiresink mode=provide → Audio/Source/Virtual \"allrelay-mic\". Fixed Ogg CRC32 (non-reflected polynomial), OpusTags page, batch 25 packets/page. |

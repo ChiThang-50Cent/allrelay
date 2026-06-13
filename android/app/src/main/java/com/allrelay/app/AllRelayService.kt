@@ -129,7 +129,8 @@ class AllRelayService : Service() {
                 append(" wifi_mode=true")
                 append(" wifi_port=5000")
                 append(" video=${hasScreen || hasCamera}")
-                append(" audio=${hasMic || hasSpeaker}")
+                append(" audio=$hasMic") // mic uses audio flag
+                append(" speaker_enabled=$hasSpeaker") // speaker has own flag
                 append(" control=true")
                 append(" send_device_meta=true")
                 append(" send_frame_meta=true")
