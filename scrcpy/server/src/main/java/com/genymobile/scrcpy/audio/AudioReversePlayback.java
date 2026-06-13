@@ -56,12 +56,7 @@ public final class AudioReversePlayback implements AsyncProcessor {
             if (sharedDecoder == null) {
                 try {
                     sharedDecoder = MediaCodec.createDecoderByType(AudioCodec.OPUS.getMimeType());
-                    MediaFormat format = MediaFormat.createAudioFormat(
-                            AudioCodec.OPUS.getMimeType(), SAMPLE_RATE, CHANNELS);
-                    sharedDecoder.configure(format, null, null, 0);
-                    sharedDecoder.start();
-                    sharedDecoderStarted = true;
-                    Ln.i("Speaker: shared decoder created");
+                    Ln.i("Speaker: shared decoder created (not configured yet)");
                 } catch (Exception e) {
                     Ln.e("Speaker: failed to create shared decoder", e);
                     return null;
@@ -140,7 +135,7 @@ public final class AudioReversePlayback implements AsyncProcessor {
             return;
         }
 
-        // Flush decoder for new stream (keeps decoder alive, just resets state)
+        // Stop and reconfigure decoder for new stream (only if already used)
         if (sharedDecoderStarted) {
             try {
                 decoder.stop();
@@ -174,7 +169,7 @@ public final class AudioReversePlayback implements AsyncProcessor {
         long codecDelayNs = 6500000L;
         long seekPreRollNs = 80000000L;
         for (int i = 0; i < 2; i++) {
-            int inputBufferId = decoder.dequeueInputBuffer(10000);
+            int inputBufferId = decoder.dequeueInputBuffer(50000);
             if (inputBufferId >= 0) {
                 ByteBuffer inputBuffer = decoder.getInputBuffer(inputBufferId);
                 if (inputBuffer != null) {
