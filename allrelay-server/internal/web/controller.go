@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"sync"
+	"time"
 
 	"github.com/allrelay/allrelay-server/internal/audio"
 	"github.com/allrelay/allrelay-server/internal/protocol"
@@ -239,13 +240,20 @@ func (sc *ServerController) startSpeakerStreamLocked() {
 	slog.Info("Starting speaker stream")
 	stream.Active = true
 	stream.Running = true
-
-	// Start speaker capture in background
 	stream.gen++
 	gen := stream.gen
+
+	// Metrics callback
+	onMetrics := func(fps, bitrate, latency int, bytes, frames int64) {
+		if sc.webServer != nil {
+			sc.webServer.UpdateStreamMetrics("speaker", fps, bitrate, latency, bytes, frames)
+		}
+	}
+
+	// Start speaker capture in background
 	go func() {
 		writer := sc.conn.SpeakerWriter()
-		if err := runSpeakerCapture(ctx, writer); err != nil {
+		if err := runSpeakerCapture(ctx, writer, onMetrics); err != nil {
 			slog.Error("Speaker capture error", "error", err)
 		}
 		sc.mu.Lock()
@@ -311,7 +319,7 @@ func (sc *ServerController) GetStreamStatus() []StreamStatus {
 }
 
 // runSpeakerCapture captures audio from PC and sends to phone
-func runSpeakerCapture(ctx context.Context, w io.Writer) error {
+func runSpeakerCapture(ctx context.Context, w io.Writer, onMetrics func(fps, bitrate, latency int, bytes, frames int64)) error {
 	pipeline, err := audio.SpeakerCapturePipeline()
 	if err != nil {
 		return fmt.Errorf("failed to start capture pipeline: %w", err)
@@ -343,6 +351,10 @@ func runSpeakerCapture(ctx context.Context, w io.Writer) error {
 	// Main loop: read Opus audio packets and forward to phone
 	var frameCount uint64
 	var byteCount uint64
+	var lastMetricsTime = time.Now()
+	var framesSinceMetrics uint64
+	var bytesSinceMetrics uint64
+
 	for {
 		packet, err := demux.NextPacket()
 		if err != nil {
@@ -354,14 +366,33 @@ func runSpeakerCapture(ctx context.Context, w io.Writer) error {
 			return err
 		}
 
+		sendStart := time.Now()
 		pts := frameCount * 20000 // 20ms per frame
 		if err := audio.WritePacket(w, protocol.StreamSpeaker, 0, pts, packet); err != nil {
 			slog.Error("Speaker: write error", "error", err)
 			return err
 		}
+		sendLatency := time.Since(sendStart).Microseconds()
 
 		frameCount++
 		byteCount += uint64(len(packet))
+		framesSinceMetrics++
+		bytesSinceMetrics += uint64(len(packet))
+
+		// Update metrics every second
+		if time.Since(lastMetricsTime) >= time.Second {
+			fps := int(float64(framesSinceMetrics) / time.Since(lastMetricsTime).Seconds())
+			bitrate := int(float64(bytesSinceMetrics*8) / time.Since(lastMetricsTime).Seconds())
+			// Pipeline latency: Go send time + estimated TCP + AudioTrack buffer
+			latencyMs := int(sendLatency/1000) + 5 + 150
+			if onMetrics != nil {
+				onMetrics(fps, bitrate, latencyMs, int64(byteCount), int64(frameCount))
+			}
+
+			framesSinceMetrics = 0
+			bytesSinceMetrics = 0
+			lastMetricsTime = time.Now()
+		}
 
 		if frameCount%250 == 0 {
 			slog.Debug("Speaker stream",
