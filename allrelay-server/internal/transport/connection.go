@@ -18,7 +18,6 @@ import (
 	"io"
 	"log/slog"
 	"net"
-	"strings"
 	"sync"
 	"time"
 
@@ -26,17 +25,9 @@ import (
 )
 
 const (
-	// Default ports
 	DefaultBasePort = 5000
-
-	// Connection timeout
-	connectTimeout = 5 * time.Second
-
-	// Dummy byte sent by server on connect
-	dummyByte = 0xAB
-
-	// Device name field length (matches DEVICE_NAME_FIELD_LENGTH in WifiConnection.java)
-	deviceNameLen = 64
+	connectTimeout  = 5 * time.Second
+	dummyByte       = 0xAB
 )
 
 // Connection holds all TCP connections to the Android server.
@@ -51,8 +42,7 @@ type Connection struct {
 }
 
 // Connect establishes TCP connections to the Android server on all requested ports.
-// basePort is typically 5000. All connections are made in parallel to avoid
-// cumulative timeout from sequential connects.
+// basePort is typically 5000. All connections are made in parallel.
 func Connect(host string, basePort uint16, connectVideo, connectCamera, connectMic, connectSpeaker, connectControl bool) (*Connection, error) {
 	if basePort == 0 {
 		basePort = DefaultBasePort
@@ -67,23 +57,16 @@ func Connect(host string, basePort uint16, connectVideo, connectCamera, connectM
 	var wg sync.WaitGroup
 	results := make(chan result, 5)
 
-	// Helper to launch a connect goroutine
-	launch := func(name string, port uint16, optional bool) {
+	launch := func(name string, port uint16) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			c, err := connectPort(host, port, name)
-			if err != nil && optional {
-				slog.Warn(name+" connection failed (optional)", "error", err)
-				results <- result{name: name, conn: nil, err: nil}
-				return
-			}
 			results <- result{name: name, conn: c, err: err}
 		}()
 	}
 
 	if connectVideo {
-		// Video uses retry with backoff — Android daemon may be restarting
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -95,7 +78,6 @@ func Connect(host string, basePort uint16, connectVideo, connectCamera, connectM
 		}()
 	}
 	if connectCamera {
-		// Camera uses retry with backoff
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -107,11 +89,9 @@ func Connect(host string, basePort uint16, connectVideo, connectCamera, connectM
 		}()
 	}
 	if connectMic {
-		launch("mic", basePort+2, false)
+		launch("mic", basePort+2)
 	}
 	if connectSpeaker {
-		// Speaker uses retry with backoff — Android server may need time
-		// to set up all ServerSockets before speaker is ready.
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -123,10 +103,9 @@ func Connect(host string, basePort uint16, connectVideo, connectCamera, connectM
 		}()
 	}
 	if connectControl {
-		launch("control", basePort+4, false)
+		launch("control", basePort+4)
 	}
 
-	// Wait for all goroutines to finish
 	go func() {
 		wg.Wait()
 		close(results)
@@ -158,9 +137,6 @@ func Connect(host string, basePort uint16, connectVideo, connectCamera, connectM
 	}
 
 	// Drain unused ports to prevent Android server streams from blocking.
-	// Android server starts screen/camera/mic streams when connections exist.
-	// If we don't read from these ports, the server's TCP send buffers fill up,
-	// causing streams to block → 15s daemon timeout → speaker disconnects.
 	for name, c := range map[string]net.Conn{
 		"video":  conn.video,
 		"camera": conn.camera,
@@ -177,15 +153,14 @@ func Connect(host string, basePort uint16, connectVideo, connectCamera, connectM
 	return conn, nil
 }
 
-// connectPortWithRetry attempts to connect to a port with retries on
-// connection refused. Returns nil if all attempts fail.
+// connectPortWithRetry attempts to connect to a port with retries.
+// Returns nil if all attempts fail.
 func connectPortWithRetry(host string, port uint16, name string, maxRetries int) net.Conn {
 	for i := 0; i < maxRetries; i++ {
 		conn, err := connectPort(host, port, name)
 		if err == nil {
 			return conn
 		}
-		// Retry on any connection error — Android daemon may be restarting
 		if i < maxRetries-1 {
 			slog.Debug(name+" port not ready, retrying...", "attempt", i+1, "error", err)
 			time.Sleep(time.Duration(i+1) * 500 * time.Millisecond)
@@ -195,25 +170,7 @@ func connectPortWithRetry(host string, port uint16, name string, maxRetries int)
 	return nil
 }
 
-// isTimeout checks if the error is a timeout error.
-func isTimeout(err error) bool {
-	if netErr, ok := err.(net.Error); ok {
-		return netErr.Timeout()
-	}
-	return false
-}
-
-// isConnRefused checks if the error is a "connection refused" error.
-func isConnRefused(err error) bool {
-	if err == nil {
-		return false
-	}
-	errStr := err.Error()
-	return strings.Contains(errStr, "connection refused") ||
-		strings.Contains(errStr, "connectex: No connection could be made")
-}
-
-// connectPort connects to a single port, reads the dummy byte and device name,
+// connectPort connects to a single port, reads the dummy byte,
 // and returns the connection.
 func connectPort(host string, port uint16, name string) (net.Conn, error) {
 	addr := fmt.Sprintf("%s:%d", host, port)
@@ -224,16 +181,13 @@ func connectPort(host string, port uint16, name string) (net.Conn, error) {
 		return nil, fmt.Errorf("dial %s: %w", name, err)
 	}
 
-	// Enable TCP_NODELAY for low latency
 	if tcpConn, ok := conn.(*net.TCPConn); ok {
 		tcpConn.SetNoDelay(true)
 		tcpConn.SetReadBuffer(256 * 1024)
 	}
 
-	// Set a deadline for reading the dummy byte
 	conn.SetReadDeadline(time.Now().Add(15 * time.Second))
 
-	// Read the dummy byte sent by the server
 	dummy := make([]byte, 1)
 	if _, err := io.ReadFull(conn, dummy); err != nil {
 		conn.Close()
@@ -245,24 +199,20 @@ func connectPort(host string, port uint16, name string) (net.Conn, error) {
 		return nil, fmt.Errorf("unexpected dummy byte (%s): 0x%02x", name, dummy[0])
 	}
 
-	// Clear deadline after successful read
 	conn.SetReadDeadline(time.Time{})
 
-	// Only peek for device name on the video port (first connected port).
-	// Other ports (camera, mic, speaker, control) don't receive device name,
-	// and waiting for a 15-second timeout on every port causes race conditions
-	// with the Android server's daemon restart timer.
+	// Only video port receives device name after dummy byte.
+	// Other ports return immediately to avoid blocking startup.
 	if name != "video" {
 		return conn, nil
 	}
 
-	// The device sends a 64-byte device name on the video socket.
-
+	// The video connection also receives a 64-byte device name.
+	// We don't need it for speaker-only mode, so skip reading it.
 	return conn, nil
 }
 
 // Close closes all connections.
-// Returns combined errors from all connections that failed to close.
 func (c *Connection) Close() error {
 	var errs []error
 	if c.video != nil {
@@ -283,17 +233,17 @@ func (c *Connection) Close() error {
 	return errors.Join(errs...)
 }
 
-// VideoStream returns the video (screen) connection reader + stream ID.
+// VideoStream returns the video (screen) connection reader.
 func (c *Connection) VideoStream() io.Reader {
 	return c.video
 }
 
-// CameraStream returns the camera connection reader + stream ID.
+// CameraStream returns the camera connection reader.
 func (c *Connection) CameraStream() io.Reader {
 	return c.camera
 }
 
-// MicStream returns the mic connection reader + stream ID.
+// MicStream returns the mic connection reader.
 func (c *Connection) MicStream() io.Reader {
 	return c.mic
 }
@@ -303,7 +253,7 @@ func (c *Connection) SpeakerWriter() io.Writer {
 	return c.speaker
 }
 
-// ControlConn returns the control connection for bidirectional communication.
+// ControlConn returns the control connection.
 func (c *Connection) ControlConn() net.Conn {
 	return c.control
 }
@@ -324,25 +274,4 @@ func (c *Connection) HasStream(id uint32) bool {
 	default:
 		return false
 	}
-}
-
-// connWithPrepend wraps a net.Conn and prepends bytes to the first read.
-// Used when we've peeked at the first byte of a stream and need to
-// feed it back to the packet reader.
-type connWithPrepend struct {
-	net.Conn
-	prepend []byte
-	prepended bool
-}
-
-func (c *connWithPrepend) Read(b []byte) (int, error) {
-	if !c.prepended && len(c.prepend) > 0 {
-		n := copy(b, c.prepend)
-		c.prepend = c.prepend[n:]
-		if len(c.prepend) == 0 {
-			c.prepended = true
-		}
-		return n, nil
-	}
-	return c.Conn.Read(b)
 }

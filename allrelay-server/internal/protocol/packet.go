@@ -35,10 +35,7 @@ const (
 
 // Flag bits in pts_and_flags.
 const (
-	FlagSession uint64 = 1 << 63
 	FlagConfig  uint64 = 1 << 62
-	FlagKeyFrame uint64 = 1 << 61
-	PTSMask     uint64 = (1 << 53) - 1 // lower 53 bits
 )
 
 // StreamName returns a human-readable name for a stream ID.
@@ -75,38 +72,9 @@ type Header struct {
 	SessionHeight uint32
 }
 
-// PTS extracts the presentation timestamp in microseconds.
-func (h *Header) PTS() uint64 {
-	return h.PTSAndFlags & PTSMask
-}
-
-// IsSession returns true if this is a session (resolution change) packet.
-func (h *Header) IsSession() bool {
-	return h.PTSAndFlags&FlagSession != 0
-}
-
 // IsConfig returns true if this is a codec config packet.
 func (h *Header) IsConfig() bool {
 	return h.PTSAndFlags&FlagConfig != 0
-}
-
-// IsKeyFrame returns true if this packet contains a key frame.
-func (h *Header) IsKeyFrame() bool {
-	return h.PTSAndFlags&FlagKeyFrame != 0
-}
-
-// MediaType returns a string describing the packet type.
-func (h *Header) MediaType() string {
-	if h.IsSession() {
-		return "session"
-	}
-	if h.IsConfig() {
-		return "config"
-	}
-	if h.IsKeyFrame() {
-		return "keyframe"
-	}
-	return "media"
 }
 
 // ReadHeader reads and parses a 16-byte AllRelay header from the reader.

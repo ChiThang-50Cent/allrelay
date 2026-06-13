@@ -61,7 +61,6 @@ public final class Server {
         private int running;
         private int failed;
         private boolean daemon;
-        private volatile boolean timedOut;
 
         Completion(int running, boolean daemon) {
             this.running = running;
@@ -76,8 +75,6 @@ public final class Server {
         }
 
         synchronized void addCompleted(boolean fatalError) {
-            if (timedOut) return; // Already timed out
-            
             --running;
             if (fatalError) {
                 ++failed;

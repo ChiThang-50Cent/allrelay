@@ -243,13 +243,6 @@ public final class WifiConnection implements Closeable {
         }
     }
 
-    /**
-     * Open with default AllRelay ports (5000-5004).
-     */
-    public static WifiConnection open(boolean video, boolean audio,
-                                      boolean control) throws IOException {
-        return open(video, false, audio, false, control, PORT_VIDEO);
-    }
 
     /**
      * Open only the speaker port for reverse audio streaming (PC → phone).
@@ -442,11 +435,6 @@ public final class WifiConnection implements Closeable {
     }
 
     /**
-     * Get the control socket for bidirectional control communication.
-     */
-    public Socket getControlSocket() {
-        return controlSocket;
-    }
 
     /**
      * Get the local IP address that clients should connect to.
