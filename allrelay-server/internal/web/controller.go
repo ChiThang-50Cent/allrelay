@@ -491,11 +491,16 @@ func runSpeakerCapture(ctx context.Context, w io.Writer, onMetrics func(fps, bit
 // Android camera daemon sends AllRelay protocol packets (16-byte header + payload).
 // We use the demuxer to strip headers and forward only H.264 NAL units to FFmpeg.
 func runCameraCapture(ctx context.Context, reader io.Reader) error {
-	// PipeWire camera source — no device path needed, no v4l2loopback, no sudo.
-	// Browsers see it via xdg-desktop-portal.
 	device := video.GetCameraDevice()
 
-	slog.Info("Camera: opening PipeWire pipeline")
+	// Reload v4l2loopback to ensure clean state for Chrome/Meet.
+	// Chrome uses V4L2 directly (not PipeWire portal).
+	if err := video.ReloadV4L2Loopback(device); err != nil {
+		slog.Warn("Camera: v4l2loopback reload failed", "error", err,
+			"hint", "Set ALLRELAY_SUDO_PASSWORD env or run manually")
+	}
+
+	slog.Info("Camera: opening v4l2 pipeline", "device", device)
 
 	pipeline, err := video.CameraPipeline(device)
 	if err != nil {

@@ -179,14 +179,15 @@ func (p *Pipeline) Done() <-chan error {
 }
 
 // CameraPipeline creates a pipeline that decodes H.264 from stdin and
-// publishes decoded frames as a PipeWire video source for browsers.
+// publishes decoded frames as a PipeWire video source.
 //
-// PipeWire replaces v4l2loopback — no kernel module, no sudo needed.
-// The video source appears in browsers (Zoom/Meet) via xdg-desktop-portal.
+// Firefox uses xdg-desktop-portal (works). Chrome/Chromium needs
+// --enable-features=WebRTCPipeWireCamera flag or the Video/Source must
+// be in "streaming" state before Chrome enumerates cameras.
 //
 // Pipeline: H.264 stdin → h264parse → avdec_h264 → videorate → videoconvert → YUY2 → pipewiresink
 func CameraPipeline(device string) (*Pipeline, error) {
-	_ = device // unused — PipeWire doesn't need a device path
+	_ = device
 	args := []string{
 		"-q",
 		"fdsrc", "fd=0",
