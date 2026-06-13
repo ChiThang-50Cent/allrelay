@@ -91,6 +91,7 @@ public class Options {
     private int wifiPort = 5000; // base port for Wi-Fi connections
     private boolean multistream = false; // enable multi-stream (screen + camera simultaneous)
     private boolean speakerEnabled = true; // enable speaker stream (PC→phone) independently from mic
+    private boolean cameraEnabled = false; // enable camera stream in daemon mode
     private boolean daemon = false; // keep server running after streams complete
 
     public Ln.Level getLogLevel() {
@@ -336,6 +337,10 @@ public class Options {
 
     public boolean isSpeakerEnabled() {
         return speakerEnabled;
+    }
+
+    public boolean isCameraEnabled() {
+        return cameraEnabled;
     }
 
     public boolean isDaemon() {
@@ -599,6 +604,9 @@ public class Options {
                     break;
                 case "speaker_enabled":
                     options.speakerEnabled = Boolean.parseBoolean(value);
+                    break;
+                case "camera_enabled":
+                    options.cameraEnabled = Boolean.parseBoolean(value);
                     break;
                 case "no_video":
                     options.video = !Boolean.parseBoolean(value);

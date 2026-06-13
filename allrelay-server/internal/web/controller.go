@@ -1,6 +1,7 @@
 package web
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"github.com/allrelay/allrelay-server/internal/audio"
 	"github.com/allrelay/allrelay-server/internal/protocol"
 	"github.com/allrelay/allrelay-server/internal/transport"
+	"github.com/allrelay/allrelay-server/internal/video"
 )
 
 // ServerController manages the actual connection to the phone
@@ -76,11 +78,11 @@ func (sc *ServerController) Connect(host string, port int) error {
 
 	slog.Info("Connecting to phone", "host", host, "port", port)
 
-	// Connect only speaker. Android server takes ~15s to timeout video
-	// accept, then starts ONLY the speaker stream (no screen = no conflicts).
+	// Connect speaker + camera. Screen/video intentionally disabled
+	// to avoid conflicts with the speaker daemon flow.
 	conn, err := transport.Connect(host, uint16(port),
-		false, // video — not needed, causes screen stream conflicts
-		false, // camera
+		false, // video (screen) — daemon mode skips screen
+		true,  // camera
 		false, // mic
 		true,  // speaker
 		false) // control
@@ -106,6 +108,11 @@ func (sc *ServerController) Connect(host string, port int) error {
 	// Start speaker stream by default (PC → phone audio)
 	if conn.HasStream(protocol.StreamSpeaker) {
 		sc.startSpeakerStream()
+	}
+
+	// Start camera stream by default (phone camera → PC → v4l2loopback)
+	if conn.HasStream(protocol.StreamCamera) {
+		sc.startCameraStream()
 	}
 
 	slog.Info("Connected to phone", "host", host)
@@ -194,6 +201,8 @@ func (sc *ServerController) ToggleStream(name string, active bool) error {
 		switch name {
 		case "speaker":
 			sc.startSpeakerStreamLocked()
+		case "camera":
+			sc.startCameraStreamLocked()
 		case "mic":
 			sc.startMicStreamLocked()
 		}
@@ -286,6 +295,52 @@ func (sc *ServerController) startMicStreamLocked() {
 	// TODO: Implement mic stream handling
 	// For now, just mark as running
 	slog.Info("Mic stream started (placeholder)")
+}
+
+// startCameraStream starts the camera stream (phone camera → PC → v4l2loopback)
+func (sc *ServerController) startCameraStream() {
+	sc.startCameraStreamLocked()
+}
+
+// startCameraStreamLocked starts the camera stream (must hold lock)
+func (sc *ServerController) startCameraStreamLocked() {
+	if sc.conn == nil || !sc.conn.HasStream(protocol.StreamCamera) {
+		slog.Warn("Camera stream not available (no connection)")
+		return
+	}
+
+	stream := sc.streams["camera"]
+
+	// Stop any previous camera goroutine
+	if stream.cancel != nil {
+		stream.cancel()
+	}
+	stream.Running = false
+	stream.Active = false
+
+	// Create a cancel context for this stream
+	ctx, cancel := context.WithCancel(context.Background())
+	stream.cancel = cancel
+
+	slog.Info("Starting camera stream")
+	stream.Active = true
+	stream.Running = true
+	stream.gen++
+	gen := stream.gen
+
+	// Start camera capture in background (reads from phone, writes to v4l2loopback)
+	go func() {
+		reader := sc.conn.CameraStream()
+		if err := runCameraCapture(ctx, reader); err != nil {
+			slog.Error("Camera capture error", "error", err)
+		}
+		sc.mu.Lock()
+		if stream.Running && stream.gen == gen {
+			stream.Running = false
+			stream.Active = false
+		}
+		sc.mu.Unlock()
+	}()
 }
 
 // IsConnected returns whether we're connected to a phone
@@ -400,5 +455,88 @@ func runSpeakerCapture(ctx context.Context, w io.Writer, onMetrics func(fps, bit
 				"total_bytes", byteCount,
 				"packet_bytes", len(packet))
 		}
+	}
+}
+
+// runCameraCapture reads H.264 camera packets from the phone and feeds
+// them to an FFmpeg pipeline that decodes and writes to a v4l2loopback device (/dev/video10).
+//
+// Android camera daemon sends AllRelay protocol packets (16-byte header + payload).
+// We use the demuxer to strip headers and forward only H.264 NAL units to FFmpeg.
+func runCameraCapture(ctx context.Context, reader io.Reader) error {
+	device := video.GetCameraDevice()
+	slog.Info("Camera: opening pipeline", "device", device)
+
+	pipeline, err := video.CameraPipeline(device)
+	if err != nil {
+		return fmt.Errorf("camera pipeline: %w", err)
+	}
+	defer pipeline.Close()
+
+	var frameCount uint64
+	var byteCount uint64
+	var started bool
+
+	// Debug: peek first bytes to diagnose protocol issues
+	peek := make([]byte, 32)
+	n, peekErr := io.ReadFull(reader, peek)
+	slog.Info("Camera: preamble bytes", "n", n, "err", peekErr, "hex", fmt.Sprintf("%x", peek[:n]))
+
+	// Reconstruct reader with peek bytes prepended
+	combinedReader := io.MultiReader(bytes.NewReader(peek[:n]), reader)
+
+	demuxer := protocol.NewDemuxer(combinedReader)
+	demuxer.RegisterHandler(protocol.StreamCamera, func(header *protocol.Header, payload []byte) error {
+		// Skip codec config packets (they contain codec ID metadata, not H.264 config)
+		if header.IsConfig() {
+			slog.Debug("Camera: config packet", "size", len(payload))
+			return nil
+		}
+
+		// Skip zero-payload packets
+		if len(payload) == 0 {
+			return nil
+		}
+
+		// Write H.264 NAL units to FFmpeg pipeline
+		if _, err := pipeline.Write(payload); err != nil {
+			return fmt.Errorf("pipeline write: %w", err)
+		}
+
+		if !started {
+			slog.Info("Camera: received first frame", "bytes", len(payload))
+			started = true
+		}
+
+		frameCount++
+		byteCount += uint64(len(payload))
+
+		// Log periodic stats
+		if frameCount%150 == 0 {
+			slog.Debug("Camera stream",
+				"frames", frameCount,
+				"total_bytes", byteCount,
+				"last_packet", len(payload))
+		}
+
+		return nil
+	})
+
+	slog.Info("Camera: demuxer started")
+
+	// Run demuxer in background, listen for context cancellation
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- demuxer.Run()
+	}()
+
+	select {
+	case <-ctx.Done():
+		slog.Info("Camera: context cancelled, stopping")
+		demuxer.Stop()
+		return ctx.Err()
+	case err := <-errCh:
+		slog.Info("Camera: demuxer ended", "frames", frameCount, "bytes", byteCount, "error", err)
+		return err
 	}
 }

@@ -136,18 +136,13 @@ func Connect(host string, basePort uint16, connectVideo, connectCamera, connectM
 		return nil, firstErr
 	}
 
-	// Drain unused ports to prevent Android server streams from blocking.
-	for name, c := range map[string]net.Conn{
-		"video":  conn.video,
-		"camera": conn.camera,
-		"mic":    conn.mic,
-	} {
-		if c != nil {
-			go func(n string, conn net.Conn) {
-				bytes, _ := io.Copy(io.Discard, conn)
-				slog.Debug("Drain finished", "port", n, "bytes", bytes)
-			}(name, c)
-		}
+	// Drain VIDEO port only — prevents Android screen stream from blocking
+	// when we're not reading screen data. Camera has its own active reader.
+	if conn.video != nil {
+		go func() {
+			n, _ := io.Copy(io.Discard, conn.video)
+			slog.Debug("Video drain finished", "bytes", n)
+		}()
 	}
 
 	return conn, nil

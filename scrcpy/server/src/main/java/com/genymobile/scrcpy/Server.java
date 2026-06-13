@@ -136,6 +136,7 @@ public final class Server {
         if (wifiMode) {
             int wifiPort = options.getWifiPort();
             boolean cameraEnabled = multistream && video;
+            boolean cameraDaemonEnabled = options.isCameraEnabled();
             boolean micEnabled = audio;
             boolean speakerEnabled = options.isSpeakerEnabled();
             boolean daemon = options.isDaemon();
@@ -144,56 +145,32 @@ public final class Server {
             // Outer try-catch ensures no single exception kills the server process.
             while (true) {
                 try {
-                Ln.i("DEBUG: speaker=" + speakerEnabled + " video=" + video + " camera=" + cameraEnabled + " mic=" + micEnabled + " control=" + control + " daemon=" + daemon);
+                Ln.i("DEBUG: speaker=" + speakerEnabled + " video=" + video + " camera=" + (cameraEnabled || cameraDaemonEnabled) + " mic=" + micEnabled + " control=" + control + " daemon=" + daemon);
                 Ln.i("Wi-Fi mode enabled, port " + wifiPort +
                      ", address " + WifiConnection.getLocalIpAddress());
 
                 WifiConnection wifiConn;
                 try {
-                    // Fast path: speaker-only daemon mode.
-                    // Keep speaker port open permanently, accept connections in a loop.
-                    // No restart — just accept new connection when old one ends.
-                    if (speakerEnabled && !video && !cameraEnabled && !micEnabled && !control && daemon) {
-                        int speakerPort = wifiPort + 3;
-                        java.net.ServerSocket speakerServer = null;
-                        try {
-                            speakerServer = new java.net.ServerSocket();
-                            speakerServer.setReuseAddress(true);
-                            speakerServer.bind(new java.net.InetSocketAddress(speakerPort));
-                            Ln.i("Speaker daemon listening on port " + speakerPort);
+                    // Fast path: speaker and/or camera daemon mode.
+                    // Keep ports open permanently, accept connections in a loop.
+                    // Speaker daemon runs on main thread (needs Looper for decoder callbacks).
+                    // Camera daemon runs on background thread (posts callbacks to main Looper).
+                    if ((speakerEnabled || cameraDaemonEnabled) && !video && !cameraEnabled && !micEnabled && !control && daemon) {
+                        // Start camera daemon on background thread (if enabled)
+                        Thread cameraThread = null;
+                        if (cameraDaemonEnabled) {
+                            int cameraPort = wifiPort + 1;
+                            cameraThread = startCameraDaemon(cameraPort, options);
+                        }
 
-                            while (true) {
-                                java.net.Socket speakerSocket = null;
-                                try {
-                                    Ln.i("Waiting for speaker client on port " + speakerPort + "...");
-                                    speakerSocket = speakerServer.accept();
-                                    speakerSocket.setTcpNoDelay(true);
-                                    speakerSocket.getOutputStream().write(0xAB);
-                                    speakerSocket.getOutputStream().flush();
-                                    Ln.i("Wi-Fi speaker client connected from " + speakerSocket.getRemoteSocketAddress());
-
-                                    InputStream input = speakerSocket.getInputStream();
-                                    AudioReversePlayback reversePlayback = new AudioReversePlayback(input);
-                                    Completion completion = new Completion(1, true);
-                                    reversePlayback.start((fatalError) -> completion.addCompleted(fatalError));
-
-                                    Looper.loop(); // blocks until stream completes
-                                    Ln.i("Speaker stream ended, accepting next connection...");
-                                } catch (IOException e) {
-                                    Ln.e("Speaker accept error: " + e.getMessage());
-                                    if (speakerSocket != null) {
-                                        try { speakerSocket.close(); } catch (IOException ignored) {}
-                                    }
-                                    try { Thread.sleep(500); } catch (InterruptedException ignored) {}
-                                }
-                            }
-                        } catch (IOException e) {
-                            Ln.e("Speaker daemon: " + e.getMessage());
-                            try { Thread.sleep(500); } catch (InterruptedException ignored) {}
-                        } finally {
-                            if (speakerServer != null) {
-                                try { speakerServer.close(); } catch (IOException ignored) {}
-                            }
+                        // Start speaker daemon on main thread (if enabled)
+                        // This blocks the current thread via Looper.loop()
+                        if (speakerEnabled) {
+                            int speakerPort = wifiPort + 3;
+                            runSpeakerDaemon(speakerPort);
+                        } else if (cameraThread != null) {
+                            // No speaker, just wait for camera thread
+                            try { cameraThread.join(); } catch (InterruptedException ignored) {}
                         }
                         continue;
                     }
@@ -587,5 +564,128 @@ public final class Server {
         } catch (Exception e) {
             Ln.w("Cannot set UID", e);
         }
+    }
+
+    /**
+     * Run the speaker daemon loop on the current thread (requires Looper).
+     * Listens on the given port, accepts connections, streams decoded Opus.
+     */
+    private static void runSpeakerDaemon(int speakerPort) {
+        java.net.ServerSocket speakerServer = null;
+        try {
+            speakerServer = new java.net.ServerSocket();
+            speakerServer.setReuseAddress(true);
+            speakerServer.bind(new java.net.InetSocketAddress(speakerPort));
+            Ln.i("Speaker daemon listening on port " + speakerPort);
+
+            while (true) {
+                java.net.Socket speakerSocket = null;
+                try {
+                    Ln.i("Waiting for speaker client on port " + speakerPort + "...");
+                    speakerSocket = speakerServer.accept();
+                    speakerSocket.setTcpNoDelay(true);
+                    speakerSocket.getOutputStream().write(0xAB);
+                    speakerSocket.getOutputStream().flush();
+                    Ln.i("Wi-Fi speaker client connected from " + speakerSocket.getRemoteSocketAddress());
+
+                    InputStream input = speakerSocket.getInputStream();
+                    AudioReversePlayback reversePlayback = new AudioReversePlayback(input);
+                    Completion completion = new Completion(1, true);
+                    reversePlayback.start((fatalError) -> completion.addCompleted(fatalError));
+
+                    Looper.loop(); // blocks until stream completes
+                    Ln.i("Speaker stream ended, accepting next connection...");
+                } catch (IOException e) {
+                    Ln.e("Speaker accept error: " + e.getMessage());
+                    if (speakerSocket != null) {
+                        try { speakerSocket.close(); } catch (IOException ignored) {}
+                    }
+                    try { Thread.sleep(500); } catch (InterruptedException ignored) {}
+                }
+            }
+        } catch (IOException e) {
+            Ln.e("Speaker daemon: " + e.getMessage());
+            try { Thread.sleep(500); } catch (InterruptedException ignored) {}
+        } finally {
+            if (speakerServer != null) {
+                try { speakerServer.close(); } catch (IOException ignored) {}
+            }
+        }
+    }
+
+    /**
+     * Start the camera daemon on a new background thread.
+     * Listens on the given port, accepts connections, captures camera frames.
+     * Returns the started thread (may be joined by caller).
+     */
+    private static Thread startCameraDaemon(int cameraPort, Options options) {
+        Thread thread = new Thread(() -> {
+            java.net.ServerSocket cameraServer = null;
+            try {
+                cameraServer = new java.net.ServerSocket();
+                cameraServer.setReuseAddress(true);
+                cameraServer.bind(new java.net.InetSocketAddress(cameraPort));
+                Ln.i("Camera daemon listening on port " + cameraPort);
+
+                while (true) {
+                    java.net.Socket cameraSocket = null;
+                    try {
+                        Ln.i("Waiting for camera client on port " + cameraPort + "...");
+                        cameraSocket = cameraServer.accept();
+                        cameraSocket.setTcpNoDelay(true);
+                        cameraSocket.getOutputStream().write(new byte[]{(byte)0xAB}); // dummy byte
+                        cameraSocket.getOutputStream().flush();
+                        Ln.i("Camera client connected from " + cameraSocket.getRemoteSocketAddress());
+
+                        // Create CameraCapture on main looper
+                        runCameraStream(cameraSocket, options);
+
+                        Ln.i("Camera stream ended, accepting next connection...");
+                    } catch (Exception e) {
+                        Ln.e("Camera daemon stream error: " + e.getMessage());
+                        if (cameraSocket != null) {
+                            try { cameraSocket.close(); } catch (IOException ignored) {}
+                        }
+                        try { Thread.sleep(500); } catch (InterruptedException ignored) {}
+                    }
+                }
+            } catch (IOException e) {
+                Ln.e("Camera daemon bind failed: " + e.getMessage());
+            } finally {
+                if (cameraServer != null) {
+                    try { cameraServer.close(); } catch (IOException ignored) {}
+                }
+            }
+        }, "camera-daemon");
+        thread.setDaemon(true);
+        thread.start();
+        return thread;
+    }
+
+    /**
+     * Run a single camera stream session: capture camera via Camera2 API,
+     * encode with MediaCodec H.264, stream to client socket via WifiStreamer.
+     * Runs on the calling thread but posts CameraManager callbacks to main Looper.
+     */
+    private static void runCameraStream(java.net.Socket socket, Options options) throws Exception {
+        OutputStream outputStream = socket.getOutputStream();
+
+        CameraCapture cameraCapture = new CameraCapture(options);
+        WifiStreamer cameraStreamer = new WifiStreamer(
+                outputStream, options.getVideoCodec(), StreamId.CAMERA,
+                options.getSendStreamMeta(), options.getSendFrameMeta());
+        WifiSurfaceEncoder encoder = new WifiSurfaceEncoder(
+                cameraCapture, cameraStreamer, options);
+
+        // Start encoder, receive termination callback
+        Completion completion = new Completion(1, true);
+        encoder.start((fatalError) -> completion.addCompleted(fatalError));
+
+        // Wait for stream to end (client disconnect or error)
+        encoder.join();
+
+        // Cleanup
+        cameraCapture.stop();
+        Ln.i("Camera stream completed");
     }
 }
