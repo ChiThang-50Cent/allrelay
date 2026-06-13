@@ -492,6 +492,14 @@ func runSpeakerCapture(ctx context.Context, w io.Writer, onMetrics func(fps, bit
 // We use the demuxer to strip headers and forward only H.264 NAL units to FFmpeg.
 func runCameraCapture(ctx context.Context, reader io.Reader) error {
 	device := video.GetCameraDevice()
+
+	// Reload v4l2loopback module to ensure clean state.
+	// Browsers (Zoom/Meet) enumerate cameras on page load —
+	// the module must be fresh and have exclusive_caps=1.
+	if err := video.ReloadV4L2Loopback(device); err != nil {
+		slog.Warn("Camera: v4l2loopback reload failed (may need sudo)", "error", err)
+	}
+
 	slog.Info("Camera: opening pipeline", "device", device)
 
 	pipeline, err := video.CameraPipeline(device)
