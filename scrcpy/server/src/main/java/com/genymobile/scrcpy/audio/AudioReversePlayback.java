@@ -51,16 +51,31 @@ public final class AudioReversePlayback implements AsyncProcessor {
         this.inputStream = inputStream;
     }
 
-    private static MediaCodec getSharedDecoder() {
+    /**
+     * Get or create a decoder for this speaker session.
+     * Creates a fresh decoder per connection to avoid state corruption
+     * when old goroutines hold stale references.
+     */
+    private static MediaCodec getFreshDecoder() {
         synchronized (decoderLock) {
-            if (sharedDecoder == null) {
+            // Release old decoder if any
+            if (sharedDecoder != null) {
                 try {
-                    sharedDecoder = MediaCodec.createDecoderByType(AudioCodec.OPUS.getMimeType());
-                    Ln.i("Speaker: shared decoder created (not configured yet)");
-                } catch (Exception e) {
-                    Ln.e("Speaker: failed to create shared decoder", e);
-                    return null;
-                }
+                    sharedDecoder.stop();
+                } catch (Exception ignored) {}
+                try {
+                    sharedDecoder.release();
+                } catch (Exception ignored) {}
+                sharedDecoder = null;
+            }
+            sharedDecoderStarted = false;
+
+            try {
+                sharedDecoder = MediaCodec.createDecoderByType(AudioCodec.OPUS.getMimeType());
+                Ln.i("Speaker: fresh decoder created");
+            } catch (Exception e) {
+                Ln.e("Speaker: failed to create decoder", e);
+                return null;
             }
             return sharedDecoder;
         }
@@ -128,28 +143,11 @@ public final class AudioReversePlayback implements AsyncProcessor {
 
         Ln.i("Speaker stream connected, csd=" + csdBuffer.size() + " bytes");
 
-        // Get or create shared decoder
-        MediaCodec decoder = getSharedDecoder();
+        // Create a fresh decoder per speaker session (avoids stale state from old goroutines)
+        MediaCodec decoder = getFreshDecoder();
         if (decoder == null) {
             Ln.e("Speaker: no decoder available");
             return;
-        }
-
-        // Stop and reconfigure decoder for new stream (only if already used)
-        if (sharedDecoderStarted) {
-            try {
-                decoder.stop();
-                Ln.i("Speaker: decoder stopped for reconfig");
-            } catch (Exception e) {
-                Ln.w("Speaker: stop failed, re-creating", e);
-                synchronized (decoderLock) {
-                    try { sharedDecoder.release(); } catch (Exception ignored) {}
-                    sharedDecoder = null;
-                    sharedDecoderStarted = false;
-                }
-                decoder = getSharedDecoder();
-                if (decoder == null) return;
-            }
         }
 
         // Feed CSD-0 for this stream

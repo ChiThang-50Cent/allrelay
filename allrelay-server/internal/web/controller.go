@@ -42,7 +42,8 @@ type StreamController struct {
 	Running bool
 	stop    func()
 	cancel  context.CancelFunc
-	gen     int // generation counter for stream lifecycle
+	done    chan struct{} // closed when goroutine fully exits
+	gen     int           // generation counter for stream lifecycle
 }
 
 // NewServerController creates a new server controller
@@ -197,6 +198,26 @@ func (sc *ServerController) ToggleStream(name string, active bool) error {
 	stream.Active = active
 
 	if active && !stream.Running {
+		// Release lock while waiting for old goroutine to stop
+		// (avoids deadlock: old goroutine needs mu to cleanup)
+		cancel := stream.cancel
+		done := stream.done
+		sc.mu.Unlock()
+
+		if cancel != nil {
+			cancel()
+		}
+		if done != nil {
+			<-done
+		}
+
+		sc.mu.Lock()
+		// Re-read stream state (may have changed)
+		stream, ok = sc.streams[name]
+		if !ok || stream.Running {
+			return nil
+		}
+
 		// Start stream
 		switch name {
 		case "speaker":
@@ -231,16 +252,10 @@ func (sc *ServerController) startSpeakerStreamLocked() {
 
 	stream := sc.streams["speaker"]
 
-	// Stop any previous speaker goroutine
-	if stream.cancel != nil {
-		stream.cancel()
-	}
+	// Cancel old goroutine (caller already waited for it via done channel)
+	// Cancel and done are set to new values below
 	stream.Running = false
 	stream.Active = false
-
-	if stream.Running {
-		return
-	}
 
 	// Create a cancel context for this stream
 	ctx, cancel := context.WithCancel(context.Background())
@@ -260,14 +275,15 @@ func (sc *ServerController) startSpeakerStreamLocked() {
 	}
 
 	// Start speaker capture in background
+	stream.done = make(chan struct{})
 	go func() {
+		defer close(stream.done)
 		writer := sc.conn.SpeakerWriter()
 		if err := runSpeakerCapture(ctx, writer, onMetrics); err != nil {
 			slog.Error("Speaker capture error", "error", err)
 		}
 		sc.mu.Lock()
 		if stream.Running && stream.gen == gen {
-			// Only update if this is still the current stream generation
 			stream.Running = false
 			stream.Active = false
 			sc.connected = false
@@ -311,10 +327,7 @@ func (sc *ServerController) startCameraStreamLocked() {
 
 	stream := sc.streams["camera"]
 
-	// Stop any previous camera goroutine
-	if stream.cancel != nil {
-		stream.cancel()
-	}
+	// Old goroutine already cancelled + waited by caller
 	stream.Running = false
 	stream.Active = false
 
@@ -329,7 +342,9 @@ func (sc *ServerController) startCameraStreamLocked() {
 	gen := stream.gen
 
 	// Start camera capture in background (reads from phone, writes to v4l2loopback)
+	stream.done = make(chan struct{})
 	go func() {
+		defer close(stream.done)
 		reader := sc.conn.CameraStream()
 		if err := runCameraCapture(ctx, reader); err != nil {
 			slog.Error("Camera capture error", "error", err)
@@ -403,6 +418,13 @@ func runSpeakerCapture(ctx context.Context, w io.Writer, onMetrics func(fps, bit
 	}
 	slog.Debug("Speaker: sent OpusTags", "bytes", len(opusTags))
 
+	// Monitor context cancellation — kill pipeline to unblock reads
+	go func() {
+		<-ctx.Done()
+		slog.Info("Speaker: context cancelled, closing pipeline")
+		pipeline.Close()
+	}()
+
 	// Main loop: read Opus audio packets and forward to phone
 	var frameCount uint64
 	var byteCount uint64
@@ -413,6 +435,11 @@ func runSpeakerCapture(ctx context.Context, w io.Writer, onMetrics func(fps, bit
 	for {
 		packet, err := demux.NextPacket()
 		if err != nil {
+			// Check if this was a clean cancellation
+			if ctx.Err() != nil {
+				slog.Info("Speaker: stopped by context", "frames", frameCount)
+				return ctx.Err()
+			}
 			if err == io.EOF {
 				slog.Info("Speaker: capture pipeline ended", "frames", frameCount)
 			} else {
@@ -506,6 +533,11 @@ func runCameraCapture(ctx context.Context, reader io.Reader) error {
 		if !started {
 			slog.Info("Camera: received first frame", "bytes", len(payload))
 			started = true
+
+			// Start PipeWire camera source AFTER ffmpeg starts writing.
+			// Browsers (Zoom/Meet) use xdg-desktop-portal which requires
+			// a PipeWire video SOURCE, not just a v4l2 device.
+			go startPipeWireCameraSource(device)
 		}
 
 		frameCount++
@@ -539,4 +571,22 @@ func runCameraCapture(ctx context.Context, reader io.Reader) error {
 		slog.Info("Camera: demuxer ended", "frames", frameCount, "bytes", byteCount, "error", err)
 		return err
 	}
+}
+
+// startPipeWireCameraSource starts a PipeWire video source from the v4l2loopback device,
+// so that browsers (via xdg-desktop-portal) see it as a camera.
+// This must be started AFTER ffmpeg starts writing to the v4l2 device.
+func startPipeWireCameraSource(device string) {
+	slog.Info("Camera: starting PipeWire source", "device", device)
+	pw, err := video.PipeWireCameraPipeline(device)
+	if err != nil {
+		slog.Warn("Camera: PipeWire source failed", "error", err)
+		return
+	}
+	// PipeWire pipeline runs until the v4l2 device is closed or this process exits.
+	// It's started as a fire-and-forget since it auto-terminates when the v4l2 stream ends.
+	go func() {
+		<-pw.Done()
+		slog.Debug("Camera: PipeWire source ended")
+	}()
 }
