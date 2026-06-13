@@ -184,7 +184,7 @@ func (p *Pipeline) Done() <-chan error {
 // PipeWire replaces v4l2loopback — no kernel module, no sudo needed.
 // The video source appears in browsers (Zoom/Meet) via xdg-desktop-portal.
 //
-// Pipeline: H.264 stdin → h264parse → avdec_h264 → videoconvert → YUY2 → pipewiresink
+// Pipeline: H.264 stdin → h264parse → avdec_h264 → videorate → videoconvert → YUY2 → pipewiresink
 func CameraPipeline(device string) (*Pipeline, error) {
 	_ = device // unused — PipeWire doesn't need a device path
 	args := []string{
@@ -192,8 +192,9 @@ func CameraPipeline(device string) (*Pipeline, error) {
 		"fdsrc", "fd=0",
 		"!", "h264parse",
 		"!", "avdec_h264",
+		"!", "videorate",
 		"!", "videoconvert",
-		"!", "video/x-raw,format=YUY2",
+		"!", "video/x-raw,format=YUY2,framerate=30/1",
 		"!", "pipewiresink",
 		"mode=provide",
 		"stream-properties=p,media.class=Video/Source,media.role=Camera,node.name=allrelay-camera,node.description=AllRelay_Camera",
