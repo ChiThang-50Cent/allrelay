@@ -185,6 +185,7 @@ public final class WifiStreamer {
             throw new IOException("OPUS header not found");
         }
 
+        buffer.order(ByteOrder.nativeOrder());
         long sizeLong = buffer.getLong();
         if (sizeLong < 0 || sizeLong >= 0x7FFFFFFF) {
             throw new IOException("Invalid block size in OPUS header: " + sizeLong);

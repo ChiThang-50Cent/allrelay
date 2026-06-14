@@ -14,7 +14,8 @@ import (
 const (
 	VirtualMicSinkName   = "allrelay-mic-sink"
 	VirtualMicSourceName = "allrelay-phone-mic"
-	virtualMicDesc       = "AllRelay Phone Mic"
+	virtualMicSinkDesc   = "AllRelay-Mic-Sink"
+	virtualMicSourceDesc = "AllRelay-Phone-Mic"
 )
 
 var virtualMicMu sync.Mutex
@@ -41,19 +42,25 @@ func EnsureVirtualMicDevices() error {
 }
 
 func ensurePulseSink() error {
-	exists, err := pulseObjectExists("sinks", VirtualMicSinkName)
+	exists, moduleID, desc, err := pulseObjectInfo("sinks", VirtualMicSinkName)
 	if err != nil {
 		return err
 	}
 	if exists {
-		return nil
+		if desc == virtualMicSinkDesc {
+			return nil
+		}
+		slog.Info("Mic: reloading Pulse sink to fix description", "name", VirtualMicSinkName, "old", desc, "new", virtualMicSinkDesc)
+		if err := unloadPulseModule(moduleID); err != nil {
+			return err
+		}
 	}
 
 	args := []string{
 		"load-module",
 		"module-null-sink",
 		"sink_name=" + VirtualMicSinkName,
-		"sink_properties=device.description=" + virtualMicDesc,
+		"sink_properties=device.description=" + virtualMicSinkDesc,
 	}
 	out, err := exec.Command("pactl", args...).CombinedOutput()
 	if err != nil {
@@ -64,12 +71,18 @@ func ensurePulseSink() error {
 }
 
 func ensurePulseSource() error {
-	exists, err := pulseObjectExists("sources", VirtualMicSourceName)
+	exists, moduleID, desc, err := pulseObjectInfo("sources", VirtualMicSourceName)
 	if err != nil {
 		return err
 	}
 	if exists {
-		return nil
+		if desc == virtualMicSourceDesc {
+			return nil
+		}
+		slog.Info("Mic: reloading Pulse source to fix description", "name", VirtualMicSourceName, "old", desc, "new", virtualMicSourceDesc)
+		if err := unloadPulseModule(moduleID); err != nil {
+			return err
+		}
 	}
 
 	args := []string{
@@ -77,7 +90,7 @@ func ensurePulseSource() error {
 		"module-remap-source",
 		"master=" + VirtualMicSinkName + ".monitor",
 		"source_name=" + VirtualMicSourceName,
-		"source_properties=device.description=" + virtualMicDesc,
+		"source_properties=device.description=" + virtualMicSourceDesc,
 	}
 	out, err := exec.Command("pactl", args...).CombinedOutput()
 	if err != nil {
@@ -87,18 +100,47 @@ func ensurePulseSource() error {
 	return nil
 }
 
-func pulseObjectExists(kind, name string) (bool, error) {
-	out, err := exec.Command("pactl", "list", "short", kind).Output()
+func pulseObjectInfo(kind, name string) (exists bool, moduleID string, desc string, err error) {
+	out, err := exec.Command("pactl", "list", kind).Output()
 	if err != nil {
-		return false, fmt.Errorf("pactl list short %s: %w", kind, err)
+		return false, "", "", fmt.Errorf("pactl list %s: %w", kind, err)
 	}
-	for _, line := range strings.Split(string(out), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) >= 2 && fields[1] == name {
-			return true, nil
+
+	lines := strings.Split(string(out), "\n")
+	for i := 0; i < len(lines); i++ {
+		line := strings.TrimSpace(lines[i])
+		if line != "Name: "+name {
+			continue
 		}
+
+		exists = true
+		for j := i + 1; j < len(lines); j++ {
+			entry := strings.TrimSpace(lines[j])
+			if strings.HasPrefix(entry, "Name: ") {
+				break
+			}
+			if strings.HasPrefix(entry, "Description: ") {
+				desc = strings.TrimPrefix(entry, "Description: ")
+			}
+			if strings.HasPrefix(entry, "Owner Module: ") {
+				moduleID = strings.TrimPrefix(entry, "Owner Module: ")
+			}
+		}
+		return exists, moduleID, desc, nil
 	}
-	return false, nil
+
+	return false, "", "", nil
+}
+
+func unloadPulseModule(moduleID string) error {
+	if moduleID == "" || moduleID == "n/a" {
+		return nil
+	}
+	out, err := exec.Command("pactl", "unload-module", moduleID).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("unload pulse module %s: %w: %s", moduleID, err, strings.TrimSpace(string(out)))
+	}
+	return nil
 }
 
 type VirtualMicWriter struct {

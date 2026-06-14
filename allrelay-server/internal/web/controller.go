@@ -608,9 +608,16 @@ func parseOpusHead(payload []byte) (*opusConfig, error) {
 
 // runMicCapture reads Opus mic packets from the phone, decodes them to PCM,
 // and feeds a PulseAudio/pipewire-pulse virtual microphone source.
+//
+// Unlike camera, mic must stay active even during silence or delayed first audio.
+// So we do NOT apply an idle read timeout here. The stream ends only on:
+//   - explicit toggle OFF (ctx cancel → close TCP to unblock reader)
+//   - real TCP disconnect / EOF
+//   - fatal decoder/output error
 func runMicCapture(ctx context.Context, reader io.Reader, onMetrics func(fps, bitrate, latency int, bytes, frames int64)) error {
+	var micConn net.Conn
 	if conn, ok := reader.(net.Conn); ok {
-		reader = &readDeadlineReader{conn: conn, timeout: 5 * time.Second}
+		micConn = conn
 	}
 
 	var (
@@ -751,6 +758,15 @@ func runMicCapture(ctx context.Context, reader io.Reader, onMetrics func(fps, bi
 		errCh <- demuxer.Run()
 	}()
 
+	// Explicitly close TCP on toggle OFF so a blocked demux read wakes up immediately.
+	if micConn != nil {
+		go func() {
+			<-ctx.Done()
+			slog.Info("Mic: context cancelled, closing TCP reader")
+			_ = micConn.Close()
+		}()
+	}
+
 	select {
 	case <-ctx.Done():
 		slog.Info("Mic: context cancelled, stopping")
@@ -760,10 +776,6 @@ func runMicCapture(ctx context.Context, reader io.Reader, onMetrics func(fps, bi
 		slog.Info("Mic: fatal handler error", "frames", frameCount, "bytes", byteCount, "error", err)
 		return err
 	case err := <-errCh:
-		if isNetTimeout(err) {
-			slog.Info("Mic: stream idle timeout", "frames", frameCount, "bytes", byteCount)
-			return io.EOF
-		}
 		slog.Info("Mic: demuxer ended", "frames", frameCount, "bytes", byteCount, "error", err)
 		return err
 	}
