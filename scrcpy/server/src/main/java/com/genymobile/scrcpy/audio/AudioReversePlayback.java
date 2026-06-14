@@ -301,8 +301,8 @@ public final class AudioReversePlayback implements AsyncProcessor {
         if (Build.VERSION.SDK_INT >= AndroidVersions.API_26_ANDROID_8_0) {
             return new AudioTrack.Builder()
                     .setAudioAttributes(new AudioAttributes.Builder()
-                            .setUsage(AudioAttributes.USAGE_MEDIA)
-                            .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                            .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                             .build())
                     .setAudioFormat(new AudioFormat.Builder()
                             .setEncoding(ENCODING)
@@ -315,8 +315,8 @@ public final class AudioReversePlayback implements AsyncProcessor {
         }
         @SuppressWarnings("deprecation")
         AudioTrack track = new AudioTrack(
-                AudioAttributes.USAGE_MEDIA,
-                AudioAttributes.CONTENT_TYPE_MUSIC,
+                AudioAttributes.USAGE_VOICE_COMMUNICATION,
+                AudioAttributes.CONTENT_TYPE_SPEECH,
                 SAMPLE_RATE,
                 CHANNEL_CONFIG,
                 ENCODING,

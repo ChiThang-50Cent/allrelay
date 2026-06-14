@@ -16,19 +16,23 @@ public class AudioRecordReader {
             (1000000 + AudioConfig.SAMPLE_RATE - 1) / AudioConfig.SAMPLE_RATE; // 1 sample in microseconds (used for fixing PTS)
 
     private final AudioRecord recorder;
+    private final int channelCount;
+    private final int maxReadSize;
 
     private final AudioTimestamp timestamp = new AudioTimestamp();
     private long previousRecorderTimestamp = -1;
     private long previousPts = 0;
     private long nextPts = 0;
 
-    public AudioRecordReader(AudioRecord recorder) {
+    public AudioRecordReader(AudioRecord recorder, int channelCount, int maxReadSize) {
         this.recorder = recorder;
+        this.channelCount = channelCount;
+        this.maxReadSize = maxReadSize;
     }
 
     @TargetApi(AndroidVersions.API_24_ANDROID_7_0)
     public int read(ByteBuffer outDirectBuffer, MediaCodec.BufferInfo outBufferInfo) {
-        int r = recorder.read(outDirectBuffer, AudioConfig.MAX_READ_SIZE);
+        int r = recorder.read(outDirectBuffer, maxReadSize);
         if (r <= 0) {
             return r;
         }
@@ -48,7 +52,7 @@ public class AudioRecordReader {
             pts = nextPts;
         }
 
-        long durationUs = r * 1000000L / (AudioConfig.CHANNELS * AudioConfig.BYTES_PER_SAMPLE * AudioConfig.SAMPLE_RATE);
+        long durationUs = r * 1000000L / (channelCount * AudioConfig.BYTES_PER_SAMPLE * AudioConfig.SAMPLE_RATE);
         nextPts = pts + durationUs;
 
         if (previousPts != 0 && pts < previousPts + ONE_SAMPLE_US) {

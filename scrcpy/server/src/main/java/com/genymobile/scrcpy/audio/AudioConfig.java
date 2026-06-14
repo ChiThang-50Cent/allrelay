@@ -13,17 +13,25 @@ public final class AudioConfig {
     // Never read more than 1024 samples, even if the buffer is bigger (that would increase latency).
     // A lower value is useless, since the system captures audio samples by blocks of 1024 (so for example if we read by blocks of 256 samples, we
     // receive 4 successive blocks without waiting, then we wait for the 4 next ones).
-    public static final int MAX_READ_SIZE = 1024 * CHANNELS * BYTES_PER_SAMPLE;
+    public static final int MAX_READ_SIZE = maxReadSize(CHANNELS);
 
     private AudioConfig() {
         // Not instantiable
     }
 
+    public static int maxReadSize(int channels) {
+        return 1024 * channels * BYTES_PER_SAMPLE;
+    }
+
     public static AudioFormat createAudioFormat() {
+        return createAudioFormat(CHANNEL_CONFIG);
+    }
+
+    public static AudioFormat createAudioFormat(int channelMask) {
         AudioFormat.Builder builder = new AudioFormat.Builder();
         builder.setEncoding(ENCODING);
         builder.setSampleRate(SAMPLE_RATE);
-        builder.setChannelMask(CHANNEL_CONFIG);
+        builder.setChannelMask(channelMask);
         return builder.build();
     }
 }

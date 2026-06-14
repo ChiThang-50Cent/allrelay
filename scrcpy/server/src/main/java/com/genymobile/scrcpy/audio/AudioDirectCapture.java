@@ -9,7 +9,9 @@ import com.genymobile.scrcpy.wrappers.ServiceManager;
 import android.annotation.SuppressLint;
 import android.annotation.TargetApi;
 import android.content.ComponentName;
+import android.content.Context;
 import android.content.Intent;
+import android.media.AudioManager;
 import android.media.AudioRecord;
 import android.media.MediaCodec;
 import android.media.audiofx.AcousticEchoCanceler;
@@ -22,13 +24,24 @@ import java.nio.ByteBuffer;
 public class AudioDirectCapture implements AudioCapture {
 
     private static final int SAMPLE_RATE = AudioConfig.SAMPLE_RATE;
-    private static final int CHANNEL_CONFIG = AudioConfig.CHANNEL_CONFIG;
-    private static final int CHANNELS = AudioConfig.CHANNELS;
-    private static final int CHANNEL_MASK = AudioConfig.CHANNEL_MASK;
+    private static final int STEREO_CHANNEL_CONFIG = AudioConfig.CHANNEL_CONFIG;
+    private static final int STEREO_CHANNELS = AudioConfig.CHANNELS;
+    private static final int STEREO_CHANNEL_MASK = AudioConfig.CHANNEL_MASK;
+    private static final int MONO_CHANNEL_CONFIG = android.media.AudioFormat.CHANNEL_IN_MONO;
+    private static final int MONO_CHANNELS = 1;
+    private static final int MONO_CHANNEL_MASK = android.media.AudioFormat.CHANNEL_IN_MONO;
     private static final int ENCODING = AudioConfig.ENCODING;
+    private static final Object audioModeLock = new Object();
+    private static int audioModeRefCount;
+    private static Integer previousAudioMode;
+    private static Boolean previousSpeakerphoneOn;
 
-    private final int audioSource;
+    private final int requestedAudioSource;
     private final boolean enableVoiceProcessing;
+    private final int captureAudioSource;
+    private final int channelConfig;
+    private final int channelCount;
+    private final int channelMask;
 
     private AudioRecord recorder;
     private AudioRecordReader reader;
@@ -40,21 +53,27 @@ public class AudioDirectCapture implements AudioCapture {
     }
 
     public AudioDirectCapture(AudioSource audioSource, boolean enableVoiceProcessing) {
-        this.audioSource = audioSource.getDirectAudioSource();
+        this.requestedAudioSource = audioSource.getDirectAudioSource();
         this.enableVoiceProcessing = enableVoiceProcessing;
+        this.captureAudioSource = enableVoiceProcessing
+                ? AudioSource.MIC_VOICE_COMMUNICATION.getDirectAudioSource()
+                : requestedAudioSource;
+        this.channelConfig = enableVoiceProcessing ? MONO_CHANNEL_CONFIG : STEREO_CHANNEL_CONFIG;
+        this.channelCount = enableVoiceProcessing ? MONO_CHANNELS : STEREO_CHANNELS;
+        this.channelMask = enableVoiceProcessing ? MONO_CHANNEL_MASK : STEREO_CHANNEL_MASK;
     }
 
     @TargetApi(AndroidVersions.API_23_ANDROID_6_0)
     @SuppressLint({"WrongConstant", "MissingPermission"})
-    private static AudioRecord createAudioRecord(int audioSource) {
+    private AudioRecord createAudioRecord(int audioSource) {
         AudioRecord.Builder builder = new AudioRecord.Builder();
         if (Build.VERSION.SDK_INT >= AndroidVersions.API_31_ANDROID_12) {
             // On older APIs, Workarounds.fillAppInfo() must be called beforehand
             builder.setContext(FakeContext.get());
         }
         builder.setAudioSource(audioSource);
-        builder.setAudioFormat(AudioConfig.createAudioFormat());
-        int minBufferSize = AudioRecord.getMinBufferSize(SAMPLE_RATE, CHANNEL_CONFIG, ENCODING);
+        builder.setAudioFormat(AudioConfig.createAudioFormat(channelConfig));
+        int minBufferSize = AudioRecord.getMinBufferSize(SAMPLE_RATE, channelConfig, ENCODING);
         if (minBufferSize > 0) {
             // This buffer size does not impact latency
             builder.setBufferSizeInBytes(8 * minBufferSize);
@@ -103,16 +122,21 @@ public class AudioDirectCapture implements AudioCapture {
 
     private void startRecording() throws AudioCaptureException {
         try {
-            recorder = createAudioRecord(audioSource);
+            recorder = createAudioRecord(captureAudioSource);
         } catch (NullPointerException e) {
             // Creating an AudioRecord using an AudioRecord.Builder does not work on Vivo phones:
             // - <https://github.com/Genymobile/scrcpy/issues/3805>
             // - <https://github.com/Genymobile/scrcpy/pull/3862>
-            recorder = Workarounds.createAudioRecord(audioSource, SAMPLE_RATE, CHANNEL_CONFIG, CHANNELS, CHANNEL_MASK, ENCODING);
+            recorder = Workarounds.createAudioRecord(captureAudioSource, SAMPLE_RATE, channelConfig, channelCount, channelMask, ENCODING);
         }
+        configureCommunicationMode();
         configureVoiceProcessing();
         recorder.startRecording();
-        reader = new AudioRecordReader(recorder);
+        reader = new AudioRecordReader(recorder, channelCount, getMaxReadSize());
+        Ln.i("Mic capture started: source=" + captureAudioSource
+                + " requested_source=" + requestedAudioSource
+                + " channels=" + channelCount
+                + " voice_processing=" + enableVoiceProcessing);
     }
 
     @Override
@@ -134,6 +158,87 @@ public class AudioDirectCapture implements AudioCapture {
             }
         } else {
             startRecording();
+        }
+    }
+
+    private AudioManager getAudioManager() {
+        Context baseContext = FakeContext.get().getBaseContext();
+        if (baseContext == null) {
+            return null;
+        }
+        try {
+            java.lang.reflect.Constructor<AudioManager> ctor = AudioManager.class.getDeclaredConstructor(Context.class);
+            ctor.setAccessible(true);
+            return ctor.newInstance(baseContext);
+        } catch (Exception e) {
+            Object service = baseContext.getSystemService(Context.AUDIO_SERVICE);
+            if (service instanceof AudioManager) {
+                return (AudioManager) service;
+            }
+            Ln.w("Mic AudioManager init failed: " + e.getMessage());
+            return null;
+        }
+    }
+
+    private void configureCommunicationMode() {
+        if (!enableVoiceProcessing) {
+            return;
+        }
+
+        AudioManager audioManager = getAudioManager();
+        if (audioManager == null) {
+            Ln.w("Mic communication mode unavailable: no AudioManager");
+            return;
+        }
+        synchronized (audioModeLock) {
+            if (audioModeRefCount == 0) {
+                previousAudioMode = audioManager.getMode();
+                previousSpeakerphoneOn = audioManager.isSpeakerphoneOn();
+                try {
+                    audioManager.setMode(AudioManager.MODE_IN_COMMUNICATION);
+                    audioManager.setSpeakerphoneOn(true);
+                    Ln.i("Mic communication mode enabled: mode=" + audioManager.getMode()
+                            + " speakerphone=" + audioManager.isSpeakerphoneOn());
+                } catch (RuntimeException e) {
+                    Ln.w("Mic communication mode enable failed: " + e.getMessage());
+                }
+            }
+            audioModeRefCount++;
+        }
+    }
+
+    private void restoreCommunicationMode() {
+        if (!enableVoiceProcessing) {
+            return;
+        }
+
+        AudioManager audioManager = getAudioManager();
+        if (audioManager == null) {
+            return;
+        }
+        synchronized (audioModeLock) {
+            if (audioModeRefCount <= 0) {
+                audioModeRefCount = 0;
+                return;
+            }
+            audioModeRefCount--;
+            if (audioModeRefCount == 0) {
+                try {
+                    if (previousSpeakerphoneOn != null) {
+                        audioManager.setSpeakerphoneOn(previousSpeakerphoneOn);
+                    }
+                    if (previousAudioMode != null) {
+                        audioManager.setMode(previousAudioMode);
+                    }
+                    Ln.i("Mic communication mode restored: mode=" + audioManager.getMode()
+                            + " speakerphone=" + audioManager.isSpeakerphoneOn());
+                } catch (RuntimeException e) {
+                    Ln.w("Mic communication mode restore failed: " + e.getMessage());
+                } finally {
+                    previousAudioMode = null;
+                    previousSpeakerphoneOn = null;
+                }
+            }
         }
     }
 
@@ -196,6 +301,12 @@ public class AudioDirectCapture implements AudioCapture {
             recorder.release();
             recorder = null;
         }
+        restoreCommunicationMode();
+    }
+
+    @Override
+    public int getChannelCount() {
+        return channelCount;
     }
 
     @Override

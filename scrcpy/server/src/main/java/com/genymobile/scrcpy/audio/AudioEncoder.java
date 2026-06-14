@@ -46,9 +46,6 @@ public final class AudioEncoder implements AsyncProcessor {
         }
     }
 
-    private static final int SAMPLE_RATE = AudioConfig.SAMPLE_RATE;
-    private static final int CHANNELS = AudioConfig.CHANNELS;
-
     private final AudioCapture capture;
     private final Streamer streamer;
     private final int bitRate;
@@ -79,12 +76,12 @@ public final class AudioEncoder implements AsyncProcessor {
         this.encoderName = options.getAudioEncoder();
     }
 
-    private static MediaFormat createFormat(String mimeType, int bitRate, List<CodecOption> codecOptions) {
+    private static MediaFormat createFormat(String mimeType, int sampleRate, int channels, int bitRate, List<CodecOption> codecOptions) {
         MediaFormat format = new MediaFormat();
         format.setString(MediaFormat.KEY_MIME, mimeType);
         format.setInteger(MediaFormat.KEY_BIT_RATE, bitRate);
-        format.setInteger(MediaFormat.KEY_CHANNEL_COUNT, CHANNELS);
-        format.setInteger(MediaFormat.KEY_SAMPLE_RATE, SAMPLE_RATE);
+        format.setInteger(MediaFormat.KEY_CHANNEL_COUNT, channels);
+        format.setInteger(MediaFormat.KEY_SAMPLE_RATE, sampleRate);
 
         if (codecOptions != null) {
             for (CodecOption option : codecOptions) {
@@ -228,7 +225,7 @@ public final class AudioEncoder implements AsyncProcessor {
             mediaCodecThread = new HandlerThread("media-codec");
             mediaCodecThread.start();
 
-            MediaFormat format = createFormat(codec.getMimeType(), bitRate, codecOptions);
+            MediaFormat format = createFormat(codec.getMimeType(), capture.getSampleRate(), capture.getChannelCount(), bitRate, codecOptions);
             mediaCodec.setCallback(new EncoderCallback(), new Handler(mediaCodecThread.getLooper()));
             mediaCodec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
 

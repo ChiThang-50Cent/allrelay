@@ -119,7 +119,7 @@ public final class AudioPlaybackCapture implements AudioCapture {
     public void start() throws AudioCaptureException {
         recorder = createAudioRecord();
         recorder.startRecording();
-        reader = new AudioRecordReader(recorder);
+        reader = new AudioRecordReader(recorder, getChannelCount(), getMaxReadSize());
     }
 
     @Override
