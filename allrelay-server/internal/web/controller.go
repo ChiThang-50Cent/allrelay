@@ -298,11 +298,6 @@ func (sc *ServerController) startSpeakerStreamLocked() {
 				slog.Info("Speaker: stopped by toggle")
 			} else {
 				slog.Error("Speaker capture error", "error", err)
-				sc.mu.Lock()
-				if stream.Running && stream.gen == gen {
-					sc.connected = false
-				}
-				sc.mu.Unlock()
 			}
 		}
 		sc.mu.Lock()
@@ -342,9 +337,20 @@ func (sc *ServerController) startCameraStream() {
 
 // startCameraStreamLocked starts the camera stream (must hold lock)
 func (sc *ServerController) startCameraStreamLocked() {
-	if sc.conn == nil || !sc.conn.HasStream(protocol.StreamCamera) {
+	if sc.conn == nil {
 		slog.Warn("Camera stream not available (no connection)")
 		return
+	}
+
+	// Reconnect camera TCP if the old connection was closed by a previous OFF.
+	// This ensures a clean session with a fresh TCP reader — the old demuxer
+	// goroutine was unblocked and should have exited after the TCP close.
+	if !sc.conn.HasStream(protocol.StreamCamera) {
+		slog.Info("Camera: reconnecting TCP")
+		if err := sc.conn.ReconnectStream(sc.host, uint16(sc.port), protocol.StreamCamera); err != nil {
+			slog.Error("Camera: reconnect failed", "error", err)
+			return
+		}
 	}
 
 	stream := sc.streams["camera"]
@@ -373,11 +379,6 @@ func (sc *ServerController) startCameraStreamLocked() {
 				slog.Info("Camera: stopped by toggle")
 			} else {
 				slog.Error("Camera capture error", "error", err)
-				sc.mu.Lock()
-				if stream.Running && stream.gen == gen {
-					sc.connected = false
-				}
-				sc.mu.Unlock()
 			}
 		}
 		sc.mu.Lock()
@@ -385,6 +386,11 @@ func (sc *ServerController) startCameraStreamLocked() {
 			stream.Running = false
 			stream.Active = false
 		}
+		// Close camera TCP to force-unblock any orphaned demuxer goroutine
+		// that may still be blocked on ReadHeader. Without this, the TCP
+		// connection stays ESTAB and the old goroutine competes with the
+		// new one on the next camera ON.
+		sc.conn.CloseStream(protocol.StreamCamera)
 		sc.mu.Unlock()
 	}()
 }
@@ -544,6 +550,14 @@ func runCameraCapture(ctx context.Context, reader io.Reader) error {
 	}
 	defer pipeline.Close()
 
+	pipelineErrCh := make(chan error, 1)
+	go func() {
+		if err := <-pipeline.Done(); err != nil {
+			pipelineErrCh <- err
+		}
+		close(pipelineErrCh)
+	}()
+
 	var frameCount uint64
 	var byteCount uint64
 	var started bool
@@ -557,6 +571,7 @@ func runCameraCapture(ctx context.Context, reader io.Reader) error {
 	combinedReader := io.MultiReader(bytes.NewReader(peek[:n]), reader)
 
 	demuxer := protocol.NewDemuxer(combinedReader)
+	fatalErrCh := make(chan error, 1)
 	demuxer.RegisterHandler(protocol.StreamCamera, func(header *protocol.Header, payload []byte) error {
 		// Skip zero-payload packets (session meta, etc.)
 		if len(payload) == 0 {
@@ -572,9 +587,15 @@ func runCameraCapture(ctx context.Context, reader io.Reader) error {
 			return nil
 		}
 
-		// Write H.264 NAL units to GStreamer pipeline
+		// Write H.264 NAL units to ffmpeg pipeline.
+		// If ffmpeg exits unexpectedly, stop the demuxer so the stream fully tears down.
 		if _, err := pipeline.Write(payload); err != nil {
-			return fmt.Errorf("pipeline write: %w", err)
+			select {
+			case fatalErrCh <- fmt.Errorf("pipeline write: %w", err):
+			default:
+			}
+			demuxer.Stop()
+			return nil
 		}
 
 		if !started {
@@ -609,6 +630,16 @@ func runCameraCapture(ctx context.Context, reader io.Reader) error {
 		slog.Info("Camera: context cancelled, stopping")
 		demuxer.Stop()
 		return ctx.Err()
+	case err := <-pipelineErrCh:
+		if err != nil {
+			slog.Info("Camera: pipeline ended", "frames", frameCount, "bytes", byteCount, "error", err)
+			demuxer.Stop()
+			return err
+		}
+		return nil
+	case err := <-fatalErrCh:
+		slog.Info("Camera: fatal handler error", "frames", frameCount, "bytes", byteCount, "error", err)
+		return err
 	case err := <-errCh:
 		slog.Info("Camera: demuxer ended", "frames", frameCount, "bytes", byteCount, "error", err)
 		return err

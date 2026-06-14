@@ -270,3 +270,38 @@ func (c *Connection) HasStream(id uint32) bool {
 		return false
 	}
 }
+
+// CloseStream closes and clears a single stream connection.
+// This unblocks any goroutine blocked on reads from this stream.
+func (c *Connection) CloseStream(id uint32) {
+	switch id {
+	case protocol.StreamCamera:
+		if c.camera != nil {
+			slog.Info("Closing camera TCP connection")
+			c.camera.Close()
+			c.camera = nil
+		}
+	}
+}
+
+// ReconnectStream re-establishes a single stream connection to the phone.
+// host is the phone IP, basePort is the base port (e.g. 5000).
+// The per-stream port offset is added automatically.
+func (c *Connection) ReconnectStream(host string, basePort uint16, id uint32) error {
+	switch id {
+	case protocol.StreamCamera:
+		if c.camera != nil {
+			c.camera.Close()
+			c.camera = nil
+		}
+		newConn := connectPortWithRetry(host, basePort+1, "camera", 8)
+		if newConn == nil {
+			return fmt.Errorf("camera reconnect failed: %s:%d", host, basePort+1)
+		}
+		c.camera = newConn
+		slog.Info("Camera reconnected", "host", host, "port", basePort+1)
+		return nil
+	default:
+		return fmt.Errorf("reconnect not implemented for stream %s", protocol.StreamName(id))
+	}
+}

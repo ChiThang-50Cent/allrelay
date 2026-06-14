@@ -2,9 +2,10 @@ package video
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
-	"log/slog"
+	"strings"
 )
 
 // Default V4L2 device for the AllRelay virtual camera.
@@ -33,16 +34,22 @@ func EnsureV4L2Device(device string) error {
 
 // SetupV4L2Output sets the output format on the v4l2loopback device.
 // This must be called BEFORE ffmpeg/gstreamer opens the device for writing.
-// With exclusive_caps=1, the device initially reports as CAPTURE-only;
-// setting the output format triggers the mode switch to OUTPUT.
 //
-// If the format is already set (from a previous run or crash), this is a no-op
-// and returns nil (trying to reset would fail with VIDIOC_G_FMT).
+// Important: with exclusive_caps=1, v4l2loopback can keep the last good
+// output format between sessions if keep_format=1 is enabled. This makes
+// camera OFF→ON restarts reliable without requiring sudo/module reloads.
 func SetupV4L2Output(device string, width, height int, pixelformat string) error {
-	// Check if format is already configured correctly
-	if fmt, err := getV4L2Format(device, "--get-fmt-video-out"); err == nil {
-		slog.Debug("v4l2: output format already set", "format", fmt)
-		return nil
+	// Persist the last good format across writer restarts.
+	if err := setV4L2Ctrl(device, "keep_format=1"); err != nil {
+		slog.Warn("v4l2: failed to enable keep_format", "error", err)
+	}
+
+	if current, err := getV4L2Format(device, "--get-fmt-video-out"); err == nil {
+		if v4l2FormatMatches(current, width, height, pixelformat) {
+			slog.Debug("v4l2: output format already configured", "device", device)
+			return nil
+		}
+		slog.Info("v4l2: output format differs, reconfiguring", "device", device)
 	}
 
 	slog.Info("v4l2: setting output format",
@@ -58,23 +65,15 @@ func SetupV4L2Output(device string, width, height int, pixelformat string) error
 	)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		// VIDIOC_G_FMT failure means device is in a bad state.
-		// Try reloading v4l2loopback (needs sudo — only works if passwordless sudo).
-		slog.Warn("v4l2: format setup failed, trying module reload", "error", err, "output", string(out))
-		if reloadErr := reloadV4L2Module(); reloadErr != nil {
-			slog.Warn("v4l2: module reload failed (needs sudo?)", "error", reloadErr)
-			return fmt.Errorf("v4l2-ctl set output format: %w\noutput: %s", err, string(out))
-		}
-		// Retry after reload
-		cmd = exec.Command("v4l2-ctl",
-			"-d", device,
-			"--set-fmt-video-out",
-			fmt.Sprintf("width=%d,height=%d,pixelformat=%s", width, height, pixelformat),
-		)
-		out, err = cmd.CombinedOutput()
-		if err != nil {
-			return fmt.Errorf("v4l2-ctl set output format (after reload): %w\noutput: %s", err, string(out))
-		}
+		return fmt.Errorf("v4l2-ctl set output format: %w\noutput: %s", err, string(out))
+	}
+
+	current, err := getV4L2Format(device, "--get-fmt-video-out")
+	if err != nil {
+		return fmt.Errorf("v4l2-ctl verify output format: %w", err)
+	}
+	if !v4l2FormatMatches(current, width, height, pixelformat) {
+		return fmt.Errorf("v4l2 output format mismatch after setup: %s", strings.TrimSpace(current))
 	}
 	return nil
 }
@@ -89,22 +88,18 @@ func getV4L2Format(device, flag string) (string, error) {
 	return string(out), nil
 }
 
-// reloadV4L2Module attempts to reload the v4l2loopback module.
-// Uses sudo rmmod + modprobe; only works with passwordless sudo.
-func reloadV4L2Module() error {
-	if err := exec.Command("sudo", "rmmod", "v4l2loopback").Run(); err != nil {
-		slog.Debug("v4l2: rmmod skipped (may not be loaded)", "error", err)
-	}
-	cmd := exec.Command("sudo", "modprobe", "v4l2loopback",
-		"video_nr=10",
-		"card_label=AllRelay Cam",
-		"exclusive_caps=1",
-	)
+func setV4L2Ctrl(device, ctrl string) error {
+	cmd := exec.Command("v4l2-ctl", "-d", device, "--set-ctrl", ctrl)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("modprobe: %w\noutput: %s", err, string(out))
+		return fmt.Errorf("set ctrl %s: %w\noutput: %s", ctrl, err, string(out))
 	}
 	return nil
+}
+
+func v4l2FormatMatches(output string, width, height int, pixelformat string) bool {
+	return strings.Contains(output, fmt.Sprintf("Width/Height      : %d/%d", width, height)) &&
+		strings.Contains(output, fmt.Sprintf("Pixel Format      : '%s'", pixelformat))
 }
 
 // IsV4L2DeviceReady checks if the v4l2 device exists and is accessible.

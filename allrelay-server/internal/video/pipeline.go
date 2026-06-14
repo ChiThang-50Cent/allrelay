@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"time"
 )
 
 // Pipeline manages a GStreamer subprocess that reads H.264 from stdin
@@ -122,20 +123,26 @@ func (p *Pipeline) startCmd(command string, args []string) error {
 
 // Write sends H.264 data to the GStreamer pipeline via stdin.
 // Implements io.Writer.
+//
+// IMPORTANT: does NOT hold p.mu during the actual IO operation.
+// This prevents a deadlock where Write blocks on a full pipe
+// while Close() tries to acquire the mutex to shut down.
 func (p *Pipeline) Write(data []byte) (int, error) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
+	stdin := p.stdin
+	p.mu.Unlock()
 
-	if p.stdin == nil {
+	if stdin == nil {
 		return 0, errors.New("pipeline closed")
 	}
 
-	return p.stdin.Write(data)
+	return stdin.Write(data)
 }
 
 // Close terminates the GStreamer pipeline.
-// It closes stdin (signaling EOF to gst-launch-1.0) and waits
-// for the process to exit gracefully.
+// It closes stdin (signaling EOF to the subprocess) and waits
+// for the process to exit gracefully. If the process does not
+// exit within 2 seconds (e.g. stuck on v4l2 output), it is killed.
 func (p *Pipeline) Close() error {
 	p.mu.Lock()
 	if p.stdin == nil {
@@ -145,27 +152,36 @@ func (p *Pipeline) Close() error {
 
 	slog.Info("Stopping pipeline", "name", p.name)
 
-	// Close stdin to signal end-of-stream to GStreamer
+	// Close stdin to signal end-of-stream to the subprocess.
+	// This also unblocks any Write() call stuck on a full pipe.
 	stdin := p.stdin
 	p.stdin = nil
 	p.mu.Unlock()
 
 	stdin.Close()
 
-	// Wait for process to exit (or kill it)
+	// Wait for process to exit (with kill timeout)
 	if p.cmd != nil && p.cmd.Process != nil {
-		// TODO: add timeout + kill if stuck
-		err := p.cmd.Wait()
-		if err != nil {
-			var exitErr *exec.ExitError
-			if errors.As(err, &exitErr) {
-				// Non-zero exit is expected when we close stdin
-				slog.Debug("Pipeline terminated",
-					"name", p.name,
-					"exit_code", exitErr.ExitCode())
-				return nil
+		done := make(chan error, 1)
+		go func() {
+			done <- p.cmd.Wait()
+		}()
+		select {
+		case err := <-done:
+			if err != nil {
+				var exitErr *exec.ExitError
+				if errors.As(err, &exitErr) {
+					slog.Debug("Pipeline terminated",
+						"name", p.name,
+						"exit_code", exitErr.ExitCode())
+					return nil
+				}
+				return fmt.Errorf("wait pipeline %q: %w", p.name, err)
 			}
-			return fmt.Errorf("wait pipeline %q: %w", p.name, err)
+		case <-time.After(2 * time.Second):
+			slog.Warn("Pipeline stuck, sending SIGKILL", "name", p.name)
+			p.cmd.Process.Kill()
+			<-done
 		}
 	}
 
