@@ -570,47 +570,33 @@ public final class Server {
     }
 
     /**
-     * Advertise this phone via mDNS so the PC can discover it automatically.
-     * Uses reflection to access hidden system APIs in app_process context.
+     * Start UDP discovery responder. Listens for broadcast queries
+     * from the PC and responds with this phone's info.
      */
     private static void startMdnsAdvertiser(int port) {
         new Thread(() -> {
             try {
-                // Get system context via hidden API
-                Class<?> activityThreadClass = Class.forName("android.app.ActivityThread");
-                java.lang.reflect.Method systemMain = activityThreadClass.getMethod("systemMain");
-                Object activityThread = systemMain.invoke(null);
-                java.lang.reflect.Method getSystemContext = activityThreadClass.getMethod("getSystemContext");
-                android.content.Context context = (android.content.Context) getSystemContext.invoke(activityThread);
+                java.net.DatagramSocket socket = new java.net.DatagramSocket(5009);
+                socket.setBroadcast(true);
+                byte[] buf = new byte[256];
+                String response = "{\"name\":\"AllRelay\",\"port\":" + port + "}";
+                Ln.i("Discovery: responder listening on port 5009");
 
-                android.net.nsd.NsdServiceInfo serviceInfo = new android.net.nsd.NsdServiceInfo();
-                serviceInfo.setServiceName("AllRelay");
-                serviceInfo.setServiceType("_allrelay._tcp");
-                serviceInfo.setPort(port);
-
-                android.net.nsd.NsdManager nsdManager =
-                    (android.net.nsd.NsdManager) context.getSystemService(android.content.Context.NSD_SERVICE);
-
-                if (nsdManager != null) {
-                    nsdManager.registerService(serviceInfo,
-                        android.net.nsd.NsdManager.PROTOCOL_DNS_SD,
-                        new android.net.nsd.NsdManager.RegistrationListener() {
-                            public void onServiceRegistered(android.net.nsd.NsdServiceInfo info) {
-                                Ln.i("mDNS: registered as " + info.getServiceName());
-                            }
-                            public void onRegistrationFailed(android.net.nsd.NsdServiceInfo info, int error) {
-                                Ln.w("mDNS: registration failed, error=" + error);
-                            }
-                            public void onServiceUnregistered(android.net.nsd.NsdServiceInfo info) {}
-                            public void onUnregistrationFailed(android.net.nsd.NsdServiceInfo info, int error) {}
-                        });
-                } else {
-                    Ln.w("mDNS: NsdManager not available");
+                while (true) {
+                    try {
+                        java.net.DatagramPacket packet = new java.net.DatagramPacket(buf, buf.length);
+                        socket.receive(packet);
+                        // Respond to query
+                        byte[] data = response.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                        java.net.DatagramPacket reply = new java.net.DatagramPacket(
+                            data, data.length, packet.getAddress(), packet.getPort());
+                        socket.send(reply);
+                    } catch (Exception ignored) {}
                 }
             } catch (Exception e) {
-                Ln.w("mDNS: failed to start (non-fatal)", e);
+                Ln.w("Discovery: responder failed", e);
             }
-        }, "mdns-advertiser").start();
+        }, "udp-responder").start();
     }
 
     private static void runSpeakerDaemon(int speakerPort) {

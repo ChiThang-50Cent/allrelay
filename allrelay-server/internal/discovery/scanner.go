@@ -1,6 +1,12 @@
-// Package discovery handles UDP beacon-based phone discovery.
-// Android phones broadcast a UDP packet with their info every 5 seconds.
-// The PC listens for these broadcasts to discover phones.
+// Package discovery handles UDP-based phone discovery.
+//
+// Protocol:
+//   1. PC broadcasts a "who is there" query to 255.255.255.255:5009
+//   2. Phone receives query, responds with unicast JSON to source IP:5009
+//   3. PC collects responses
+//
+// This approach avoids broadcast issues (many routers block client→server
+// broadcast on Wi-Fi). Server-side (PC) broadcast is more reliable.
 package discovery
 
 import (
@@ -11,7 +17,7 @@ import (
 	"time"
 )
 
-// BeaconPort is the UDP port for phone discovery broadcasts.
+// BeaconPort is the UDP port for discovery.
 const BeaconPort = 5009
 
 // Phone represents a discovered AllRelay phone.
@@ -21,21 +27,20 @@ type Phone struct {
 	Port int    `json:"port"`
 }
 
-// Beacon is the UDP message sent by the phone.
+// Beacon is the UDP message format.
 type Beacon struct {
 	Name string `json:"name"`
 	Port int    `json:"port"`
 }
 
-// Scanner discovers AllRelay phones via UDP beacon.
+// Scanner discovers AllRelay phones via UDP query/response.
 type Scanner struct {
 	mu      sync.RWMutex
-	phones  map[string]Phone // keyed by IP
-	conn    *net.UDPConn
+	phones  map[string]Phone
 	timeout time.Duration
 }
 
-// NewScanner creates a new UDP beacon scanner.
+// NewScanner creates a new discovery scanner.
 func NewScanner() *Scanner {
 	return &Scanner{
 		phones:  make(map[string]Phone),
@@ -43,22 +48,49 @@ func NewScanner() *Scanner {
 	}
 }
 
-// Scan listens for UDP beacons for timeout duration.
+// Scan sends a broadcast query and waits for responses.
 func (s *Scanner) Scan() []Phone {
-	addr := &net.UDPAddr{Port: BeaconPort}
-	conn, err := net.ListenUDP("udp", addr)
+	addr := &net.UDPAddr{IP: net.ParseIP("0.0.0.0"), Port: BeaconPort}
+	conn, err := net.ListenUDP("udp4", addr)
 	if err != nil {
-		slog.Warn("beacon: cannot listen", "port", BeaconPort, "error", err)
+		slog.Warn("discovery: cannot listen", "port", BeaconPort, "error", err)
 		return s.List()
 	}
 	defer conn.Close()
-	conn.SetReadDeadline(time.Now().Add(s.timeout))
 
+	// Send broadcast query to all local subnets
+	// 255.255.255.255 is often blocked by routers, so we target
+	// each local interface's subnet broadcast address (e.g., 192.168.1.255).
+	query := []byte(`{"query":"allrelay"}`)
+	interfaces, _ := net.Interfaces()
+	for _, iface := range interfaces {
+		addrs, _ := iface.Addrs()
+		for _, a := range addrs {
+			ipnet, ok := a.(*net.IPNet)
+			if !ok || ipnet.IP.To4() == nil || ipnet.IP.IsLoopback() {
+				continue
+			}
+			// Calculate broadcast: IP | ^mask
+			broadcastIP := make(net.IP, 4)
+			for i := 0; i < 4; i++ {
+				broadcastIP[i] = ipnet.IP.To4()[i] | ^ipnet.Mask[i]
+			}
+			broadcast := &net.UDPAddr{IP: broadcastIP, Port: BeaconPort}
+			slog.Debug("discovery: broadcasting to", "iface", iface.Name, "broadcast", broadcastIP.String())
+			for i := 0; i < 3; i++ {
+				conn.WriteToUDP(query, broadcast)
+				time.Sleep(200 * time.Millisecond)
+			}
+		}
+	}
+
+	// Listen for responses
+	conn.SetReadDeadline(time.Now().Add(s.timeout))
 	buf := make([]byte, 512)
 	for {
 		n, remote, err := conn.ReadFromUDP(buf)
 		if err != nil {
-			break // timeout or error
+			break
 		}
 
 		var beacon Beacon
@@ -74,7 +106,7 @@ func (s *Scanner) Scan() []Phone {
 			Port: beacon.Port,
 		}
 		s.mu.Unlock()
-		slog.Debug("beacon: discovered", "name", beacon.Name, "ip", ip, "port", beacon.Port)
+		slog.Debug("discovery: found", "name", beacon.Name, "ip", ip, "port", beacon.Port)
 	}
 
 	return s.List()
