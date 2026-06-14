@@ -156,8 +156,11 @@ public final class Server {
                     // Speaker daemon runs on main thread (needs Looper for decoder callbacks).
                     // Camera daemon runs on background thread (posts callbacks to main Looper).
                     if ((speakerEnabled || cameraDaemonEnabled) && !video && !cameraEnabled && !micEnabled && !control && daemon) {
-                        // Start mDNS advertisement so PC can discover this phone
+                    // Start mDNS advertisement so PC can discover this phone.
+                    // Must run on main thread (ActivityThread.systemMain needs Looper).
+                    new android.os.Handler(android.os.Looper.getMainLooper()).post(() -> {
                         startMdnsAdvertiser(wifiPort);
+                    });
 
                         // Start camera daemon on background thread (if enabled)
                         Thread cameraThread = null;
@@ -570,23 +573,60 @@ public final class Server {
     }
 
     /**
-     * Start UDP discovery responder. Listens for broadcast queries
-     * from the PC and responds with this phone's info.
+     * Register mDNS service so PC can discover this phone automatically.
+     * Called on the main thread (has Looper, required by NsdManager).
+     * Also starts a UDP responder as fallback for networks where mDNS is blocked.
      */
     private static void startMdnsAdvertiser(int port) {
+        // Register mDNS via Android NsdManager (standard approach, like AudioRelay)
+        try {
+            Class<?> atClass = Class.forName("android.app.ActivityThread");
+            java.lang.reflect.Method systemMain = atClass.getMethod("systemMain");
+            Object at = systemMain.invoke(null);
+            java.lang.reflect.Method getSystemContext = atClass.getMethod("getSystemContext");
+            android.content.Context ctx = (android.content.Context) getSystemContext.invoke(at);
+
+            android.net.nsd.NsdServiceInfo info = new android.net.nsd.NsdServiceInfo();
+            info.setServiceName("AllRelay");
+            info.setServiceType("_allrelay._tcp");
+            info.setPort(port);
+
+            android.net.nsd.NsdManager mgr = (android.net.nsd.NsdManager)
+                ctx.getSystemService(android.content.Context.NSD_SERVICE);
+            if (mgr != null) {
+                mgr.registerService(info, android.net.nsd.NsdManager.PROTOCOL_DNS_SD,
+                    new android.net.nsd.NsdManager.RegistrationListener() {
+                        public void onServiceRegistered(android.net.nsd.NsdServiceInfo i) {
+                            Ln.i("mDNS: registered as " + i.getServiceName());
+                        }
+                        public void onRegistrationFailed(android.net.nsd.NsdServiceInfo i, int e) {
+                            Ln.w("mDNS: registration failed, error=" + e);
+                        }
+                        public void onServiceUnregistered(android.net.nsd.NsdServiceInfo i) {}
+                        public void onUnregistrationFailed(android.net.nsd.NsdServiceInfo i, int e) {}
+                    });
+            }
+        } catch (Exception e) {
+            Ln.w("mDNS: failed (non-fatal)", e);
+        }
+
+        // Also start UDP responder as reliable fallback
+        startUdpResponder(port);
+    }
+
+    /** UDP discovery responder — listens for queries, responds with phone info. */
+    private static void startUdpResponder(int port) {
         new Thread(() -> {
             try {
                 java.net.DatagramSocket socket = new java.net.DatagramSocket(5009);
                 socket.setBroadcast(true);
                 byte[] buf = new byte[256];
                 String response = "{\"name\":\"AllRelay\",\"port\":" + port + "}";
-                Ln.i("Discovery: responder listening on port 5009");
-
+                Ln.i("Discovery: UDP responder on port 5009");
                 while (true) {
                     try {
                         java.net.DatagramPacket packet = new java.net.DatagramPacket(buf, buf.length);
                         socket.receive(packet);
-                        // Respond to query
                         byte[] data = response.getBytes(java.nio.charset.StandardCharsets.UTF_8);
                         java.net.DatagramPacket reply = new java.net.DatagramPacket(
                             data, data.length, packet.getAddress(), packet.getPort());
@@ -594,7 +634,7 @@ public final class Server {
                     } catch (Exception ignored) {}
                 }
             } catch (Exception e) {
-                Ln.w("Discovery: responder failed", e);
+                Ln.w("Discovery: UDP failed", e);
             }
         }, "udp-responder").start();
     }
