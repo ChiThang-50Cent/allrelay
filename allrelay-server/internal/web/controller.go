@@ -228,11 +228,25 @@ func (sc *ServerController) ToggleStream(name string, active bool) error {
 			sc.startMicStreamLocked()
 		}
 	} else if !active && stream.Running {
-		// Stop stream
-		if stream.stop != nil {
-			stream.stop()
+		// Release lock while waiting for goroutine to stop
+		// (avoids deadlock: goroutine needs mu to cleanup)
+		cancel := stream.cancel
+		done := stream.done
+		sc.mu.Unlock()
+
+		if cancel != nil {
+			cancel()
 		}
-		stream.Running = false
+		if done != nil {
+			<-done
+		}
+
+		sc.mu.Lock()
+		// Re-read stream state (may have changed during unlock)
+		stream, ok = sc.streams[name]
+		if ok {
+			stream.Running = false
+		}
 	}
 
 	return nil
@@ -280,13 +294,21 @@ func (sc *ServerController) startSpeakerStreamLocked() {
 		defer close(stream.done)
 		writer := sc.conn.SpeakerWriter()
 		if err := runSpeakerCapture(ctx, writer, onMetrics); err != nil {
-			slog.Error("Speaker capture error", "error", err)
+			if err == context.Canceled {
+				slog.Info("Speaker: stopped by toggle")
+			} else {
+				slog.Error("Speaker capture error", "error", err)
+				sc.mu.Lock()
+				if stream.Running && stream.gen == gen {
+					sc.connected = false
+				}
+				sc.mu.Unlock()
+			}
 		}
 		sc.mu.Lock()
 		if stream.Running && stream.gen == gen {
 			stream.Running = false
 			stream.Active = false
-			sc.connected = false
 		}
 		sc.mu.Unlock()
 	}()
@@ -347,7 +369,16 @@ func (sc *ServerController) startCameraStreamLocked() {
 		defer close(stream.done)
 		reader := sc.conn.CameraStream()
 		if err := runCameraCapture(ctx, reader); err != nil {
-			slog.Error("Camera capture error", "error", err)
+			if err == context.Canceled {
+				slog.Info("Camera: stopped by toggle")
+			} else {
+				slog.Error("Camera capture error", "error", err)
+				sc.mu.Lock()
+				if stream.Running && stream.gen == gen {
+					sc.connected = false
+				}
+				sc.mu.Unlock()
+			}
 		}
 		sc.mu.Lock()
 		if stream.Running && stream.gen == gen {
