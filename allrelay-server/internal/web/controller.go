@@ -233,7 +233,7 @@ func (sc *ServerController) ToggleStream(name string, active bool) error {
 		case "camera":
 			sc.startCameraStreamLocked()
 		case "mic":
-			sc.startMicStreamLocked()
+			go sc.startMicStreamAsync()
 		}
 	} else if !active && stream.Running {
 		// Release lock while waiting for goroutine to stop
@@ -317,21 +317,33 @@ func (sc *ServerController) startSpeakerStreamLocked() {
 	}()
 }
 
+func (sc *ServerController) startMicStreamAsync() {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	stream, ok := sc.streams["mic"]
+	if !ok || !stream.Active || stream.Running {
+		return
+	}
+	sc.startMicStreamLocked()
+}
+
 // startMicStreamLocked starts the mic stream (phone → PC virtual microphone)
 func (sc *ServerController) startMicStreamLocked() {
+	stream := sc.streams["mic"]
 	if sc.conn == nil {
 		slog.Warn("Mic stream not available (no connection)")
+		stream.Active = false
 		return
 	}
 	if !sc.conn.HasStream(protocol.StreamMic) {
 		slog.Info("Mic: reconnecting TCP")
 		if err := sc.conn.ReconnectStream(sc.host, uint16(sc.port), protocol.StreamMic); err != nil {
 			slog.Error("Mic: reconnect failed", "error", err)
+			stream.Active = false
 			return
 		}
 	}
 
-	stream := sc.streams["mic"]
 	stream.Running = false
 	stream.Active = false
 

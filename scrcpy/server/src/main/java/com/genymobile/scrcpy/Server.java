@@ -151,32 +151,39 @@ public final class Server {
 
                 WifiConnection wifiConn;
                 try {
-                    // Fast path: speaker and/or camera daemon mode.
-                    // Keep ports open permanently, accept connections in a loop.
+                    // Fast path: persistent daemon mode for independently managed ports.
+                    // Keep enabled ports open permanently and accept reconnections in a loop.
                     // Speaker daemon runs on main thread (needs Looper for decoder callbacks).
-                    // Camera daemon runs on background thread (posts callbacks to main Looper).
-                    if ((speakerEnabled || cameraDaemonEnabled) && !video && !cameraEnabled && !micEnabled && !control && daemon) {
+                    // Camera and mic daemons run on background threads.
+                    if (daemon && !video && !cameraEnabled && !control
+                            && (speakerEnabled || cameraDaemonEnabled || micEnabled)) {
                     // Start mDNS advertisement so PC can discover this phone.
                     // Must run on main thread (ActivityThread.systemMain needs Looper).
                     new android.os.Handler(android.os.Looper.getMainLooper()).post(() -> {
                         startMdnsAdvertiser(wifiPort);
                     });
 
-                        // Start camera daemon on background thread (if enabled)
                         Thread cameraThread = null;
+                        Thread micThread = null;
+
                         if (cameraDaemonEnabled) {
                             int cameraPort = wifiPort + 1;
                             cameraThread = startCameraDaemon(cameraPort, options);
                         }
 
-                        // Start speaker daemon on main thread (if enabled)
-                        // This blocks the current thread via Looper.loop()
+                        if (micEnabled) {
+                            int micPort = wifiPort + 2;
+                            micThread = startMicDaemon(micPort, options);
+                        }
+
+                        // Speaker daemon runs on main thread and blocks until fatal exit.
                         if (speakerEnabled) {
                             int speakerPort = wifiPort + 3;
                             runSpeakerDaemon(speakerPort);
                         } else if (cameraThread != null) {
-                            // No speaker, just wait for camera thread
                             try { cameraThread.join(); } catch (InterruptedException ignored) {}
+                        } else if (micThread != null) {
+                            try { micThread.join(); } catch (InterruptedException ignored) {}
                         }
                         continue;
                     }
@@ -732,6 +739,54 @@ public final class Server {
     }
 
     /**
+     * Start the mic daemon on a new background thread.
+     * Listens on the given port, accepts connections, captures phone mic audio,
+     * and streams Opus packets to the client socket.
+     */
+    private static Thread startMicDaemon(int micPort, Options options) {
+        Thread thread = new Thread(() -> {
+            java.net.ServerSocket micServer = null;
+            try {
+                micServer = new java.net.ServerSocket();
+                micServer.setReuseAddress(true);
+                micServer.bind(new java.net.InetSocketAddress(micPort));
+                Ln.i("Mic daemon listening on port " + micPort);
+
+                while (true) {
+                    java.net.Socket micSocket = null;
+                    try {
+                        Ln.i("Waiting for mic client on port " + micPort + "...");
+                        micSocket = micServer.accept();
+                        micSocket.setTcpNoDelay(true);
+                        micSocket.getOutputStream().write(new byte[]{(byte) 0xAB});
+                        micSocket.getOutputStream().flush();
+                        Ln.i("Mic client connected from " + micSocket.getRemoteSocketAddress());
+
+                        runMicStream(micSocket, options);
+
+                        Ln.i("Mic stream ended, accepting next connection...");
+                    } catch (Exception e) {
+                        Ln.e("Mic daemon stream error: " + e.getMessage(), e);
+                        if (micSocket != null) {
+                            try { micSocket.close(); } catch (IOException ignored) {}
+                        }
+                        try { Thread.sleep(500); } catch (InterruptedException ignored) {}
+                    }
+                }
+            } catch (IOException e) {
+                Ln.e("Mic daemon bind failed: " + e.getMessage(), e);
+            } finally {
+                if (micServer != null) {
+                    try { micServer.close(); } catch (IOException ignored) {}
+                }
+            }
+        }, "mic-daemon");
+        thread.setDaemon(true);
+        thread.start();
+        return thread;
+    }
+
+    /**
      * Run a single camera stream session: capture camera via Camera2 API,
      * encode with MediaCodec H.264, stream to client socket via WifiStreamer.
      * Runs on the calling thread but posts CameraManager callbacks to main Looper.
@@ -756,5 +811,38 @@ public final class Server {
         // Cleanup
         cameraCapture.stop();
         Ln.i("Camera stream completed");
+    }
+
+    /**
+     * Run a single mic stream session: capture phone microphone via AudioRecord,
+     * encode with MediaCodec Opus, and stream packets to the client socket.
+     */
+    private static void runMicStream(java.net.Socket socket, Options options) throws Exception {
+        OutputStream outputStream = socket.getOutputStream();
+
+        AudioSource audioSource = options.getAudioSource();
+        AudioCapture audioCapture;
+        if (audioSource.isDirect()) {
+            audioCapture = new AudioDirectCapture(audioSource);
+        } else {
+            audioCapture = new AudioPlaybackCapture(options.getAudioDup());
+        }
+
+        StreamId audioStreamId = audioSource.isDirect() ? StreamId.MIC : StreamId.SPEAKER;
+        WifiStreamer audioStreamer = new WifiStreamer(
+                outputStream, options.getAudioCodec(), audioStreamId,
+                options.getSendStreamMeta(), options.getSendFrameMeta());
+        WifiAudioEncoder encoder = new WifiAudioEncoder(audioCapture, audioStreamer, options);
+
+        final boolean[] fatal = {false};
+        encoder.start((fatalError) -> fatal[0] = fatalError);
+        encoder.join();
+
+        audioCapture.stop();
+        if (fatal[0]) {
+            Ln.w("Mic stream completed with fatal error");
+        } else {
+            Ln.i("Mic stream completed");
+        }
     }
 }
