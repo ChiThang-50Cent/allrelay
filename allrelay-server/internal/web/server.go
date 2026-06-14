@@ -8,6 +8,8 @@ import (
 	"os"
 	"sync"
 	"time"
+
+	"github.com/allrelay/allrelay-server/internal/discovery"
 )
 
 // ServerConfig holds web server configuration
@@ -62,6 +64,7 @@ type WebServer struct {
 	currentConn *ConnectionStatus
 	hub         *Hub
 	controller  *ServerController
+	scanner     *discovery.Scanner
 	mu          sync.RWMutex
 	httpServer  *http.Server
 }
@@ -75,6 +78,7 @@ func NewWebServer(config ServerConfig) *WebServer {
 		config: config,
 		phones: make(map[string]*PhoneDevice),
 		hub:    hub,
+		scanner: discovery.NewScanner(),
 		currentConn: &ConnectionStatus{
 			Streams: []StreamStatus{
 				{Name: "screen", Port: 5000},
@@ -192,12 +196,41 @@ func (ws *WebServer) handlePhones(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(phones)
 }
 
-// handleScanPhones triggers a network scan for phones
+// handleScanPhones triggers an mDNS network scan for AllRelay phones.
+// Android phones advertise as _allrelay._tcp on port 5000.
 func (ws *WebServer) handleScanPhones(w http.ResponseWriter, r *http.Request) {
-	// TODO: Implement mDNS/network scan
-	// For now, return empty list
+	results := ws.scanner.Scan()
+
+	phones := make([]PhoneDevice, 0, len(results))
+	ws.mu.Lock()
+	for _, p := range results {
+		id := p.IP + ":" + itoa(p.Port)
+		device := PhoneDevice{
+			ID:       id,
+			Name:     p.Name,
+			IP:       p.IP,
+			Ports:    []int{p.Port},
+			LastSeen: time.Now(),
+		}
+		// Preserve connected status
+		if existing, ok := ws.phones[id]; ok {
+			device.Connected = existing.Connected
+		}
+		ws.phones[id] = &device
+		phones = append(phones, device)
+	}
+	ws.mu.Unlock()
+
+	if phones == nil {
+		phones = []PhoneDevice{} // return [] not null
+	}
+
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode([]PhoneDevice{})
+	json.NewEncoder(w).Encode(phones)
+}
+
+func itoa(i int) string {
+	return fmt.Sprintf("%d", i)
 }
 
 // handleConnect connects to a phone

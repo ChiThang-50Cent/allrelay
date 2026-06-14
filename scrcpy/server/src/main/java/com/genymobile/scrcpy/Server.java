@@ -156,6 +156,9 @@ public final class Server {
                     // Speaker daemon runs on main thread (needs Looper for decoder callbacks).
                     // Camera daemon runs on background thread (posts callbacks to main Looper).
                     if ((speakerEnabled || cameraDaemonEnabled) && !video && !cameraEnabled && !micEnabled && !control && daemon) {
+                        // Start mDNS advertisement so PC can discover this phone
+                        startMdnsAdvertiser(wifiPort);
+
                         // Start camera daemon on background thread (if enabled)
                         Thread cameraThread = null;
                         if (cameraDaemonEnabled) {
@@ -567,9 +570,49 @@ public final class Server {
     }
 
     /**
-     * Run the speaker daemon loop on the current thread (requires Looper).
-     * Listens on the given port, accepts connections, streams decoded Opus.
+     * Advertise this phone via mDNS so the PC can discover it automatically.
+     * Uses reflection to access hidden system APIs in app_process context.
      */
+    private static void startMdnsAdvertiser(int port) {
+        new Thread(() -> {
+            try {
+                // Get system context via hidden API
+                Class<?> activityThreadClass = Class.forName("android.app.ActivityThread");
+                java.lang.reflect.Method systemMain = activityThreadClass.getMethod("systemMain");
+                Object activityThread = systemMain.invoke(null);
+                java.lang.reflect.Method getSystemContext = activityThreadClass.getMethod("getSystemContext");
+                android.content.Context context = (android.content.Context) getSystemContext.invoke(activityThread);
+
+                android.net.nsd.NsdServiceInfo serviceInfo = new android.net.nsd.NsdServiceInfo();
+                serviceInfo.setServiceName("AllRelay");
+                serviceInfo.setServiceType("_allrelay._tcp");
+                serviceInfo.setPort(port);
+
+                android.net.nsd.NsdManager nsdManager =
+                    (android.net.nsd.NsdManager) context.getSystemService(android.content.Context.NSD_SERVICE);
+
+                if (nsdManager != null) {
+                    nsdManager.registerService(serviceInfo,
+                        android.net.nsd.NsdManager.PROTOCOL_DNS_SD,
+                        new android.net.nsd.NsdManager.RegistrationListener() {
+                            public void onServiceRegistered(android.net.nsd.NsdServiceInfo info) {
+                                Ln.i("mDNS: registered as " + info.getServiceName());
+                            }
+                            public void onRegistrationFailed(android.net.nsd.NsdServiceInfo info, int error) {
+                                Ln.w("mDNS: registration failed, error=" + error);
+                            }
+                            public void onServiceUnregistered(android.net.nsd.NsdServiceInfo info) {}
+                            public void onUnregistrationFailed(android.net.nsd.NsdServiceInfo info, int error) {}
+                        });
+                } else {
+                    Ln.w("mDNS: NsdManager not available");
+                }
+            } catch (Exception e) {
+                Ln.w("mDNS: failed to start (non-fatal)", e);
+            }
+        }, "mdns-advertiser").start();
+    }
+
     private static void runSpeakerDaemon(int speakerPort) {
         java.net.ServerSocket speakerServer = null;
         try {
