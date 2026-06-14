@@ -3,9 +3,11 @@ package web
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"sync"
 	"time"
 
@@ -375,9 +377,12 @@ func (sc *ServerController) startCameraStreamLocked() {
 		defer close(stream.done)
 		reader := sc.conn.CameraStream()
 		if err := runCameraCapture(ctx, reader); err != nil {
-			if err == context.Canceled {
+			switch err {
+			case context.Canceled:
 				slog.Info("Camera: stopped by toggle")
-			} else {
+			case io.EOF:
+				slog.Info("Camera: stream ended cleanly")
+			default:
 				slog.Error("Camera capture error", "error", err)
 			}
 		}
@@ -527,8 +532,36 @@ func runSpeakerCapture(ctx context.Context, w io.Writer, onMetrics func(fps, bit
 //
 // Android camera daemon sends AllRelay protocol packets (16-byte header + payload).
 // We use the demuxer to strip headers and forward only H.264 NAL units to FFmpeg.
+type readDeadlineReader struct {
+	conn    net.Conn
+	timeout time.Duration
+}
+
+func (r *readDeadlineReader) Read(p []byte) (int, error) {
+	if err := r.conn.SetReadDeadline(time.Now().Add(r.timeout)); err != nil {
+		return 0, err
+	}
+	n, err := r.conn.Read(p)
+	if err == nil {
+		_ = r.conn.SetReadDeadline(time.Time{})
+	}
+	return n, err
+}
+
+func isNetTimeout(err error) bool {
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
+}
+
 func runCameraCapture(ctx context.Context, reader io.Reader) error {
 	device := video.GetCameraDevice()
+
+	// If the Android side stops sending frames but leaves TCP ESTAB,
+	// blocking reads would otherwise keep the stream falsely active forever.
+	// Enforce an idle read timeout so the camera stream tears down cleanly.
+	if conn, ok := reader.(net.Conn); ok {
+		reader = &readDeadlineReader{conn: conn, timeout: 5 * time.Second}
+	}
 
 	// Ensure v4l2loopback device exists (module should be loaded at boot)
 	if err := video.EnsureV4L2Device(device); err != nil {
@@ -641,6 +674,10 @@ func runCameraCapture(ctx context.Context, reader io.Reader) error {
 		slog.Info("Camera: fatal handler error", "frames", frameCount, "bytes", byteCount, "error", err)
 		return err
 	case err := <-errCh:
+		if isNetTimeout(err) {
+			slog.Info("Camera: stream idle timeout", "frames", frameCount, "bytes", byteCount)
+			return io.EOF
+		}
 		slog.Info("Camera: demuxer ended", "frames", frameCount, "bytes", byteCount, "error", err)
 		return err
 	}
