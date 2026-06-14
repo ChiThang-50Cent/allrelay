@@ -89,7 +89,15 @@ func Connect(host string, basePort uint16, connectVideo, connectCamera, connectM
 		}()
 	}
 	if connectMic {
-		launch("mic", basePort+2)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			c := connectPortWithRetry(host, basePort+2, "mic", 5)
+			if c == nil {
+				slog.Warn("Mic connection failed (optional)")
+			}
+			results <- result{name: "mic", conn: c, err: nil}
+		}()
 	}
 	if connectSpeaker {
 		wg.Add(1)
@@ -281,6 +289,12 @@ func (c *Connection) CloseStream(id uint32) {
 			c.camera.Close()
 			c.camera = nil
 		}
+	case protocol.StreamMic:
+		if c.mic != nil {
+			slog.Info("Closing mic TCP connection")
+			c.mic.Close()
+			c.mic = nil
+		}
 	}
 }
 
@@ -300,6 +314,18 @@ func (c *Connection) ReconnectStream(host string, basePort uint16, id uint32) er
 		}
 		c.camera = newConn
 		slog.Info("Camera reconnected", "host", host, "port", basePort+1)
+		return nil
+	case protocol.StreamMic:
+		if c.mic != nil {
+			c.mic.Close()
+			c.mic = nil
+		}
+		newConn := connectPortWithRetry(host, basePort+2, "mic", 5)
+		if newConn == nil {
+			return fmt.Errorf("mic reconnect failed: %s:%d", host, basePort+2)
+		}
+		c.mic = newConn
+		slog.Info("Mic reconnected", "host", host, "port", basePort+2)
 		return nil
 	default:
 		return fmt.Errorf("reconnect not implemented for stream %s", protocol.StreamName(id))

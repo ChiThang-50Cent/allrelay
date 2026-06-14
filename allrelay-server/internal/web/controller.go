@@ -3,6 +3,7 @@ package web
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -28,10 +29,10 @@ type ServerController struct {
 
 	// Connection
 	conn *transport.Connection
-	
+
 	// Stream control
 	streams map[string]*StreamController
-	
+
 	// Cleanup
 	cleanup []func()
 }
@@ -81,12 +82,12 @@ func (sc *ServerController) Connect(host string, port int) error {
 
 	slog.Info("Connecting to phone", "host", host, "port", port)
 
-	// Connect speaker + camera. Screen/video intentionally disabled
+	// Connect speaker + camera + mic. Screen/video intentionally disabled
 	// to avoid conflicts with the speaker daemon flow.
 	conn, err := transport.Connect(host, uint16(port),
 		false, // video (screen) — daemon mode skips screen
 		true,  // camera
-		false, // mic
+		true,  // mic
 		true,  // speaker
 		false) // control
 	if err != nil {
@@ -116,6 +117,11 @@ func (sc *ServerController) Connect(host string, port int) error {
 	// Start camera stream by default (phone camera → PC → v4l2loopback)
 	if conn.HasStream(protocol.StreamCamera) {
 		sc.startCameraStream()
+	}
+
+	// Start mic stream by default (phone mic → PC virtual microphone)
+	if conn.HasStream(protocol.StreamMic) {
+		sc.startMicStreamLocked()
 	}
 
 	slog.Info("Connected to phone", "host", host)
@@ -311,25 +317,61 @@ func (sc *ServerController) startSpeakerStreamLocked() {
 	}()
 }
 
-// startMicStreamLocked starts the mic stream (phone → PC)
+// startMicStreamLocked starts the mic stream (phone → PC virtual microphone)
 func (sc *ServerController) startMicStreamLocked() {
-	if sc.conn == nil || !sc.conn.HasStream(protocol.StreamMic) {
-		slog.Warn("Mic stream not available")
+	if sc.conn == nil {
+		slog.Warn("Mic stream not available (no connection)")
 		return
+	}
+	if !sc.conn.HasStream(protocol.StreamMic) {
+		slog.Info("Mic: reconnecting TCP")
+		if err := sc.conn.ReconnectStream(sc.host, uint16(sc.port), protocol.StreamMic); err != nil {
+			slog.Error("Mic: reconnect failed", "error", err)
+			return
+		}
 	}
 
 	stream := sc.streams["mic"]
-	if stream.Running {
-		return
-	}
+	stream.Running = false
+	stream.Active = false
+
+	ctx, cancel := context.WithCancel(context.Background())
+	stream.cancel = cancel
 
 	slog.Info("Starting mic stream")
 	stream.Active = true
 	stream.Running = true
+	stream.gen++
+	gen := stream.gen
 
-	// TODO: Implement mic stream handling
-	// For now, just mark as running
-	slog.Info("Mic stream started (placeholder)")
+	onMetrics := func(fps, bitrate, latency int, bytes, frames int64) {
+		if sc.webServer != nil {
+			sc.webServer.UpdateStreamMetrics("mic", fps, bitrate, latency, bytes, frames)
+		}
+	}
+
+	stream.done = make(chan struct{})
+	go func() {
+		defer close(stream.done)
+		reader := sc.conn.MicStream()
+		if err := runMicCapture(ctx, reader, onMetrics); err != nil {
+			switch err {
+			case context.Canceled:
+				slog.Info("Mic: stopped by toggle")
+			case io.EOF:
+				slog.Info("Mic: stream ended cleanly")
+			default:
+				slog.Error("Mic capture error", "error", err)
+			}
+		}
+		sc.mu.Lock()
+		if stream.Running && stream.gen == gen {
+			stream.Running = false
+			stream.Active = false
+		}
+		sc.conn.CloseStream(protocol.StreamMic)
+		sc.mu.Unlock()
+	}()
 }
 
 // startCameraStream starts the camera stream (phone camera → PC → v4l2loopback)
@@ -524,6 +566,194 @@ func runSpeakerCapture(ctx context.Context, w io.Writer, onMetrics func(fps, bit
 				"total_bytes", byteCount,
 				"packet_bytes", len(packet))
 		}
+	}
+}
+
+type opusConfig struct {
+	SampleRate int
+	Channels   int
+	PreSkip    int
+}
+
+func parseOpusHead(payload []byte) (*opusConfig, error) {
+	if len(payload) < 19 || string(payload[:8]) != "OpusHead" {
+		return nil, fmt.Errorf("invalid OpusHead payload (%d bytes)", len(payload))
+	}
+	channels := int(payload[9])
+	if channels <= 0 {
+		return nil, fmt.Errorf("invalid Opus channels: %d", channels)
+	}
+	sampleRate := int(binary.LittleEndian.Uint32(payload[12:16]))
+	if sampleRate == 0 {
+		sampleRate = 48000
+	}
+	return &opusConfig{
+		SampleRate: sampleRate,
+		Channels:   channels,
+		PreSkip:    int(binary.LittleEndian.Uint16(payload[10:12])),
+	}, nil
+}
+
+// runMicCapture reads Opus mic packets from the phone, decodes them to PCM,
+// and feeds a PulseAudio/pipewire-pulse virtual microphone source.
+func runMicCapture(ctx context.Context, reader io.Reader, onMetrics func(fps, bitrate, latency int, bytes, frames int64)) error {
+	if conn, ok := reader.(net.Conn); ok {
+		reader = &readDeadlineReader{conn: conn, timeout: 5 * time.Second}
+	}
+
+	var (
+		decoder         *audio.OpusDecoder
+		output          *audio.VirtualMicWriter
+		pcm             []int16
+		pcmBytes        []byte
+		frameCount      uint64
+		byteCount       uint64
+		framesWindow    uint64
+		bytesWindow     uint64
+		lastMetricsTime = time.Now()
+		started         bool
+	)
+	defer func() {
+		if decoder != nil {
+			decoder.Close()
+		}
+		if output != nil {
+			_ = output.Close()
+		}
+	}()
+
+	demuxer := protocol.NewDemuxer(reader)
+	fatalErrCh := make(chan error, 1)
+	demuxer.RegisterHandler(protocol.StreamMic, func(header *protocol.Header, payload []byte) error {
+		if len(payload) == 0 {
+			return nil
+		}
+
+		// Android sends an initial codec identifier packet ("opus"). Ignore it.
+		if len(payload) == 4 && string(payload) == "opus" {
+			slog.Info("Mic: codec", "name", string(payload))
+			return nil
+		}
+
+		if header.IsConfig() {
+			cfg, err := parseOpusHead(payload)
+			if err != nil {
+				select {
+				case fatalErrCh <- fmt.Errorf("parse OpusHead: %w", err):
+				default:
+				}
+				demuxer.Stop()
+				return nil
+			}
+
+			if decoder != nil {
+				decoder.Close()
+			}
+			decoder, err = audio.NewOpusDecoder(cfg.SampleRate, cfg.Channels)
+			if err != nil {
+				select {
+				case fatalErrCh <- fmt.Errorf("create opus decoder: %w", err):
+				default:
+				}
+				demuxer.Stop()
+				return nil
+			}
+
+			if output != nil {
+				_ = output.Close()
+			}
+			output, err = audio.StartVirtualMicWriter(cfg.SampleRate, cfg.Channels)
+			if err != nil {
+				select {
+				case fatalErrCh <- fmt.Errorf("start virtual mic: %w", err):
+				default:
+				}
+				demuxer.Stop()
+				return nil
+			}
+
+			pcm = make([]int16, 5760*cfg.Channels)
+			pcmBytes = make([]byte, len(pcm)*2)
+			slog.Info("Mic: configured", "rate", cfg.SampleRate, "channels", cfg.Channels, "preskip", cfg.PreSkip)
+			return nil
+		}
+
+		if decoder == nil || output == nil {
+			slog.Debug("Mic: dropping packet before config", "bytes", len(payload))
+			return nil
+		}
+
+		samplesPerChannel, err := decoder.Decode(payload, pcm)
+		if err != nil {
+			select {
+			case fatalErrCh <- fmt.Errorf("decode opus: %w", err):
+			default:
+			}
+			demuxer.Stop()
+			return nil
+		}
+
+		totalSamples := samplesPerChannel * decoder.Channels()
+		for i, sample := range pcm[:totalSamples] {
+			binary.LittleEndian.PutUint16(pcmBytes[i*2:], uint16(sample))
+		}
+		if _, err := output.Write(pcmBytes[:totalSamples*2]); err != nil {
+			select {
+			case fatalErrCh <- fmt.Errorf("write virtual mic: %w", err):
+			default:
+			}
+			demuxer.Stop()
+			return nil
+		}
+
+		if !started {
+			slog.Info("Mic: received first frame", "bytes", len(payload), "samples", samplesPerChannel)
+			started = true
+		}
+
+		frameCount++
+		byteCount += uint64(len(payload))
+		framesWindow++
+		bytesWindow += uint64(len(payload))
+
+		if time.Since(lastMetricsTime) >= time.Second {
+			fps := int(float64(framesWindow) / time.Since(lastMetricsTime).Seconds())
+			bitrate := int(float64(bytesWindow*8) / time.Since(lastMetricsTime).Seconds())
+			if onMetrics != nil {
+				onMetrics(fps, bitrate, 40, int64(byteCount), int64(frameCount))
+			}
+			framesWindow = 0
+			bytesWindow = 0
+			lastMetricsTime = time.Now()
+		}
+
+		if frameCount%250 == 0 {
+			slog.Debug("Mic stream", "frames", frameCount, "total_bytes", byteCount, "packet_bytes", len(payload))
+		}
+
+		return nil
+	})
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- demuxer.Run()
+	}()
+
+	select {
+	case <-ctx.Done():
+		slog.Info("Mic: context cancelled, stopping")
+		demuxer.Stop()
+		return ctx.Err()
+	case err := <-fatalErrCh:
+		slog.Info("Mic: fatal handler error", "frames", frameCount, "bytes", byteCount, "error", err)
+		return err
+	case err := <-errCh:
+		if isNetTimeout(err) {
+			slog.Info("Mic: stream idle timeout", "frames", frameCount, "bytes", byteCount)
+			return io.EOF
+		}
+		slog.Info("Mic: demuxer ended", "frames", frameCount, "bytes", byteCount, "error", err)
+		return err
 	}
 }
 
