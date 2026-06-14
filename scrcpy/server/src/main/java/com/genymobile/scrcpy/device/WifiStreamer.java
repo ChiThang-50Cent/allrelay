@@ -103,7 +103,15 @@ public final class WifiStreamer {
         long pts = bufferInfo.presentationTimeUs;
         boolean config = (bufferInfo.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0;
         boolean keyFrame = (bufferInfo.flags & MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0;
-        writePacket(codecBuffer, pts, config, keyFrame);
+
+        // MediaCodec output buffers may expose a larger backing buffer than the
+        // actual encoded packet. Restrict position/limit to the valid slice,
+        // otherwise we may send garbage bytes before/after the encoded frame.
+        ByteBuffer packet = codecBuffer.duplicate();
+        packet.position(bufferInfo.offset);
+        packet.limit(bufferInfo.offset + bufferInfo.size);
+
+        writePacket(packet.slice(), pts, config, keyFrame);
     }
 
     public void writeSessionMeta(int width, int height, boolean isClientResize) throws IOException {
