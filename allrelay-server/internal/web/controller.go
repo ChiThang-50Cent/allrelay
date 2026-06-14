@@ -529,6 +529,13 @@ func runCameraCapture(ctx context.Context, reader io.Reader) error {
 		slog.Warn("Camera: v4l2 device check failed", "error", err)
 	}
 
+	// Set output format BEFORE opening pipeline.
+	// Required for exclusive_caps=1 v4l2loopback: device initially
+	// reports CAPTURE-only; setting output format triggers OUTPUT mode switch.
+	if err := video.SetupV4L2Output(device, 640, 480, "YUYV"); err != nil {
+		slog.Warn("Camera: v4l2 format setup failed, pipeline may still work", "error", err)
+	}
+
 	slog.Info("Camera: opening v4l2 pipeline", "device", device)
 
 	pipeline, err := video.CameraPipeline(device)

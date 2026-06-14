@@ -187,11 +187,13 @@ func (p *Pipeline) Done() <-chan error {
 //
 // device is the v4l2loopback device path, e.g. "/dev/video10".
 func CameraPipeline(device string) (*Pipeline, error) {
-	// ffmpeg: H.264 stdin → decode → YUYV → v4l2 output
+	// ffmpeg: H.264 stdin → decode → scale → YUYV → v4l2 output
+	// Scale to 640x480 for browser compatibility (Chrome/Edge reject huge frames).
 	args := []string{
 		"-loglevel", "error",
 		"-f", "h264",
 		"-i", "pipe:0",
+		"-vf", "scale=640:480:force_original_aspect_ratio=decrease,pad=640:480:(ow-iw)/2:(oh-ih)/2",
 		"-pix_fmt", "yuyv422",
 		"-f", "v4l2",
 		device,
