@@ -224,12 +224,7 @@ public final class Server {
                             OutputStream audioOutputStream = wifiConn.getAudioOutputStream();
                             if (audioOutputStream != null) {
                                 AudioSource audioSource = options.getAudioSource();
-                                AudioCapture audioCapture;
-                                if (audioSource.isDirect()) {
-                                    audioCapture = new AudioDirectCapture(audioSource);
-                                } else {
-                                    audioCapture = new AudioPlaybackCapture(options.getAudioDup());
-                                }
+                                AudioCapture audioCapture = createAudioCapture(audioSource, options);
 
                                 StreamId audioStreamId = audioSource.isDirect()
                                         ? StreamId.MIC : StreamId.SPEAKER;
@@ -405,12 +400,7 @@ public final class Server {
             if (audio) {
                 AudioCodec audioCodec = options.getAudioCodec();
                 AudioSource audioSource = options.getAudioSource();
-                AudioCapture audioCapture;
-                if (audioSource.isDirect()) {
-                    audioCapture = new AudioDirectCapture(audioSource);
-                } else {
-                    audioCapture = new AudioPlaybackCapture(options.getAudioDup());
-                }
+                AudioCapture audioCapture = createAudioCapture(audioSource, options);
 
                 // MIC-family sources → StreamId.MIC, OUTPUT/PLAYBACK → StreamId.SPEAKER
                 StreamId audioStreamId = audioSource.isDirect() ? StreamId.MIC : StreamId.SPEAKER;
@@ -786,6 +776,18 @@ public final class Server {
         return thread;
     }
 
+    private static AudioCapture createAudioCapture(AudioSource audioSource, Options options) {
+        if (!audioSource.isDirect()) {
+            return new AudioPlaybackCapture(options.getAudioDup());
+        }
+
+        boolean enableVoiceProcessing = options.isSpeakerEnabled() || AudioReversePlayback.isPlaybackActive();
+        if (enableVoiceProcessing) {
+            Ln.i("Mic preprocessing requested (speaker enabled or active)");
+        }
+        return new AudioDirectCapture(audioSource, enableVoiceProcessing);
+    }
+
     /**
      * Run a single camera stream session: capture camera via Camera2 API,
      * encode with MediaCodec H.264, stream to client socket via WifiStreamer.
@@ -821,12 +823,7 @@ public final class Server {
         OutputStream outputStream = socket.getOutputStream();
 
         AudioSource audioSource = options.getAudioSource();
-        AudioCapture audioCapture;
-        if (audioSource.isDirect()) {
-            audioCapture = new AudioDirectCapture(audioSource);
-        } else {
-            audioCapture = new AudioPlaybackCapture(options.getAudioDup());
-        }
+        AudioCapture audioCapture = createAudioCapture(audioSource, options);
 
         StreamId audioStreamId = audioSource.isDirect() ? StreamId.MIC : StreamId.SPEAKER;
         WifiStreamer audioStreamer = new WifiStreamer(

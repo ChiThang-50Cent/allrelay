@@ -12,6 +12,8 @@ import android.content.ComponentName;
 import android.content.Intent;
 import android.media.AudioRecord;
 import android.media.MediaCodec;
+import android.media.audiofx.AcousticEchoCanceler;
+import android.media.audiofx.NoiseSuppressor;
 import android.os.Build;
 import android.os.SystemClock;
 
@@ -26,12 +28,20 @@ public class AudioDirectCapture implements AudioCapture {
     private static final int ENCODING = AudioConfig.ENCODING;
 
     private final int audioSource;
+    private final boolean enableVoiceProcessing;
 
     private AudioRecord recorder;
     private AudioRecordReader reader;
+    private AcousticEchoCanceler acousticEchoCanceler;
+    private NoiseSuppressor noiseSuppressor;
 
     public AudioDirectCapture(AudioSource audioSource) {
+        this(audioSource, false);
+    }
+
+    public AudioDirectCapture(AudioSource audioSource, boolean enableVoiceProcessing) {
         this.audioSource = audioSource.getDirectAudioSource();
+        this.enableVoiceProcessing = enableVoiceProcessing;
     }
 
     @TargetApi(AndroidVersions.API_23_ANDROID_6_0)
@@ -100,6 +110,7 @@ public class AudioDirectCapture implements AudioCapture {
             // - <https://github.com/Genymobile/scrcpy/pull/3862>
             recorder = Workarounds.createAudioRecord(audioSource, SAMPLE_RATE, CHANNEL_CONFIG, CHANNELS, CHANNEL_MASK, ENCODING);
         }
+        configureVoiceProcessing();
         recorder.startRecording();
         reader = new AudioRecordReader(recorder);
     }
@@ -126,11 +137,64 @@ public class AudioDirectCapture implements AudioCapture {
         }
     }
 
+    private void configureVoiceProcessing() {
+        if (!enableVoiceProcessing || recorder == null) {
+            return;
+        }
+
+        int sessionId = recorder.getAudioSessionId();
+        boolean aecEnabled = false;
+        boolean nsEnabled = false;
+
+        if (AcousticEchoCanceler.isAvailable()) {
+            acousticEchoCanceler = AcousticEchoCanceler.create(sessionId);
+            if (acousticEchoCanceler != null) {
+                try {
+                    acousticEchoCanceler.setEnabled(true);
+                    aecEnabled = acousticEchoCanceler.getEnabled();
+                } catch (IllegalArgumentException | UnsupportedOperationException e) {
+                    Ln.w("Mic AEC enable failed: " + e.getMessage());
+                }
+            }
+        }
+
+        if (NoiseSuppressor.isAvailable()) {
+            noiseSuppressor = NoiseSuppressor.create(sessionId);
+            if (noiseSuppressor != null) {
+                try {
+                    noiseSuppressor.setEnabled(true);
+                    nsEnabled = noiseSuppressor.getEnabled();
+                } catch (IllegalArgumentException | UnsupportedOperationException e) {
+                    Ln.w("Mic NS enable failed: " + e.getMessage());
+                }
+            }
+        }
+
+        Ln.i("Mic preprocessing: aec=" + aecEnabled + " ns=" + nsEnabled + " session=" + sessionId);
+    }
+
+    private void releaseVoiceProcessing() {
+        if (acousticEchoCanceler != null) {
+            try {
+                acousticEchoCanceler.release();
+            } catch (Exception ignored) {}
+            acousticEchoCanceler = null;
+        }
+        if (noiseSuppressor != null) {
+            try {
+                noiseSuppressor.release();
+            } catch (Exception ignored) {}
+            noiseSuppressor = null;
+        }
+    }
+
     @Override
     public void stop() {
+        releaseVoiceProcessing();
         if (recorder != null) {
             // Will call .stop() if necessary, without throwing an IllegalStateException
             recorder.release();
+            recorder = null;
         }
     }
 
