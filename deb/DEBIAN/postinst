@@ -1,0 +1,26 @@
+#!/bin/bash
+set -e
+
+# Load v4l2loopback module if not already loaded
+if ! lsmod | grep -q v4l2loopback; then
+    modprobe v4l2loopback video_nr=10 card_label="AllRelay Cam" exclusive_caps=1 || true
+fi
+
+# Ensure v4l2loopback auto-loads on boot
+echo "v4l2loopback" > /etc/modules-load.d/allrelay.conf
+echo "options v4l2loopback video_nr=10 card_label=\"AllRelay Cam\" exclusive_caps=1" > /etc/modprobe.d/allrelay.conf
+
+# Reload systemd and enable service
+systemctl daemon-reload || true
+systemctl enable allrelay || true
+systemctl restart allrelay || true
+
+echo ""
+echo "=============================================="
+echo "  AllRelay installed!"
+echo "  Web dashboard: http://localhost:9090"
+echo "  Virtual camera: /dev/video10 (AllRelay Cam)"
+echo ""
+echo "  Start/stop: systemctl [start|stop|restart] allrelay"
+echo "  Logs:       journalctl -u allrelay -f"
+echo "=============================================="

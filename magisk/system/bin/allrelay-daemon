@@ -40,18 +40,21 @@ do_start() {
 
     log "Starting AllRelay daemon..."
     
+    # daemon=true: keep ports open, accept reconnections
+    # speaker_enabled=true: PC→phone audio on port 5003
+    # camera_enabled=true: phone camera→PC on port 5001
     nohup sh -c "
         CLASSPATH='$SERVER_JAR' \
         app_process / com.genymobile.scrcpy.Server \
             4.0 \
             log_level=info \
-            max_size=2640 \
             wifi_mode=true \
             wifi_port=5000 \
-            max_fps=60 \
-            video_codec=h264 \
-            audio_source=mic \
-            multistream=true \
+            no_video=true \
+            audio=false \
+            speaker_enabled=true \
+            camera_enabled=true \
+            daemon=true \
             >> '$LOG_FILE' 2>&1
     " &
     

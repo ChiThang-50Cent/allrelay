@@ -1,0 +1,6 @@
+#!/bin/bash
+set -e
+
+systemctl stop allrelay || true
+systemctl disable allrelay || true
+systemctl daemon-reload || true

@@ -110,6 +110,7 @@ func (ws *WebServer) Start() error {
 
 	// Static files (CSS, JS, images)
 	staticPaths := []string{
+		"/usr/share/allrelay/static",
 		"allrelay-server/internal/web/static",
 		"internal/web/static",
 		"../allrelay-server/internal/web/static",
@@ -158,6 +159,7 @@ func (ws *WebServer) GetController() *ServerController {
 func (ws *WebServer) handleIndex(w http.ResponseWriter, r *http.Request) {
 	// Try multiple paths for flexibility
 	paths := []string{
+		"/usr/share/allrelay/templates/index.html",
 		"allrelay-server/internal/web/templates/index.html",
 		"internal/web/templates/index.html",
 		"../allrelay-server/internal/web/templates/index.html",

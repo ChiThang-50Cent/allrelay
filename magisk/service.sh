@@ -83,27 +83,22 @@ start_server() {
     sleep 1
     
     # Launch with app_process (runs in system_server context with root)
-    # Port 5000: base Wi-Fi port
-    # max_size=2640: support tall screens
-    # tunnel_forward=true: use Wi-Fi, not ADB
-    # max_fps=60: 60fps target
-    # video_codec=h264: H.264 encoder
-    # audio_source=mic: mic + speaker streams
-    # multistream=true: enable multi-stream (screen + camera + mic + speaker)
-    #
-    # Run in background with nohup
+    # daemon=true: keep alive, accept reconnections without restart
+    # speaker_enabled=true: PC→phone audio on port 5003
+    # camera_enabled=true: phone camera→PC on port 5001
+    # no_video=true audio=false: disable screen+mic (handled separately)
     nohup sh -c "
         CLASSPATH='$SERVER_JAR' \
         app_process / com.genymobile.scrcpy.Server \
             4.0 \
             log_level=info \
-            max_size=2640 \
             wifi_mode=true \
             wifi_port=5000 \
-            max_fps=60 \
-            video_codec=h264 \
-            audio_source=mic \
-            multistream=true \
+            no_video=true \
+            audio=false \
+            speaker_enabled=true \
+            camera_enabled=true \
+            daemon=true \
             >> '$LOG_FILE' 2>&1
     " &
     
@@ -127,11 +122,12 @@ update_heartbeat() {
     date +%s > "$HEARTBEAT_FILE"
 }
 
-# ─── Monitor loop — restart if crashed ────────────────────────────
+# ─── Monitor loop — restart if process dies ──────────────────────
+# With daemon=true, the Java server handles stream reconnections
+# internally. We only restart if the entire process crashes.
 monitor_loop() {
     local max_restarts=10
     local restart_count=0
-    local restart_delay=5
     
     while true; do
         local pid
@@ -139,7 +135,7 @@ monitor_loop() {
             pid=$(cat "$PID_FILE")
             if kill -0 "$pid" 2>/dev/null; then
                 update_heartbeat
-                sleep 10
+                sleep 30
                 continue
             fi
         fi
@@ -153,14 +149,8 @@ monitor_loop() {
         fi
         
         log "Server crashed! Restarting (attempt $restart_count/$max_restarts)..."
-        
-        # Exponential backoff: 5s → 10s → 20s → 40s → 60s (max)
-        local backoff=$(( restart_delay * (1 << (restart_count - 1)) ))
-        [ $backoff -gt 60 ] && backoff=60
-        
-        sleep $backoff
+        sleep 5
         start_server
-        sleep 2
     done
 }
 

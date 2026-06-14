@@ -1,0 +1,17 @@
+Package: allrelay
+Version: 0.1.0
+Section: net
+Priority: optional
+Architecture: amd64
+Depends: v4l2loopback-dkms, ffmpeg, pulseaudio-utils
+Maintainer: AllRelay <allrelay@localhost>
+Description: Stream Android phone media to PC over Wi-Fi
+ AllRelay streams camera, screen, microphone, and speaker between
+ a rooted Android phone and an Ubuntu PC over Wi-Fi, with a web-based
+ dashboard for control.
+ .
+ Features:
+  * Camera as virtual webcam (v4l2loopback /dev/video10)
+  * Speaker audio (PC -> phone) with low-latency Opus
+  * Web dashboard at http://localhost:9090
+  * Independent streams — each can be toggled separately
