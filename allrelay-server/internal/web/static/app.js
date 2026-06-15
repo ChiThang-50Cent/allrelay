@@ -355,7 +355,14 @@ function renderStreamMetrics(stream) {
     }
     
     if (stream.bitrate > 0) {
-        const bitrateStr = stream.bitrate >= 1000 ? `${(stream.bitrate / 1000).toFixed(1)} Mbps` : `${stream.bitrate} kbps`;
+        let bitrateStr;
+        if (stream.bitrate >= 1_000_000) {
+            bitrateStr = `${(stream.bitrate / 1_000_000).toFixed(1)} Mbps`;
+        } else if (stream.bitrate >= 1_000) {
+            bitrateStr = `${(stream.bitrate / 1_000).toFixed(1)} kbps`;
+        } else {
+            bitrateStr = `${stream.bitrate} bps`;
+        }
         metrics.push(`<div class="metric"><span class="metric-value">${bitrateStr}</span><span class="metric-label">Bitrate</span></div>`);
     }
     
@@ -562,6 +569,8 @@ let screenFrameCount = 0;
 let screenLastFpsTime = Date.now();
 let screenFpsCounter = 0;
 let screenActive = false;
+let screenConfigured = false;
+let screenConfig = { sps: [], pps: [] };
 
 function initScreenViewer() {
     screenCanvasEl = document.getElementById('screenCanvas');
@@ -601,8 +610,8 @@ function sendControlMessage(data) {
     }
 }
 
-function setupScreenDecoder() {
-    if (screenDecoder && screenDecoder.state === 'configured') return;
+function ensureScreenDecoder() {
+    if (screenDecoder) return screenDecoder;
 
     screenDecoder = new VideoDecoder({
         output(frame) {
@@ -635,10 +644,28 @@ function setupScreenDecoder() {
         }
     });
 
-    screenDecoder.configure({
-        codec: 'avc1.640028',
-        optimizeForLatency: true
+    return screenDecoder;
+}
+
+function configureScreenDecoderFromConfig() {
+    if (screenConfigured) return true;
+    if (!screenConfig.sps.length || !screenConfig.pps.length) return false;
+
+    const sps = screenConfig.sps[0];
+    const pps = screenConfig.pps[0];
+    if (sps.length < 4) return false;
+
+    const codec = `avc1.${toHex2(sps[1])}${toHex2(sps[2])}${toHex2(sps[3])}`;
+    const description = buildAvcC(screenConfig.sps, screenConfig.pps);
+    const decoder = ensureScreenDecoder();
+    decoder.configure({
+        codec,
+        description,
+        optimizeForLatency: true,
     });
+    screenConfigured = true;
+    console.log('Screen decoder configured', { codec, sps: screenConfig.sps.length, pps: screenConfig.pps.length });
+    return true;
 }
 
 function destroyScreenDecoder() {
@@ -646,6 +673,8 @@ function destroyScreenDecoder() {
         try { screenDecoder.close(); } catch (e) {}
         screenDecoder = null;
     }
+    screenConfigured = false;
+    screenConfig = { sps: [], pps: [] };
     screenFrameCount = 0;
     screenFpsCounter = 0;
     if (screenCanvasEl) {
@@ -656,71 +685,151 @@ function destroyScreenDecoder() {
     document.getElementById('screenFPS').textContent = '';
 }
 
-// Handle binary WebSocket frames (H.264 NAL units for screen)
+// Handle binary WebSocket frames for screen.
+// Format: [1 byte flags][Annex B H.264 access unit bytes]
+// flags bit0=config, bit1=keyframe
 function handleBinaryFrame(data) {
-    if (!screenActive) return;
+    if (!screenActive || !data || data.length < 2) return;
+
     try {
-        setupScreenDecoder();
-        const nalUnits = convertAnnexBToAVCC(data);
-        for (const nal of nalUnits) {
-            screenDecoder.decode(new EncodedVideoChunk({
-                type: getNALType(nal),
-                timestamp: 0,
-                duration: 0,
-                data: nal
-            }));
+        const flags = data[0];
+        const payload = data.slice(1);
+        const isConfig = (flags & 0x01) !== 0;
+        const isKey = (flags & 0x02) !== 0;
+
+        const nalUnits = extractAnnexBNALUnits(payload);
+        if (!nalUnits.length) return;
+
+        collectScreenConfig(nalUnits);
+        if (!screenConfigured) {
+            configureScreenDecoderFromConfig();
         }
+
+        if (isConfig) {
+            return;
+        }
+        if (!screenConfigured) {
+            console.warn('Screen frame dropped: decoder not configured yet');
+            return;
+        }
+
+        const chunkData = annexBAccessUnitToAVCC(payload);
+        const chunkType = isKey || containsIDR(nalUnits) ? 'key' : 'delta';
+        ensureScreenDecoder().decode(new EncodedVideoChunk({
+            type: chunkType,
+            timestamp: performance.now() * 1000,
+            duration: 0,
+            data: chunkData,
+        }));
     } catch (err) {
         console.error('Screen decode error:', err);
     }
 }
 
-function convertAnnexBToAVCC(data) {
-    const nalUnits = [];
-    const view = new Uint8Array(data);
-    let start = 0;
+function extractAnnexBNALUnits(data) {
+    const view = data instanceof Uint8Array ? data : new Uint8Array(data);
+    const starts = [];
+
     for (let i = 0; i < view.length - 3; i++) {
-        if (view[i] === 0x00 && view[i+1] === 0x00) {
-            let startCodeLen = 0;
-            if (view[i+2] === 0x00 && view[i+3] === 0x01) startCodeLen = 4;
-            else if (view[i+2] === 0x01) startCodeLen = 3;
-            if (startCodeLen > 0 && start < i) {
-                const nalData = view.slice(start, i);
-                if (nalData.length > 0) {
-                    const len = nalData.length;
-                    const avccNal = new Uint8Array(4 + len);
-                    avccNal[0] = (len >> 24) & 0xFF;
-                    avccNal[1] = (len >> 16) & 0xFF;
-                    avccNal[2] = (len >> 8) & 0xFF;
-                    avccNal[3] = len & 0xFF;
-                    avccNal.set(nalData, 4);
-                    nalUnits.push(avccNal);
-                }
-                start = i + startCodeLen;
-                i += startCodeLen - 1;
+        if (view[i] === 0x00 && view[i + 1] === 0x00) {
+            if (view[i + 2] === 0x01) {
+                starts.push({ index: i, len: 3 });
+                i += 2;
+            } else if (view[i + 2] === 0x00 && view[i + 3] === 0x01) {
+                starts.push({ index: i, len: 4 });
+                i += 3;
             }
         }
     }
-    if (start < view.length) {
-        const nalData = view.slice(start);
-        if (nalData.length > 0) {
-            const len = nalData.length;
-            const avccNal = new Uint8Array(4 + len);
-            avccNal[0] = (len >> 24) & 0xFF;
-            avccNal[1] = (len >> 16) & 0xFF;
-            avccNal[2] = (len >> 8) & 0xFF;
-            avccNal[3] = len & 0xFF;
-            avccNal.set(nalData, 4);
-            nalUnits.push(avccNal);
+
+    if (!starts.length) {
+        return [];
+    }
+
+    const nalUnits = [];
+    for (let i = 0; i < starts.length; i++) {
+        const start = starts[i].index + starts[i].len;
+        const end = i + 1 < starts.length ? starts[i + 1].index : view.length;
+        if (end > start) {
+            nalUnits.push(view.slice(start, end));
         }
     }
     return nalUnits;
 }
 
-function getNALType(data) {
-    if (data.length < 5) return 'delta';
-    const nalType = data[4] & 0x1F;
-    return (nalType === 5 || nalType === 7 || nalType === 8) ? 'key' : 'delta';
+function annexBAccessUnitToAVCC(data) {
+    const nalUnits = extractAnnexBNALUnits(data);
+    let total = 0;
+    for (const nal of nalUnits) {
+        total += 4 + nal.length;
+    }
+    const out = new Uint8Array(total);
+    let offset = 0;
+    for (const nal of nalUnits) {
+        const len = nal.length;
+        out[offset + 0] = (len >>> 24) & 0xFF;
+        out[offset + 1] = (len >>> 16) & 0xFF;
+        out[offset + 2] = (len >>> 8) & 0xFF;
+        out[offset + 3] = len & 0xFF;
+        out.set(nal, offset + 4);
+        offset += 4 + len;
+    }
+    return out;
+}
+
+function collectScreenConfig(nalUnits) {
+    for (const nal of nalUnits) {
+        if (!nal.length) continue;
+        const nalType = nal[0] & 0x1F;
+        if (nalType === 7) {
+            if (!screenConfig.sps.some(existing => byteArrayEquals(existing, nal))) {
+                screenConfig.sps.push(nal);
+            }
+        } else if (nalType === 8) {
+            if (!screenConfig.pps.some(existing => byteArrayEquals(existing, nal))) {
+                screenConfig.pps.push(nal);
+            }
+        }
+    }
+}
+
+function containsIDR(nalUnits) {
+    return nalUnits.some(nal => nal.length && ((nal[0] & 0x1F) === 5));
+}
+
+function buildAvcC(spsList, ppsList) {
+    const sps = spsList[0];
+    const pps = ppsList[0];
+    const size = 11 + sps.length + pps.length;
+    const out = new Uint8Array(size);
+    let o = 0;
+    out[o++] = 1;
+    out[o++] = sps[1];
+    out[o++] = sps[2];
+    out[o++] = sps[3];
+    out[o++] = 0xFF;
+    out[o++] = 0xE0 | 1;
+    out[o++] = (sps.length >>> 8) & 0xFF;
+    out[o++] = sps.length & 0xFF;
+    out.set(sps, o);
+    o += sps.length;
+    out[o++] = 1;
+    out[o++] = (pps.length >>> 8) & 0xFF;
+    out[o++] = pps.length & 0xFF;
+    out.set(pps, o);
+    return out;
+}
+
+function toHex2(value) {
+    return value.toString(16).padStart(2, '0');
+}
+
+function byteArrayEquals(a, b) {
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) {
+        if (a[i] !== b[i]) return false;
+    }
+    return true;
 }
 
 function showScreenViewer(show) {

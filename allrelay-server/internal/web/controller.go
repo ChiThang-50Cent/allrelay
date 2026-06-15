@@ -1096,8 +1096,20 @@ func runScreenCapture(ctx context.Context, reader io.Reader, hub *Hub,
 			return nil
 		}
 
-		// Broadcast raw H.264 NAL to WebSocket clients for WebCodecs decoding
-		hub.BroadcastBinary(payload)
+		// Broadcast H.264 access unit to WebSocket clients.
+		// Prefix 1 byte of flags so the browser knows whether this packet is
+		// codec config and/or a key frame.
+		flags := byte(0)
+		if header.IsConfig() {
+			flags |= 1 << 0
+		}
+		if header.IsKeyFrame() {
+			flags |= 1 << 1
+		}
+		msg := make([]byte, 1+len(payload))
+		msg[0] = flags
+		copy(msg[1:], payload)
+		hub.BroadcastBinary(msg)
 
 		frameCount++
 		byteCount += uint64(len(payload))
@@ -1113,7 +1125,7 @@ func runScreenCapture(ctx context.Context, reader io.Reader, hub *Hub,
 			elapsed := now.Sub(lastMetricsTime).Seconds()
 			fps := int(float64(frameCount-lastFrameCount) / elapsed)
 			bitrate := int(float64(byteCount-lastByteCount) * 8 / elapsed)
-			latency := int(now.Sub(startTime).Milliseconds())
+			latency := 0 // screen latency metric not measured correctly yet
 
 			slog.Debug("Screen stream",
 				"frames", frameCount,

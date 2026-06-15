@@ -35,7 +35,8 @@ const (
 
 // Flag bits in pts_and_flags.
 const (
-	FlagConfig  uint64 = 1 << 62
+	FlagConfig   uint64 = 1 << 62
+	FlagKeyFrame uint64 = 1 << 61
 )
 
 // StreamName returns a human-readable name for a stream ID.
@@ -75,6 +76,11 @@ type Header struct {
 // IsConfig returns true if this is a codec config packet.
 func (h *Header) IsConfig() bool {
 	return h.PTSAndFlags&FlagConfig != 0
+}
+
+// IsKeyFrame returns true if this packet contains a key frame.
+func (h *Header) IsKeyFrame() bool {
+	return h.PTSAndFlags&FlagKeyFrame != 0
 }
 
 // ReadHeader reads and parses a 16-byte AllRelay header from the reader.
