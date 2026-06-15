@@ -57,3 +57,4 @@ plans/
 
 # === Generated scripts ===
 scripts/test-phase3.sh
+deb/usr/bin/
