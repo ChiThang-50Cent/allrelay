@@ -973,7 +973,7 @@ public final class Server {
     private static void runScreenStream(java.net.Socket socket, Options options) throws Exception {
         OutputStream outputStream = socket.getOutputStream();
 
-        // Pass null for VirtualDisplayListener — screen works standalone without controller
+        // Pass null for VirtualDisplayListener for now — screen can run standalone.
         ScreenCapture screenCapture = new ScreenCapture(null, options);
         WifiStreamer streamer = new WifiStreamer(
                 outputStream, options.getVideoCodec(), StreamId.SCREEN,
@@ -981,12 +981,23 @@ public final class Server {
         WifiSurfaceEncoder encoder = new WifiSurfaceEncoder(
                 screenCapture, streamer, options);
 
-        Completion completion = new Completion(1, true);
-        encoder.start((fatalError) -> completion.addCompleted(fatalError));
-        encoder.join();
-
-        screenCapture.stop();
-        Ln.i("Screen stream completed");
+        try {
+            Completion completion = new Completion(1, true);
+            encoder.start((fatalError) -> completion.addCompleted(fatalError));
+            encoder.join();
+            Ln.i("Screen stream completed");
+        } finally {
+            try {
+                encoder.stop();
+            } catch (Throwable ignored) {}
+            try {
+                screenCapture.stop();
+            } catch (Throwable ignored) {}
+            try {
+                socket.close();
+            } catch (IOException ignored) {}
+            Ln.i("Screen stream cleanup done");
+        }
     }
 
     /**
@@ -1000,14 +1011,19 @@ public final class Server {
         ControlChannel controlChannel = new ControlChannel(inputStream, outputStream);
         Controller controller = new Controller(controlChannel, cleanUp, options);
 
-        Completion completion = new Completion(1, true);
-        controller.start((fatalError) -> completion.addCompleted(fatalError));
-
         try {
+            Completion completion = new Completion(1, true);
+            controller.start((fatalError) -> completion.addCompleted(fatalError));
             controller.join();
+            Ln.i("Control stream completed");
         } finally {
-            // Close the socket to stop the client
-            try { socket.close(); } catch (IOException ignored) {}
+            try {
+                controller.stop();
+            } catch (Throwable ignored) {}
+            try {
+                socket.close();
+            } catch (IOException ignored) {}
+            Ln.i("Control stream cleanup done");
         }
     }
 }

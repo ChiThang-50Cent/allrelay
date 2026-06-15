@@ -312,6 +312,10 @@ public class Controller implements AsyncProcessor, VirtualDisplayListener {
             thread.join();
         }
         if (sender != null) {
+            // The receive thread may exit naturally on EOF when the client closes
+            // the control socket. In that case, explicitly stop the sender thread
+            // before joining it, otherwise it may block forever on queue.take().
+            sender.stop();
             sender.join();
         }
     }

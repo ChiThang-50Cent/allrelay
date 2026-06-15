@@ -229,31 +229,57 @@ func (c *Connection) Close() error {
 
 // VideoStream returns the video (screen) connection reader.
 func (c *Connection) VideoStream() io.Reader {
+	if c == nil {
+		return nil
+	}
+	return c.video
+}
+
+// VideoConn returns the raw video (screen) TCP connection.
+func (c *Connection) VideoConn() net.Conn {
+	if c == nil {
+		return nil
+	}
 	return c.video
 }
 
 // CameraStream returns the camera connection reader.
 func (c *Connection) CameraStream() io.Reader {
+	if c == nil {
+		return nil
+	}
 	return c.camera
 }
 
 // MicStream returns the mic connection reader.
 func (c *Connection) MicStream() io.Reader {
+	if c == nil {
+		return nil
+	}
 	return c.mic
 }
 
 // SpeakerWriter returns the speaker connection writer (PC → phone).
 func (c *Connection) SpeakerWriter() io.Writer {
+	if c == nil {
+		return nil
+	}
 	return c.speaker
 }
 
 // ControlConn returns the control connection.
 func (c *Connection) ControlConn() net.Conn {
+	if c == nil {
+		return nil
+	}
 	return c.control
 }
 
 // HasStream returns true if the given stream connection was established.
 func (c *Connection) HasStream(id uint32) bool {
+	if c == nil {
+		return false
+	}
 	switch id {
 	case protocol.StreamScreen:
 		return c.video != nil
@@ -273,7 +299,16 @@ func (c *Connection) HasStream(id uint32) bool {
 // CloseStream closes and clears a single stream connection.
 // This unblocks any goroutine blocked on reads from this stream.
 func (c *Connection) CloseStream(id uint32) {
+	if c == nil {
+		return
+	}
 	switch id {
+	case protocol.StreamScreen:
+		if c.video != nil {
+			slog.Info("Closing screen TCP connection")
+			c.video.Close()
+			c.video = nil
+		}
 	case protocol.StreamCamera:
 		if c.camera != nil {
 			slog.Info("Closing camera TCP connection")
@@ -286,6 +321,18 @@ func (c *Connection) CloseStream(id uint32) {
 			c.mic.Close()
 			c.mic = nil
 		}
+	case protocol.StreamSpeaker:
+		if c.speaker != nil {
+			slog.Info("Closing speaker TCP connection")
+			c.speaker.Close()
+			c.speaker = nil
+		}
+	case protocol.StreamControl:
+		if c.control != nil {
+			slog.Info("Closing control TCP connection")
+			c.control.Close()
+			c.control = nil
+		}
 	}
 }
 
@@ -293,6 +340,9 @@ func (c *Connection) CloseStream(id uint32) {
 // host is the phone IP, basePort is the base port (e.g. 5000).
 // The per-stream port offset is added automatically.
 func (c *Connection) ReconnectStream(host string, basePort uint16, id uint32) error {
+	if c == nil {
+		return fmt.Errorf("connection is nil")
+	}
 	switch id {
 	case protocol.StreamScreen:
 		if c.video != nil {

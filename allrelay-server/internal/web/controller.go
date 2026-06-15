@@ -474,14 +474,15 @@ func (sc *ServerController) startScreenStreamLocked() {
 		return
 	}
 
-	// Reconnect screen TCP if needed
-	if !sc.conn.HasStream(protocol.StreamScreen) {
-		slog.Info("Screen: reconnecting TCP")
-		if err := sc.conn.ReconnectStream(sc.host, uint16(sc.port), protocol.StreamScreen); err != nil {
-			slog.Error("Screen: reconnect failed", "error", err)
-			return
-		}
-		slog.Info("Screen reconnected", "host", sc.host, "port", sc.port)
+	// Scrcpy-like lifecycle: every Screen ON starts a fresh TCP session.
+	// Never reuse old screen/control sockets across toggles.
+	sc.conn.CloseStream(protocol.StreamScreen)
+	sc.conn.CloseStream(protocol.StreamControl)
+
+	slog.Info("Screen: opening fresh TCP session")
+	if err := sc.conn.ReconnectStream(sc.host, uint16(sc.port), protocol.StreamScreen); err != nil {
+		slog.Error("Screen: reconnect failed", "error", err)
+		return
 	}
 
 	stream := sc.streams["screen"]
@@ -496,6 +497,7 @@ func (sc *ServerController) startScreenStreamLocked() {
 	stream.Running = true
 	stream.gen++
 	gen := stream.gen
+	videoConn := sc.conn.VideoConn()
 
 	// Wire control forwarding best-effort. Control must never block screen.
 	hub := sc.webServer.Hub()
@@ -510,25 +512,22 @@ func (sc *ServerController) startScreenStreamLocked() {
 			}
 		}
 	}
-	if controlConn := sc.conn.ControlConn(); controlConn != nil {
-		setControlForwarding(controlConn)
-	} else {
-		go func(expectedGen int) {
-			slog.Info("Control: reconnecting TCP (best-effort)")
-			if err := sc.conn.ReconnectStream(sc.host, uint16(sc.port), protocol.StreamControl); err != nil {
-				slog.Warn("Control: reconnect skipped", "error", err)
-				return
-			}
-			sc.mu.RLock()
-			stillCurrent := sc.streams["screen"].gen == expectedGen && sc.streams["screen"].Running
-			sc.mu.RUnlock()
-			if !stillCurrent {
-				sc.conn.CloseStream(protocol.StreamControl)
-				return
-			}
-			setControlForwarding(sc.conn.ControlConn())
-		}(gen)
-	}
+	go func(expectedGen int) {
+		slog.Info("Control: opening fresh TCP session (best-effort)")
+		sc.conn.CloseStream(protocol.StreamControl)
+		if err := sc.conn.ReconnectStream(sc.host, uint16(sc.port), protocol.StreamControl); err != nil {
+			slog.Warn("Control: reconnect skipped", "error", err)
+			return
+		}
+		sc.mu.RLock()
+		stillCurrent := sc.streams["screen"].gen == expectedGen && sc.streams["screen"].Running
+		sc.mu.RUnlock()
+		if !stillCurrent {
+			sc.conn.CloseStream(protocol.StreamControl)
+			return
+		}
+		setControlForwarding(sc.conn.ControlConn())
+	}(gen)
 
 	stream.done = make(chan struct{})
 	go func() {
@@ -537,8 +536,7 @@ func (sc *ServerController) startScreenStreamLocked() {
 			// Clear control forwarding when screen stream stops
 			hub.OnControl = nil
 		}()
-		reader := sc.conn.VideoStream()
-		if err := runScreenCapture(ctx, reader, hub,
+		if err := runScreenCapture(ctx, videoConn, hub,
 			func(fps, bitrate, latency int, bytes, frames int64) {
 				sc.mu.Lock()
 				if s, ok := sc.streams["screen"]; ok && s.gen == gen {
@@ -1059,9 +1057,17 @@ func runCameraCapture(ctx context.Context, reader io.Reader) error {
 func runScreenCapture(ctx context.Context, reader io.Reader, hub *Hub,
 	onMetrics func(fps, bitrate, latency int, bytes, frames int64)) error {
 
-	// Enforce a read deadline to detect idle/disconnected streams
+	// Do NOT apply an idle read timeout for screen mirroring.
+	// A static phone screen may legitimately produce no new H.264 packets for
+	// several seconds, and timing out here kills an otherwise healthy session.
+	// Instead, explicitly close the TCP reader on toggle OFF/disconnect so any
+	// blocking demux read wakes up immediately.
 	if conn, ok := reader.(net.Conn); ok {
-		reader = &readDeadlineReader{conn: conn, timeout: 5 * time.Second}
+		go func() {
+			<-ctx.Done()
+			slog.Info("Screen: context cancelled, closing TCP reader")
+			_ = conn.Close()
+		}()
 	}
 
 	// Debug: peek first bytes
