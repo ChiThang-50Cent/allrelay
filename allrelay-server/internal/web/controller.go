@@ -1073,6 +1073,9 @@ func runScreenCapture(ctx context.Context, reader io.Reader, hub *Hub,
 
 	demuxer := protocol.NewDemuxer(combinedReader)
 	errCh := make(chan error, 1)
+	go func() {
+		errCh <- demuxer.Run()
+	}()
 
 	var frameCount uint64
 	var byteCount uint64
