@@ -3,17 +3,29 @@ set -e
 
 # Load v4l2loopback module if not already loaded
 if ! lsmod | grep -q v4l2loopback; then
-    modprobe v4l2loopback video_nr=10 card_label="AllRelay Cam" exclusive_caps=1 || true
+    modprobe v4l2loopback video_nr=10 card_label="AllRelay Cam" exclusive_caps=1 keep_format=1 || true
 fi
 
 # Ensure v4l2loopback auto-loads on boot
 echo "v4l2loopback" > /etc/modules-load.d/allrelay.conf
-echo "options v4l2loopback video_nr=10 card_label=\"AllRelay Cam\" exclusive_caps=1" > /etc/modprobe.d/allrelay.conf
+echo "options v4l2loopback video_nr=10 card_label=\"AllRelay Cam\" exclusive_caps=1 keep_format=1" > /etc/modprobe.d/allrelay.conf
 
-# Reload systemd and enable service
-systemctl daemon-reload || true
-systemctl enable allrelay || true
-systemctl restart allrelay || true
+# Remove old system-wide service if present (migrated to user service)
+if [ -f /etc/systemd/system/allrelay.service ]; then
+    systemctl stop allrelay 2>/dev/null || true
+    systemctl disable allrelay 2>/dev/null || true
+    rm -f /etc/systemd/system/allrelay.service
+    systemctl daemon-reload || true
+fi
+
+# Enable user service for all users (global preset)
+systemctl --global enable allrelay.service || true
+
+# Start the service for the installing user
+if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+    su - "$SUDO_USER" -c "XDG_RUNTIME_DIR=/run/user/\$(id -u) systemctl --user daemon-reload" || true
+    su - "$SUDO_USER" -c "XDG_RUNTIME_DIR=/run/user/\$(id -u) systemctl --user restart allrelay" || true
+fi
 
 echo ""
 echo "=============================================="
@@ -21,6 +33,6 @@ echo "  AllRelay installed!"
 echo "  Web dashboard: http://localhost:9090"
 echo "  Virtual camera: /dev/video10 (AllRelay Cam)"
 echo ""
-echo "  Start/stop: systemctl [start|stop|restart] allrelay"
-echo "  Logs:       journalctl -u allrelay -f"
+echo "  Start/stop: systemctl --user [start|stop|restart] allrelay"
+echo "  Logs:       journalctl --user -u allrelay -f"
 echo "=============================================="

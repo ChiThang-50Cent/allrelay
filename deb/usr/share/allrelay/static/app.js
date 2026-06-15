@@ -53,6 +53,15 @@ function init() {
     elements.enableAllBtn.addEventListener('click', () => toggleAllStreams(true));
     elements.disableAllBtn.addEventListener('click', () => toggleAllStreams(false));
 
+    // Stream toggle via event delegation (robust with dynamic content)
+    elements.streamsGrid.addEventListener('change', (e) => {
+        const toggle = e.target.closest('.stream-toggle-input');
+        if (toggle) {
+            const streamName = toggle.dataset.stream;
+            handleToggleStream(streamName, toggle.checked);
+        }
+    });
+
     // Enter key on input
     elements.phoneIP.addEventListener('keypress', (e) => {
         if (e.key === 'Enter') handleConnect();
@@ -298,9 +307,9 @@ function renderStreams() {
                     <span>${stream.icon}</span>
                 </div>
                 <label class="stream-toggle">
-                    <input type="checkbox" 
-                           ${stream.active ? 'checked' : ''} 
-                           onchange="handleToggleStream('${stream.name}', this.checked)">
+                    <input type="checkbox" class="stream-toggle-input" 
+                           data-stream="${stream.name}"
+                           ${stream.active ? 'checked' : ''}>
                     <span class="toggle-slider"></span>
                 </label>
             </div>

@@ -1,17 +1,12 @@
 [Unit]
 Description=AllRelay - Android Phone Media Stream Server
-After=network.target pulseaudio.service
+After=pipewire.service pipewire-pulse.service
 
 [Service]
 Type=simple
-User=%u
-Environment=HOME=%h
-Environment=XDG_RUNTIME_DIR=/run/user/%U
 ExecStart=/usr/bin/allrelay-server --web-port 9090 -v
 Restart=on-failure
 RestartSec=5
-StandardOutput=journal
-StandardError=journal
 
 [Install]
 WantedBy=default.target

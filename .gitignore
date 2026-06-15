@@ -1,29 +1,23 @@
-# Build outputs
+# === Build outputs ===
 scrcpy/x/
 scrcpy/server/build/
 scrcpy/server/.cxx/
 scrcpy/.gradle/
 scrcpy/build/
+android/.gradle/
+android/app/build/
+android/build/
 
-# IDE
-.idea/
-*.iml
-.vscode/
-*.swp
-*.swo
-*~
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Gradle
-.gradle/
-local.properties
-
-# Built binaries (build scripts produce these)
+# Built binaries
 bin/*
 !bin/*.jar
+
+# Magisk build artifact (rebuilt by scripts/build-magisk.sh)
+magisk/system/bin/scrcpy-server-allrelay.jar
+
+# Go
+allrelay-server/allrelay-server
+allrelay-server/bin/
 
 # C/C++
 *.o
@@ -33,31 +27,33 @@ bin/*
 *.so
 *.so.*
 
-# Go
-cmd/mdns-discover/mdns-discover
+# === IDE / Editors ===
+.idea/
+*.iml
+.vscode/
+*.swp
+*.swo
+*~
 
-# Temporary logs / test output
-/tmp/
+# === OS ===
+.DS_Store
+Thumbs.db
+
+# === Gradle ===
+.gradle/
+local.properties
+
+# === Temporary / logs ===
 *.log
-
-# Python
 __pycache__/
 *.pyc
 
-# Go binary (built in package root by accident)
-allrelay-server/allrelay-server
-allrelay-server/bin/
-
-# Magisk build artifact (rebuilt by scripts/build-magisk.sh)
-magisk/system/bin/scrcpy-server-allrelay.jar
-
-# Docs, plans, research (not code)
+# === Docs, plans, research (not code) ===
 AGENTS.md
 RESEARCH_REPORT.md
 SPEC.md
 docs/research/
 plans/
 
-# Generated test scripts
+# === Generated scripts ===
 scripts/test-phase3.sh
-allrelay-server/bin/

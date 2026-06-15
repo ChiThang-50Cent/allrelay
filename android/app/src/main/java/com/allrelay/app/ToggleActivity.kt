@@ -35,7 +35,7 @@ class ToggleActivity : Activity() {
 
     private val refreshRunnable = object : Runnable {
         override fun run() {
-            refreshStatus()
+            refreshStatus(showBusy = false)
             mainHandler.postDelayed(this, 2500)
         }
     }
