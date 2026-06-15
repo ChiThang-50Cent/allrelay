@@ -144,15 +144,6 @@ func Connect(host string, basePort uint16, connectVideo, connectCamera, connectM
 		return nil, firstErr
 	}
 
-	// Drain VIDEO port only — prevents Android screen stream from blocking
-	// when we're not reading screen data. Camera has its own active reader.
-	if conn.video != nil {
-		go func() {
-			n, _ := io.Copy(io.Discard, conn.video)
-			slog.Debug("Video drain finished", "bytes", n)
-		}()
-	}
-
 	return conn, nil
 }
 
@@ -303,6 +294,18 @@ func (c *Connection) CloseStream(id uint32) {
 // The per-stream port offset is added automatically.
 func (c *Connection) ReconnectStream(host string, basePort uint16, id uint32) error {
 	switch id {
+	case protocol.StreamScreen:
+		if c.video != nil {
+			c.video.Close()
+			c.video = nil
+		}
+		newConn := connectPortWithRetry(host, basePort+0, "video", 8)
+		if newConn == nil {
+			return fmt.Errorf("screen reconnect failed: %s:%d", host, basePort+0)
+		}
+		c.video = newConn
+		slog.Info("Screen reconnected", "host", host, "port", basePort+0)
+		return nil
 	case protocol.StreamCamera:
 		if c.camera != nil {
 			c.camera.Close()
@@ -326,6 +329,18 @@ func (c *Connection) ReconnectStream(host string, basePort uint16, id uint32) er
 		}
 		c.mic = newConn
 		slog.Info("Mic reconnected", "host", host, "port", basePort+2)
+		return nil
+	case protocol.StreamControl:
+		if c.control != nil {
+			c.control.Close()
+			c.control = nil
+		}
+		newConn := connectPortWithRetry(host, basePort+4, "control", 8)
+		if newConn == nil {
+			return fmt.Errorf("control reconnect failed: %s:%d", host, basePort+4)
+		}
+		c.control = newConn
+		slog.Info("Control reconnected", "host", host, "port", basePort+4)
 		return nil
 	default:
 		return fmt.Errorf("reconnect not implemented for stream %s", protocol.StreamName(id))

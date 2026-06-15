@@ -165,8 +165,6 @@ function handleBinaryMessage(data) {
         handleBinaryFrame(new Uint8Array(data));
     }
 }
-    }
-}
 
 function updateStreamFromWS(streamData) {
     const stream = state.streams.find(s => s.name === streamData.name);

@@ -163,10 +163,8 @@ public final class Server {
                     if (daemon
                             && (speakerEnabled || cameraDaemonEnabled || micEnabled || video || control)) {
                     // Start mDNS advertisement so PC can discover this phone.
-                    // Must run on main thread (ActivityThread.systemMain needs Looper).
-                    new android.os.Handler(android.os.Looper.getMainLooper()).post(() -> {
-                        startMdnsAdvertiser(wifiPort);
-                    });
+                    // Run on a background thread — main thread is blocked by speaker daemon.
+                    new Thread(() -> startMdnsAdvertiser(wifiPort), "discovery").start();
 
                         Thread cameraThread = null;
                         Thread micThread = null;

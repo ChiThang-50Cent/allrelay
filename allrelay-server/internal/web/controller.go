@@ -87,13 +87,15 @@ func (sc *ServerController) Connect(host string, port int) error {
 
 	slog.Info("Connecting to phone", "host", host, "port", port)
 
-	// Connect all streams: screen, camera, mic, speaker, control
+	// Connect camera + mic + speaker immediately.
+	// Screen + control are opened lazily on toggle ON to avoid consuming
+	// screen data before the UI actively reads it.
 	conn, err := transport.Connect(host, uint16(port),
-		true,  // video (screen)
+		false, // video (screen)
 		true,  // camera
 		true,  // mic
 		true,  // speaker
-		true)  // control
+		false) // control
 	if err != nil {
 		return fmt.Errorf("connection failed: %w", err)
 	}
@@ -495,18 +497,37 @@ func (sc *ServerController) startScreenStreamLocked() {
 	stream.gen++
 	gen := stream.gen
 
-	// Wire control forwarding: WebSocket -> Android control port
-	controlConn := sc.conn.ControlConn()
+	// Wire control forwarding best-effort. Control must never block screen.
 	hub := sc.webServer.Hub()
-	if controlConn != nil {
+	hub.OnControl = nil
+	setControlForwarding := func(controlConn net.Conn) {
+		if controlConn == nil {
+			return
+		}
 		hub.OnControl = func(data []byte) {
-			// Forward raw control JSON to Android
 			if _, err := controlConn.Write(append(data, '\n')); err != nil {
 				slog.Debug("Control write error", "error", err)
 			}
 		}
+	}
+	if controlConn := sc.conn.ControlConn(); controlConn != nil {
+		setControlForwarding(controlConn)
 	} else {
-		hub.OnControl = nil
+		go func(expectedGen int) {
+			slog.Info("Control: reconnecting TCP (best-effort)")
+			if err := sc.conn.ReconnectStream(sc.host, uint16(sc.port), protocol.StreamControl); err != nil {
+				slog.Warn("Control: reconnect skipped", "error", err)
+				return
+			}
+			sc.mu.RLock()
+			stillCurrent := sc.streams["screen"].gen == expectedGen && sc.streams["screen"].Running
+			sc.mu.RUnlock()
+			if !stillCurrent {
+				sc.conn.CloseStream(protocol.StreamControl)
+				return
+			}
+			setControlForwarding(sc.conn.ControlConn())
+		}(gen)
 	}
 
 	stream.done = make(chan struct{})
@@ -545,6 +566,7 @@ func (sc *ServerController) startScreenStreamLocked() {
 			stream.Active = false
 		}
 		sc.conn.CloseStream(protocol.StreamScreen)
+		sc.conn.CloseStream(protocol.StreamControl)
 		sc.mu.Unlock()
 	}()
 }
