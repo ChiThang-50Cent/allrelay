@@ -9,7 +9,7 @@ object RootDaemonManager {
     private const val ROOT_LOG_PATH = "/data/local/tmp/allrelay-unified.log"
     private const val LOCAL_TMP_JAR = "/data/local/tmp/allrelay.jar"
     private const val MAGISK_JAR = "/data/adb/modules/allrelay/system/bin/scrcpy-server-allrelay.jar"
-    private const val PROCESS_PATTERN = "app_process / com.genymobile.scrcpy.Server 4.0"
+    private const val PROCESS_PATTERN = "com.genymobile.scrcpy.Server"
 
     data class Config(
         val camera: Boolean,
@@ -104,7 +104,10 @@ object RootDaemonManager {
     fun status(config: Config? = null): Status {
         val result = runSu(
             """
-            PID="$(ps -A -o PID,ARGS | grep '$PROCESS_PATTERN' | grep -v grep | awk 'NR==1 {print \$1}')"
+            PID="$(ps -A -o PID,PPID,NAME,ARGS | grep '$PROCESS_PATTERN' | grep -v grep | awk 'NR==1 {print \$1}')"
+            if [ -z "${'$'}PID" ]; then
+              PID="$(for f in /proc/[0-9]*/cmdline; do tr '\000' ' ' < "${'$'}f" 2>/dev/null | grep -q '$PROCESS_PATTERN' && basename "$(dirname "${'$'}f")" && break; done)"
+            fi
             if [ -n "${'$'}PID" ]; then
               echo "RUNNING:${'$'}PID"
             else
@@ -128,12 +131,24 @@ object RootDaemonManager {
             .mapNotNull { it.substringAfter(':').trim().toIntOrNull() }
             .toSet()
         val expected = config?.expectedPorts().orEmpty()
+        val hasDaemonPorts = ports.intersect(setOf(5001, 5002, 5003)).isNotEmpty()
         val message = when {
             !hasRoot() -> "Root unavailable"
-            !running -> "Daemon stopped"
-            expected.isNotEmpty() && !ports.containsAll(expected) -> "Process up, waiting for ports ${expected.sorted()}"
-            else -> "Daemon running${pid?.let { " (pid $it)" } ?: ""}"
+            running && expected.isNotEmpty() && !ports.containsAll(expected) -> "Process up, waiting for ports ${expected.sorted()}"
+            running -> "Daemon running${pid?.let { " (pid $it)" } ?: ""}"
+            hasDaemonPorts -> "Daemon ports detected (process lookup failed)"
+            else -> "Daemon stopped"
         }
+
+        val effectiveRunning = running || hasDaemonPorts
+
+        return Status(
+            running = effectiveRunning,
+            pid = pid,
+            ports = ports,
+            message = message,
+            logTail = readLogTail(),
+        )
 
         return Status(
             running = running,
