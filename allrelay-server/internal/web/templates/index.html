@@ -59,6 +59,25 @@
                 </div>
             </section>
 
+            <!-- Screen Viewer Panel -->
+            <section class="panel screen-panel" id="screenPanel" style="display: none;">
+                <div class="panel-header">
+                    <h2>Screen</h2>
+                    <span class="screen-fps" id="screenFPS"></span>
+                </div>
+                <div class="panel-body screen-body">
+                    <canvas id="screenCanvas" class="screen-canvas"></canvas>
+                    <div class="screen-placeholder" id="screenPlaceholder">
+                        <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                            <rect x="2" y="3" width="20" height="14" rx="2" ry="2"/>
+                            <line x1="8" y1="21" x2="16" y2="21"/>
+                            <line x1="12" y1="17" x2="12" y2="21"/>
+                        </svg>
+                        <p>Waiting for screen stream...</p>
+                    </div>
+                </div>
+            </section>
+
             <!-- Streams Panel -->
             <section class="panel streams-panel">
                 <div class="panel-header">

@@ -43,6 +43,11 @@ type StreamController struct {
 	Port    int
 	Active  bool
 	Running bool
+	FPS     int
+	Bitrate int
+	Latency int
+	Bytes   int64
+	Frames  int64
 	stop    func()
 	cancel  context.CancelFunc
 	done    chan struct{} // closed when goroutine fully exits
@@ -82,14 +87,13 @@ func (sc *ServerController) Connect(host string, port int) error {
 
 	slog.Info("Connecting to phone", "host", host, "port", port)
 
-	// Connect speaker + camera + mic. Screen/video intentionally disabled
-	// to avoid conflicts with the speaker daemon flow.
+	// Connect all streams: screen, camera, mic, speaker, control
 	conn, err := transport.Connect(host, uint16(port),
-		false, // video (screen) — daemon mode skips screen
+		true,  // video (screen)
 		true,  // camera
 		true,  // mic
 		true,  // speaker
-		false) // control
+		true)  // control
 	if err != nil {
 		return fmt.Errorf("connection failed: %w", err)
 	}
@@ -184,6 +188,11 @@ func (sc *ServerController) SyncStreamStatus(streams []StreamStatus) {
 	for i, s := range streams {
 		if ctrl, ok := sc.streams[s.Name]; ok {
 			streams[i].Active = ctrl.Active
+			streams[i].FPS = ctrl.FPS
+			streams[i].Bitrate = ctrl.Bitrate
+			streams[i].Latency = ctrl.Latency
+			streams[i].BytesSent = ctrl.Bytes
+			streams[i].Frames = ctrl.Frames
 		}
 	}
 }
@@ -234,6 +243,8 @@ func (sc *ServerController) ToggleStream(name string, active bool) error {
 			sc.startCameraStreamLocked()
 		case "mic":
 			go sc.startMicStreamAsync()
+		case "screen":
+			sc.startScreenStreamLocked()
 		}
 	} else if !active && stream.Running {
 		// Release lock while waiting for goroutine to stop
@@ -450,6 +461,90 @@ func (sc *ServerController) startCameraStreamLocked() {
 		// connection stays ESTAB and the old goroutine competes with the
 		// new one on the next camera ON.
 		sc.conn.CloseStream(protocol.StreamCamera)
+		sc.mu.Unlock()
+	}()
+}
+
+// startScreenStreamLocked starts the screen stream (must hold lock)
+func (sc *ServerController) startScreenStreamLocked() {
+	if sc.conn == nil {
+		slog.Warn("Screen stream not available (no connection)")
+		return
+	}
+
+	// Reconnect screen TCP if needed
+	if !sc.conn.HasStream(protocol.StreamScreen) {
+		slog.Info("Screen: reconnecting TCP")
+		if err := sc.conn.ReconnectStream(sc.host, uint16(sc.port), protocol.StreamScreen); err != nil {
+			slog.Error("Screen: reconnect failed", "error", err)
+			return
+		}
+		slog.Info("Screen reconnected", "host", sc.host, "port", sc.port)
+	}
+
+	stream := sc.streams["screen"]
+	stream.Running = false
+	stream.Active = false
+
+	ctx, cancel := context.WithCancel(context.Background())
+	stream.cancel = cancel
+
+	slog.Info("Starting screen stream")
+	stream.Active = true
+	stream.Running = true
+	stream.gen++
+	gen := stream.gen
+
+	// Wire control forwarding: WebSocket -> Android control port
+	controlConn := sc.conn.ControlConn()
+	hub := sc.webServer.Hub()
+	if controlConn != nil {
+		hub.OnControl = func(data []byte) {
+			// Forward raw control JSON to Android
+			if _, err := controlConn.Write(append(data, '\n')); err != nil {
+				slog.Debug("Control write error", "error", err)
+			}
+		}
+	} else {
+		hub.OnControl = nil
+	}
+
+	stream.done = make(chan struct{})
+	go func() {
+		defer close(stream.done)
+		defer func() {
+			// Clear control forwarding when screen stream stops
+			hub.OnControl = nil
+		}()
+		reader := sc.conn.VideoStream()
+		if err := runScreenCapture(ctx, reader, hub,
+			func(fps, bitrate, latency int, bytes, frames int64) {
+				sc.mu.Lock()
+				if s, ok := sc.streams["screen"]; ok && s.gen == gen {
+					s.FPS = fps
+					s.Bitrate = bitrate
+					s.Latency = latency
+					s.Bytes = bytes
+					s.Frames = frames
+				}
+				sc.mu.Unlock()
+			},
+		); err != nil {
+			switch err {
+			case context.Canceled:
+				slog.Info("Screen: stopped by toggle")
+			case io.EOF:
+				slog.Info("Screen: stream ended cleanly")
+			default:
+				slog.Error("Screen capture error", "error", err)
+			}
+		}
+		sc.mu.Lock()
+		if stream.Running && stream.gen == gen {
+			stream.Running = false
+			stream.Active = false
+		}
+		sc.conn.CloseStream(protocol.StreamScreen)
 		sc.mu.Unlock()
 	}()
 }
@@ -933,6 +1028,95 @@ func runCameraCapture(ctx context.Context, reader io.Reader) error {
 			return io.EOF
 		}
 		slog.Info("Camera: demuxer ended", "frames", frameCount, "bytes", byteCount, "error", err)
+		return err
+	}
+}
+
+// runScreenCapture reads H.264 NAL units from the TCP reader via the demuxer
+// and broadcasts them as binary WebSocket messages to all connected clients.
+func runScreenCapture(ctx context.Context, reader io.Reader, hub *Hub,
+	onMetrics func(fps, bitrate, latency int, bytes, frames int64)) error {
+
+	// Enforce a read deadline to detect idle/disconnected streams
+	if conn, ok := reader.(net.Conn); ok {
+		reader = &readDeadlineReader{conn: conn, timeout: 5 * time.Second}
+	}
+
+	// Debug: peek first bytes
+	peek := make([]byte, 32)
+	n, peekErr := io.ReadFull(reader, peek)
+	slog.Info("Screen: preamble bytes", "n", n, "err", peekErr, "hex", fmt.Sprintf("%x", peek[:n]))
+
+	combinedReader := io.MultiReader(bytes.NewReader(peek[:n]), reader)
+
+	demuxer := protocol.NewDemuxer(combinedReader)
+	errCh := make(chan error, 1)
+
+	var frameCount uint64
+	var byteCount uint64
+	var started bool
+	startTime := time.Now()
+	lastMetricsTime := startTime
+	lastFrameCount := uint64(0)
+	lastByteCount := uint64(0)
+
+	demuxer.RegisterHandler(protocol.StreamScreen, func(header *protocol.Header, payload []byte) error {
+		// Skip zero-payload packets (session meta)
+		if len(payload) == 0 {
+			return nil
+		}
+
+		// Only forward Annex B H.264 NAL units
+		if !video.IsAnnexB(payload) {
+			return nil
+		}
+
+		// Broadcast raw H.264 NAL to WebSocket clients for WebCodecs decoding
+		hub.BroadcastBinary(payload)
+
+		frameCount++
+		byteCount += uint64(len(payload))
+
+		if !started {
+			slog.Info("Screen: received first frame", "bytes", len(payload))
+			started = true
+		}
+
+		// Periodic metrics
+		now := time.Now()
+		if now.Sub(lastMetricsTime) >= time.Second {
+			elapsed := now.Sub(lastMetricsTime).Seconds()
+			fps := int(float64(frameCount-lastFrameCount) / elapsed)
+			bitrate := int(float64(byteCount-lastByteCount) * 8 / elapsed)
+			latency := int(now.Sub(startTime).Milliseconds())
+
+			slog.Debug("Screen stream",
+				"frames", frameCount,
+				"total_bytes", byteCount,
+				"fps", fps,
+				"bitrate", bitrate)
+
+			onMetrics(fps, bitrate, latency, int64(byteCount), int64(frameCount))
+
+			lastMetricsTime = now
+			lastFrameCount = frameCount
+			lastByteCount = byteCount
+		}
+
+		return nil
+	})
+
+	// Wait for stream to end
+	select {
+	case <-ctx.Done():
+		demuxer.Stop()
+		return ctx.Err()
+	case err := <-errCh:
+		if isNetTimeout(err) {
+			slog.Info("Screen: stream idle timeout", "frames", frameCount, "bytes", byteCount)
+			return io.EOF
+		}
+		slog.Info("Screen: demuxer ended", "frames", frameCount, "bytes", byteCount, "error", err)
 		return err
 	}
 }

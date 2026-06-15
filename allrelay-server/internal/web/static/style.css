@@ -638,3 +638,52 @@ input:checked + .toggle-slider:before {
         grid-template-columns: 1fr;
     }
 }
+
+/* ============================================
+   Screen Viewer
+   ============================================ */
+
+.screen-body {
+    position: relative;
+    min-height: 360px;
+    background: #000;
+    border-radius: var(--radius-md);
+    overflow: hidden;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.screen-canvas {
+    width: 100%;
+    height: auto;
+    display: none;
+    cursor: crosshair;
+    user-select: none;
+    touch-action: none;
+}
+
+.screen-canvas.active {
+    display: block;
+}
+
+.screen-placeholder {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: var(--space-3);
+    color: var(--color-text-muted);
+}
+
+.screen-placeholder.hidden {
+    display: none;
+}
+
+.screen-fps {
+    font-size: var(--font-size-sm);
+    font-variant-numeric: tabular-nums;
+    color: var(--color-success);
+    padding: 2px 8px;
+    background: var(--color-surface-elevated);
+    border-radius: var(--radius-sm);
+}

@@ -77,6 +77,9 @@ function init() {
     // Connect WebSocket
     connectWebSocket();
 
+    // Initialize screen viewer
+    initScreenViewer();
+
     // Poll for status updates (fallback if WebSocket fails)
     setInterval(loadStatus, 10000);
 }
@@ -102,6 +105,10 @@ function connectWebSocket() {
         };
         
         state.ws.onmessage = (event) => {
+            if (event.data instanceof ArrayBuffer || event.data instanceof Blob) {
+                handleBinaryMessage(event.data);
+                return;
+            }
             try {
                 const msg = JSON.parse(event.data);
                 handleWebSocketMessage(msg);
@@ -109,6 +116,8 @@ function connectWebSocket() {
                 console.error('Failed to parse WebSocket message:', error);
             }
         };
+
+        state.ws.binaryType = 'arraybuffer';
         
         state.ws.onclose = () => {
             console.log('WebSocket disconnected');
@@ -138,9 +147,24 @@ function handleWebSocketMessage(msg) {
         case 'pong':
             // Heartbeat response
             break;
+
+        case 'control_ack':
+            // Control message acknowledged
+            break;
             
         default:
             console.log('Unknown WebSocket message type:', msg.type);
+    }
+}
+
+function handleBinaryMessage(data) {
+    // Binary frames are H.264 NAL units for screen streaming
+    if (data instanceof Blob) {
+        data.arrayBuffer().then(buf => handleBinaryFrame(new Uint8Array(buf)));
+    } else {
+        handleBinaryFrame(new Uint8Array(data));
+    }
+}
     }
 }
 
@@ -150,6 +174,11 @@ function updateStreamFromWS(streamData) {
         Object.assign(stream, streamData);
         renderStreams();
         updateStatusDisplay();
+
+        // Show/hide screen viewer
+        if (stream.name === 'screen') {
+            showScreenViewer(stream.active && state.connected);
+        }
     }
 }
 
@@ -523,3 +552,182 @@ function connectToPhone(ip) {
 // Initialize on DOM ready
 // ============================================
 document.addEventListener('DOMContentLoaded', init);
+
+// ============================================
+// Screen Viewer (WebCodecs)
+// ============================================
+
+let screenDecoder = null;
+let screenCanvasEl = null;
+let screenCtx = null;
+let screenFrameCount = 0;
+let screenLastFpsTime = Date.now();
+let screenFpsCounter = 0;
+let screenActive = false;
+
+function initScreenViewer() {
+    screenCanvasEl = document.getElementById('screenCanvas');
+    screenCtx = screenCanvasEl.getContext('2d');
+
+    // Mouse events for control
+    screenCanvasEl.addEventListener('mousedown', (e) => {
+        if (!screenActive) return;
+        const rect = screenCanvasEl.getBoundingClientRect();
+        sendControlMessage({ type: 'touch', action: 'down', x: (e.clientX - rect.left) / rect.width, y: (e.clientY - rect.top) / rect.height, pointer_id: 0 });
+    });
+    screenCanvasEl.addEventListener('mouseup', (e) => {
+        if (!screenActive) return;
+        const rect = screenCanvasEl.getBoundingClientRect();
+        sendControlMessage({ type: 'touch', action: 'up', x: (e.clientX - rect.left) / rect.width, y: (e.clientY - rect.top) / rect.height, pointer_id: 0 });
+    });
+    screenCanvasEl.addEventListener('mousemove', (e) => {
+        if (!screenActive || !e.buttons) return;
+        const rect = screenCanvasEl.getBoundingClientRect();
+        sendControlMessage({ type: 'touch', action: 'move', x: (e.clientX - rect.left) / rect.width, y: (e.clientY - rect.top) / rect.height, pointer_id: 0 });
+    });
+
+    // Keyboard events
+    document.addEventListener('keydown', (e) => {
+        if (!screenActive) return;
+        sendControlMessage({ type: 'key', action: 'down', keycode: e.keyCode, meta_state: 0 });
+    });
+    document.addEventListener('keyup', (e) => {
+        if (!screenActive) return;
+        sendControlMessage({ type: 'key', action: 'up', keycode: e.keyCode, meta_state: 0 });
+    });
+}
+
+function sendControlMessage(data) {
+    if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+        state.ws.send(JSON.stringify({ type: 'control', data }));
+    }
+}
+
+function setupScreenDecoder() {
+    if (screenDecoder && screenDecoder.state === 'configured') return;
+
+    screenDecoder = new VideoDecoder({
+        output(frame) {
+            screenFrameCount++;
+            screenFpsCounter++;
+
+            if (screenCanvasEl.width !== frame.displayWidth ||
+                screenCanvasEl.height !== frame.displayHeight) {
+                screenCanvasEl.width = frame.displayWidth;
+                screenCanvasEl.height = frame.displayHeight;
+            }
+
+            screenCtx.drawImage(frame, 0, 0);
+            frame.close();
+
+            if (!screenCanvasEl.classList.contains('active')) {
+                screenCanvasEl.classList.add('active');
+                document.getElementById('screenPlaceholder').classList.add('hidden');
+            }
+
+            const now = Date.now();
+            if (now - screenLastFpsTime >= 1000) {
+                document.getElementById('screenFPS').textContent = screenFpsCounter + ' FPS';
+                screenFpsCounter = 0;
+                screenLastFpsTime = now;
+            }
+        },
+        error(err) {
+            console.error('Screen decoder error:', err);
+        }
+    });
+
+    screenDecoder.configure({
+        codec: 'avc1.640028',
+        optimizeForLatency: true
+    });
+}
+
+function destroyScreenDecoder() {
+    if (screenDecoder) {
+        try { screenDecoder.close(); } catch (e) {}
+        screenDecoder = null;
+    }
+    screenFrameCount = 0;
+    screenFpsCounter = 0;
+    if (screenCanvasEl) {
+        screenCanvasEl.classList.remove('active');
+    }
+    const placeholder = document.getElementById('screenPlaceholder');
+    if (placeholder) placeholder.classList.remove('hidden');
+    document.getElementById('screenFPS').textContent = '';
+}
+
+// Handle binary WebSocket frames (H.264 NAL units for screen)
+function handleBinaryFrame(data) {
+    if (!screenActive) return;
+    try {
+        setupScreenDecoder();
+        const nalUnits = convertAnnexBToAVCC(data);
+        for (const nal of nalUnits) {
+            screenDecoder.decode(new EncodedVideoChunk({
+                type: getNALType(nal),
+                timestamp: 0,
+                duration: 0,
+                data: nal
+            }));
+        }
+    } catch (err) {
+        console.error('Screen decode error:', err);
+    }
+}
+
+function convertAnnexBToAVCC(data) {
+    const nalUnits = [];
+    const view = new Uint8Array(data);
+    let start = 0;
+    for (let i = 0; i < view.length - 3; i++) {
+        if (view[i] === 0x00 && view[i+1] === 0x00) {
+            let startCodeLen = 0;
+            if (view[i+2] === 0x00 && view[i+3] === 0x01) startCodeLen = 4;
+            else if (view[i+2] === 0x01) startCodeLen = 3;
+            if (startCodeLen > 0 && start < i) {
+                const nalData = view.slice(start, i);
+                if (nalData.length > 0) {
+                    const len = nalData.length;
+                    const avccNal = new Uint8Array(4 + len);
+                    avccNal[0] = (len >> 24) & 0xFF;
+                    avccNal[1] = (len >> 16) & 0xFF;
+                    avccNal[2] = (len >> 8) & 0xFF;
+                    avccNal[3] = len & 0xFF;
+                    avccNal.set(nalData, 4);
+                    nalUnits.push(avccNal);
+                }
+                start = i + startCodeLen;
+                i += startCodeLen - 1;
+            }
+        }
+    }
+    if (start < view.length) {
+        const nalData = view.slice(start);
+        if (nalData.length > 0) {
+            const len = nalData.length;
+            const avccNal = new Uint8Array(4 + len);
+            avccNal[0] = (len >> 24) & 0xFF;
+            avccNal[1] = (len >> 16) & 0xFF;
+            avccNal[2] = (len >> 8) & 0xFF;
+            avccNal[3] = len & 0xFF;
+            avccNal.set(nalData, 4);
+            nalUnits.push(avccNal);
+        }
+    }
+    return nalUnits;
+}
+
+function getNALType(data) {
+    if (data.length < 5) return 'delta';
+    const nalType = data[4] & 0x1F;
+    return (nalType === 5 || nalType === 7 || nalType === 8) ? 'key' : 'delta';
+}
+
+function showScreenViewer(show) {
+    screenActive = show;
+    const panel = document.getElementById('screenPanel');
+    if (panel) panel.style.display = show ? '' : 'none';
+    if (!show) destroyScreenDecoder();
+}

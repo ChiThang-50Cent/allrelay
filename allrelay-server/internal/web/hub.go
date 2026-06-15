@@ -19,7 +19,8 @@ var upgrader = websocket.Upgrader{
 type Client struct {
 	hub  *Hub
 	conn *websocket.Conn
-	send chan []byte
+	send chan []byte  // text messages (JSON status, events)
+	sendBin chan []byte  // binary messages (H.264 NAL units for screen)
 }
 
 // Hub maintains the set of active clients and broadcasts messages
@@ -29,6 +30,9 @@ type Hub struct {
 	register   chan *Client
 	unregister chan *Client
 	mu         sync.RWMutex
+
+	// OnControl is called when a client sends a control message (touch, key, etc.)
+	OnControl func(data []byte)
 }
 
 // NewHub creates a new WebSocket hub
@@ -56,6 +60,7 @@ func (h *Hub) Run() {
 			if _, ok := h.clients[client]; ok {
 				delete(h.clients, client)
 				close(client.send)
+				close(client.sendBin)
 			}
 			h.mu.Unlock()
 			slog.Debug("WebSocket client disconnected", "total", len(h.clients))
@@ -71,6 +76,19 @@ func (h *Hub) Run() {
 				}
 			}
 			h.mu.RUnlock()
+		}
+	}
+}
+
+// BroadcastBinary sends raw binary data (e.g., H.264 NAL units) to all clients.
+func (h *Hub) BroadcastBinary(data []byte) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	for client := range h.clients {
+		select {
+		case client.sendBin <- data:
+		default:
+			// Client buffer full, drop this frame
 		}
 	}
 }
@@ -132,9 +150,10 @@ func (ws *WebServer) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 
 	client := &Client{
-		hub:  ws.hub,
-		conn: conn,
-		send: make(chan []byte, 256),
+		hub:     ws.hub,
+		conn:    conn,
+		send:    make(chan []byte, 256),
+		sendBin: make(chan []byte, 64),
 	}
 
 	ws.hub.register <- client
@@ -179,6 +198,12 @@ func (c *Client) readPump() {
 		switch msg.Type {
 		case "ping":
 			c.send <- []byte(`{"type":"pong"}`)
+		case "control":
+			// Forward control message to Android via the hub callback
+			if c.hub.OnControl != nil {
+				data, _ := json.Marshal(msg.Data)
+				c.hub.OnControl(data)
+			}
 		}
 	}
 }
@@ -194,8 +219,16 @@ func (c *Client) writePump() {
 				c.conn.WriteMessage(websocket.CloseMessage, []byte{})
 				return
 			}
-
 			if err := c.conn.WriteMessage(websocket.TextMessage, message); err != nil {
+				return
+			}
+
+		case data, ok := <-c.sendBin:
+			if !ok {
+				c.conn.WriteMessage(websocket.CloseMessage, []byte{})
+				return
+			}
+			if err := c.conn.WriteMessage(websocket.BinaryMessage, data); err != nil {
 				return
 			}
 		}

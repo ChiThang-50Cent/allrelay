@@ -9,6 +9,11 @@ import com.genymobile.scrcpy.audio.AudioRawRecorder;
 import com.genymobile.scrcpy.audio.AudioReversePlayback;
 import com.genymobile.scrcpy.audio.AudioSource;
 import com.genymobile.scrcpy.audio.WifiAudioEncoder;
+import com.genymobile.scrcpy.control.ControlMessage;
+import com.genymobile.scrcpy.control.ControlMessageReader;
+import com.genymobile.scrcpy.control.DeviceMessage;
+import com.genymobile.scrcpy.control.DeviceMessageWriter;
+import com.genymobile.scrcpy.control.PositionMapper;
 import com.genymobile.scrcpy.control.ControlChannel;
 import com.genymobile.scrcpy.control.Controller;
 import com.genymobile.scrcpy.device.DesktopConnection;
@@ -154,9 +159,9 @@ public final class Server {
                     // Fast path: persistent daemon mode for independently managed ports.
                     // Keep enabled ports open permanently and accept reconnections in a loop.
                     // Speaker daemon runs on main thread (needs Looper for decoder callbacks).
-                    // Camera and mic daemons run on background threads.
-                    if (daemon && !video && !cameraEnabled && !control
-                            && (speakerEnabled || cameraDaemonEnabled || micEnabled)) {
+                    // Screen, camera, mic, and control daemons run on background threads.
+                    if (daemon
+                            && (speakerEnabled || cameraDaemonEnabled || micEnabled || video || control)) {
                     // Start mDNS advertisement so PC can discover this phone.
                     // Must run on main thread (ActivityThread.systemMain needs Looper).
                     new android.os.Handler(android.os.Looper.getMainLooper()).post(() -> {
@@ -165,6 +170,14 @@ public final class Server {
 
                         Thread cameraThread = null;
                         Thread micThread = null;
+                        Thread screenThread = null;
+                        Thread controlThread = null;
+
+                        // Screen daemon: mirror display to port 5000
+                        if (video) {
+                            int screenPort = wifiPort + 0;
+                            screenThread = startScreenDaemon(screenPort, options);
+                        }
 
                         if (cameraDaemonEnabled) {
                             int cameraPort = wifiPort + 1;
@@ -176,14 +189,30 @@ public final class Server {
                             micThread = startMicDaemon(micPort, options);
                         }
 
+                        // Control daemon: receive touch/key events on port 5004
+                        if (control) {
+                            int controlPort = wifiPort + 4;
+                            controlThread = startControlDaemon(controlPort, options, cleanUp);
+                        }
+
                         // Speaker daemon runs on main thread and blocks until fatal exit.
                         if (speakerEnabled) {
                             int speakerPort = wifiPort + 3;
                             runSpeakerDaemon(speakerPort);
-                        } else if (cameraThread != null) {
-                            try { cameraThread.join(); } catch (InterruptedException ignored) {}
-                        } else if (micThread != null) {
-                            try { micThread.join(); } catch (InterruptedException ignored) {}
+                        } else {
+                            // Wait for any other daemon threads
+                            if (screenThread != null) {
+                                try { screenThread.join(); } catch (InterruptedException ignored) {}
+                            }
+                            if (cameraThread != null) {
+                                try { cameraThread.join(); } catch (InterruptedException ignored) {}
+                            }
+                            if (micThread != null) {
+                                try { micThread.join(); } catch (InterruptedException ignored) {}
+                            }
+                            if (controlThread != null) {
+                                try { controlThread.join(); } catch (InterruptedException ignored) {}
+                            }
                         }
                         continue;
                     }
@@ -840,6 +869,147 @@ public final class Server {
             Ln.w("Mic stream completed with fatal error");
         } else {
             Ln.i("Mic stream completed");
+        }
+    }
+
+    /**
+     * Start the screen daemon on a new background thread.
+     * Listens on the given port, accepts connections, captures the device display,
+     * encodes with MediaCodec H.264, and streams to the client socket.
+     */
+    private static Thread startScreenDaemon(int screenPort, Options options) {
+        Thread thread = new Thread(() -> {
+            java.net.ServerSocket screenServer = null;
+            try {
+                screenServer = new java.net.ServerSocket();
+                screenServer.setReuseAddress(true);
+                screenServer.bind(new java.net.InetSocketAddress(screenPort));
+                Ln.i("Screen daemon listening on port " + screenPort);
+
+                while (true) {
+                    java.net.Socket screenSocket = null;
+                    try {
+                        Ln.i("Waiting for screen client on port " + screenPort + "...");
+                        screenSocket = screenServer.accept();
+                        screenSocket.setTcpNoDelay(true);
+                        screenSocket.getOutputStream().write(new byte[]{(byte) 0xAB});
+                        screenSocket.getOutputStream().flush();
+                        Ln.i("Screen client connected from " + screenSocket.getRemoteSocketAddress());
+
+                        runScreenStream(screenSocket, options);
+
+                        Ln.i("Screen stream ended, accepting next connection...");
+                    } catch (Exception e) {
+                        Ln.e("Screen daemon stream error: " + e.getMessage(), e);
+                        if (screenSocket != null) {
+                            try { screenSocket.close(); } catch (IOException ignored) {}
+                        }
+                        try { Thread.sleep(500); } catch (InterruptedException ignored) {}
+                    }
+                }
+            } catch (IOException e) {
+                Ln.e("Screen daemon bind failed: " + e.getMessage(), e);
+            } finally {
+                if (screenServer != null) {
+                    try { screenServer.close(); } catch (IOException ignored) {}
+                }
+            }
+        }, "screen-daemon");
+        thread.setDaemon(true);
+        thread.start();
+        return thread;
+    }
+
+    /**
+     * Start the control daemon on a new background thread.
+     * Listens on the given port, accepts connections, receives control messages
+     * (touch, key, clipboard), and injects them via Controller.
+     */
+    private static Thread startControlDaemon(int controlPort, Options options, CleanUp cleanUp) {
+        Thread thread = new Thread(() -> {
+            java.net.ServerSocket controlServer = null;
+            try {
+                controlServer = new java.net.ServerSocket();
+                controlServer.setReuseAddress(true);
+                controlServer.bind(new java.net.InetSocketAddress(controlPort));
+                Ln.i("Control daemon listening on port " + controlPort);
+
+                while (true) {
+                    java.net.Socket controlSocket = null;
+                    try {
+                        Ln.i("Waiting for control client on port " + controlPort + "...");
+                        controlSocket = controlServer.accept();
+                        controlSocket.setTcpNoDelay(true);
+                        controlSocket.getOutputStream().write(new byte[]{(byte) 0xAB});
+                        controlSocket.getOutputStream().flush();
+                        Ln.i("Control client connected from " + controlSocket.getRemoteSocketAddress());
+
+                        runControlStream(controlSocket, options, cleanUp);
+
+                        Ln.i("Control stream ended, accepting next connection...");
+                    } catch (Exception e) {
+                        Ln.e("Control daemon stream error: " + e.getMessage(), e);
+                        if (controlSocket != null) {
+                            try { controlSocket.close(); } catch (IOException ignored) {}
+                        }
+                        try { Thread.sleep(500); } catch (InterruptedException ignored) {}
+                    }
+                }
+            } catch (IOException e) {
+                Ln.e("Control daemon bind failed: " + e.getMessage(), e);
+            } finally {
+                if (controlServer != null) {
+                    try { controlServer.close(); } catch (IOException ignored) {}
+                }
+            }
+        }, "control-daemon");
+        thread.setDaemon(true);
+        thread.start();
+        return thread;
+    }
+
+    /**
+     * Run a single screen stream session: capture device display via SurfaceFlinger,
+     * encode with MediaCodec H.264, stream to client socket via WifiStreamer.
+     */
+    private static void runScreenStream(java.net.Socket socket, Options options) throws Exception {
+        OutputStream outputStream = socket.getOutputStream();
+
+        // Pass null for VirtualDisplayListener — screen works standalone without controller
+        ScreenCapture screenCapture = new ScreenCapture(null, options);
+        WifiStreamer streamer = new WifiStreamer(
+                outputStream, options.getVideoCodec(), StreamId.SCREEN,
+                options.getSendStreamMeta(), options.getSendFrameMeta());
+        WifiSurfaceEncoder encoder = new WifiSurfaceEncoder(
+                screenCapture, streamer, options);
+
+        Completion completion = new Completion(1, true);
+        encoder.start((fatalError) -> completion.addCompleted(fatalError));
+        encoder.join();
+
+        screenCapture.stop();
+        Ln.i("Screen stream completed");
+    }
+
+    /**
+     * Run a single control stream session: read control messages from the TCP socket,
+     * inject events via Controller.
+     */
+    private static void runControlStream(java.net.Socket socket, Options options, CleanUp cleanUp) throws Exception {
+        InputStream inputStream = socket.getInputStream();
+        OutputStream outputStream = socket.getOutputStream();
+
+        ControlChannel controlChannel = new ControlChannel(inputStream, outputStream);
+        Controller controller = new Controller(controlChannel, cleanUp, options);
+
+        Completion completion = new Completion(1, true);
+        controller.start((fatalError) -> completion.addCompleted(fatalError));
+
+        try {
+            controller.join();
+        } finally {
+            // Close the socket to stop the client
+            try { socket.close(); } catch (IOException ignored) {}
         }
     }
 }

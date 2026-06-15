@@ -160,6 +160,11 @@ func (ws *WebServer) Stop() error {
 func (ws *WebServer) GetController() *ServerController {
 	return ws.controller
 }
+
+// Hub returns the WebSocket hub for broadcasting messages
+func (ws *WebServer) Hub() *Hub {
+	return ws.hub
+}
 func (ws *WebServer) handleIndex(w http.ResponseWriter, r *http.Request) {
 	// Try multiple paths for flexibility
 	paths := []string{
