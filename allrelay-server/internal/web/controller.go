@@ -507,7 +507,10 @@ func (sc *ServerController) startScreenStreamLocked() {
 			return
 		}
 		hub.OnControl = func(data []byte) {
-			if _, err := controlConn.Write(append(data, '\n')); err != nil {
+			if len(data) == 0 {
+				return
+			}
+			if _, err := controlConn.Write(data); err != nil {
 				slog.Debug("Control write error", "error", err)
 			}
 		}
@@ -1092,8 +1095,16 @@ func runScreenCapture(ctx context.Context, reader io.Reader, hub *Hub,
 	lastByteCount := uint64(0)
 
 	demuxer.RegisterHandler(protocol.StreamScreen, func(header *protocol.Header, payload []byte) error {
-		// Skip zero-payload packets (session meta)
+		// Session meta (size/orientation change) has zero payload.
+		// Forward it to the browser so the popup can resize/reset the decoder
+		// before frames for the new orientation arrive.
 		if len(payload) == 0 {
+			if header.SessionWidth > 0 && header.SessionHeight > 0 {
+				hub.BroadcastEvent("screen_session", map[string]uint32{
+					"width":  header.SessionWidth,
+					"height": header.SessionHeight,
+				})
+			}
 			return nil
 		}
 

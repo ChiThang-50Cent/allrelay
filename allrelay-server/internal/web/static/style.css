@@ -708,55 +708,47 @@ body[data-page="remote"] .screen-canvas {
     border-radius: var(--radius-sm);
 }
 
-.remote-shell {
-    min-height: 100vh;
-    display: flex;
-    flex-direction: column;
+body[data-page="remote"] {
+    background: #000;
+    overflow: hidden;
 }
 
-.remote-header {
-    position: sticky;
+.remote-popup-shell {
+    width: 100vw;
+    height: 100vh;
+    background: #000;
 }
 
-.remote-header-actions {
+.remote-popup-screen {
+    position: relative;
+    width: 100vw;
+    height: 100vh;
+    background: #000;
     display: flex;
     align-items: center;
-    gap: var(--space-1);
+    justify-content: center;
+    overflow: hidden;
 }
 
-.remote-main {
-    flex: 1;
-    max-width: 1600px;
-    width: 100%;
-    margin: 0 auto;
-    padding: var(--space-3);
-    display: grid;
-    grid-template-columns: 1fr;
-    gap: var(--space-3);
+body[data-page="remote"] .screen-canvas.active {
+    display: block;
+    width: 100vw;
+    height: 100vh;
+    object-fit: contain;
 }
 
-.remote-controls-panel .panel-body {
-    padding-top: var(--space-2);
+.remote-popup-placeholder {
+    text-align: center;
 }
 
-.remote-meta-row {
-    display: flex;
-    gap: var(--space-2);
-}
-
-.compact-status-card {
-    min-width: 280px;
-    text-align: left;
-}
-
-.remote-status-value {
-    font-size: var(--font-size-lg);
-}
-
-.remote-screen-panel {
-    min-height: calc(100vh - 220px);
-}
-
-.remote-screen-body {
-    min-height: calc(100vh - 340px);
+.remote-popup-fps {
+    position: absolute;
+    top: 8px;
+    right: 8px;
+    font-size: 11px;
+    color: #86efac;
+    background: rgba(0, 0, 0, 0.45);
+    padding: 2px 6px;
+    border-radius: 6px;
+    pointer-events: none;
 }

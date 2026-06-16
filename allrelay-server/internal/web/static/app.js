@@ -35,6 +35,10 @@ const state = {
     remotePopupCloseHandled: false,
 };
 
+let screenConfigKey = '';
+let screenPendingSessionSize = null;
+let screenLastPopupFitKey = '';
+
 // DOM Elements
 const elements = {};
 
@@ -189,6 +193,10 @@ function handleWebSocketMessage(msg) {
         case 'control_ack':
             // Control message acknowledged
             break;
+
+        case 'screen_session':
+            handleScreenSession(msg.data);
+            break;
             
         default:
             console.log('Unknown WebSocket message type:', msg.type);
@@ -215,6 +223,9 @@ function updateStreamFromWS(streamData) {
         // Show/hide screen viewer
         if (stream.name === 'screen') {
             showScreenViewer(stream.active && state.connected);
+            if (!stream.active) {
+                screenPendingSessionSize = null;
+            }
             maybeApplyRemoteMode();
         }
     }
@@ -825,6 +836,7 @@ function initScreenViewer() {
     screenCanvasEl = document.getElementById('screenCanvas');
     if (!screenCanvasEl) return;
     screenCtx = screenCanvasEl.getContext('2d');
+    window.addEventListener('resize', () => fitPopupToVideo(screenVideoSize.width, screenVideoSize.height, false));
 
     if (pageMode !== 'remote') {
         return;
@@ -930,6 +942,7 @@ function ensureScreenDecoder() {
             }
             screenVideoSize.width = frame.displayWidth;
             screenVideoSize.height = frame.displayHeight;
+            fitPopupToVideo(frame.displayWidth, frame.displayHeight);
 
             screenCtx.drawImage(frame, 0, 0);
             frame.close();
@@ -954,8 +967,7 @@ function ensureScreenDecoder() {
     return screenDecoder;
 }
 
-function configureScreenDecoderFromConfig() {
-    if (screenConfigured) return true;
+function configureScreenDecoderFromConfig(force = false) {
     if (!screenConfig.sps.length || !screenConfig.pps.length) return false;
 
     const sps = screenConfig.sps[0];
@@ -964,6 +976,13 @@ function configureScreenDecoderFromConfig() {
 
     const codec = `avc1.${toHex2(sps[1])}${toHex2(sps[2])}${toHex2(sps[3])}`;
     const description = buildAvcC(screenConfig.sps, screenConfig.pps);
+    const nextKey = `${codec}:${bytesToHex(description)}`;
+
+    if (screenConfigured && !force && screenConfigKey === nextKey) {
+        return true;
+    }
+
+    resetScreenDecoderForReconfigure();
     const decoder = ensureScreenDecoder();
     decoder.configure({
         codec,
@@ -971,7 +990,8 @@ function configureScreenDecoderFromConfig() {
         optimizeForLatency: true,
     });
     screenConfigured = true;
-    console.log('Screen decoder configured', { codec, sps: screenConfig.sps.length, pps: screenConfig.pps.length });
+    screenConfigKey = nextKey;
+    console.log('Screen decoder configured', { codec, sps: screenConfig.sps.length, pps: screenConfig.pps.length, force });
     return true;
 }
 
@@ -981,7 +1001,10 @@ function destroyScreenDecoder() {
         screenDecoder = null;
     }
     screenConfigured = false;
+    screenConfigKey = '';
     screenConfig = { sps: [], pps: [] };
+    screenPendingSessionSize = null;
+    screenLastPopupFitKey = '';
     screenVideoSize = { width: 0, height: 0 };
     screenPointerDown = false;
     screenFrameCount = 0;
@@ -991,7 +1014,8 @@ function destroyScreenDecoder() {
     }
     const placeholder = document.getElementById('screenPlaceholder');
     if (placeholder) placeholder.classList.remove('hidden');
-    document.getElementById('screenFPS').textContent = '';
+    const fpsEl = document.getElementById('screenFPS');
+    if (fpsEl) fpsEl.textContent = '';
 }
 
 // Handle binary WebSocket frames for screen.
@@ -1009,9 +1033,9 @@ function handleBinaryFrame(data) {
         const nalUnits = extractAnnexBNALUnits(payload);
         if (!nalUnits.length) return;
 
-        collectScreenConfig(nalUnits);
-        if (!screenConfigured) {
-            configureScreenDecoderFromConfig();
+        const configChanged = collectScreenConfig(nalUnits);
+        if (!screenConfigured || configChanged || isConfig) {
+            configureScreenDecoderFromConfig(configChanged || isConfig);
         }
 
         if (isConfig) {
@@ -1032,6 +1056,7 @@ function handleBinaryFrame(data) {
         }));
     } catch (err) {
         console.error('Screen decode error:', err);
+        resetScreenDecoderForReconfigure();
     }
 }
 
@@ -1087,19 +1112,34 @@ function annexBAccessUnitToAVCC(data) {
 }
 
 function collectScreenConfig(nalUnits) {
+    const next = { sps: [], pps: [] };
     for (const nal of nalUnits) {
         if (!nal.length) continue;
         const nalType = nal[0] & 0x1F;
         if (nalType === 7) {
-            if (!screenConfig.sps.some(existing => byteArrayEquals(existing, nal))) {
-                screenConfig.sps.push(nal);
-            }
+            next.sps.push(nal);
         } else if (nalType === 8) {
-            if (!screenConfig.pps.some(existing => byteArrayEquals(existing, nal))) {
-                screenConfig.pps.push(nal);
-            }
+            next.pps.push(nal);
         }
     }
+
+    if (!next.sps.length && !next.pps.length) {
+        return false;
+    }
+
+    const nextKey = `${next.sps.map(bytesToHex).join('|')}::${next.pps.map(bytesToHex).join('|')}`;
+    const currentKey = `${screenConfig.sps.map(bytesToHex).join('|')}::${screenConfig.pps.map(bytesToHex).join('|')}`;
+    if (nextKey === currentKey) {
+        return false;
+    }
+
+    if (next.sps.length) {
+        screenConfig.sps = next.sps;
+    }
+    if (next.pps.length) {
+        screenConfig.pps = next.pps;
+    }
+    return true;
 }
 
 function containsIDR(nalUnits) {
@@ -1139,6 +1179,63 @@ function byteArrayEquals(a, b) {
         if (a[i] !== b[i]) return false;
     }
     return true;
+}
+
+function bytesToHex(data) {
+    return Array.from(data, b => b.toString(16).padStart(2, '0')).join('');
+}
+
+function resetScreenDecoderForReconfigure() {
+    if (screenDecoder) {
+        try { screenDecoder.close(); } catch (e) {}
+        screenDecoder = null;
+    }
+    screenConfigured = false;
+}
+
+function handleScreenSession(data) {
+    if (!data) return;
+    const width = Number(data.width || 0);
+    const height = Number(data.height || 0);
+    if (!width || !height) return;
+
+    screenPendingSessionSize = { width, height };
+    screenVideoSize.width = width;
+    screenVideoSize.height = height;
+    fitPopupToVideo(width, height);
+
+    // Rotation/resolution change creates a brand-new encoder session on Android.
+    // Drop both decoder state and codec config so we wait for fresh SPS/PPS.
+    screenConfig = { sps: [], pps: [] };
+    screenConfigKey = '';
+    resetScreenDecoderForReconfigure();
+}
+
+function fitPopupToVideo(width, height, allowWindowResize = true) {
+    if (pageMode !== 'remote' || !width || !height) return;
+    const fitKey = `${width}x${height}`;
+    if (screenLastPopupFitKey === fitKey && !allowWindowResize) {
+        return;
+    }
+    screenLastPopupFitKey = fitKey;
+
+    if (!screenCanvasEl) return;
+
+    const availWidth = Math.max(360, window.screen.availWidth - 48);
+    const availHeight = Math.max(480, window.screen.availHeight - 48);
+    const scale = Math.min(availWidth / width, availHeight / height, 1.75);
+    const targetInnerWidth = Math.max(240, Math.round(width * scale));
+    const targetInnerHeight = Math.max(320, Math.round(height * scale));
+
+    if (allowWindowResize && typeof window.resizeTo === 'function') {
+        const chromeWidth = Math.max(0, window.outerWidth - window.innerWidth);
+        const chromeHeight = Math.max(0, window.outerHeight - window.innerHeight);
+        try {
+            window.resizeTo(targetInnerWidth + chromeWidth, targetInnerHeight + chromeHeight);
+        } catch (e) {
+            // ignore popup resize failures
+        }
+    }
 }
 
 const SCRCPY_CONTROL_TYPE_KEYCODE = 0;
