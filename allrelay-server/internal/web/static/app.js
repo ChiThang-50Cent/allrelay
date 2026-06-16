@@ -31,6 +31,8 @@ const state = {
     wsReconnectTimer: null,
     remotePowerOffAutoTried: false,
     remotePowerOffSent: false,
+    remotePopup: null,
+    remotePopupCloseHandled: false,
 };
 
 // DOM Elements
@@ -113,6 +115,10 @@ function init() {
 
     // Poll for status updates (fallback if WebSocket fails)
     setInterval(loadStatus, 10000);
+
+    if (pageMode === 'dashboard') {
+        setInterval(checkRemotePopupLifecycle, 1000);
+    }
 }
 
 // ============================================
@@ -330,6 +336,16 @@ async function handleScan() {
 }
 
 async function handleToggleStream(streamName, active) {
+    let popupOpened = false;
+    if (pageMode === 'dashboard' && streamName === 'screen' && active) {
+        popupOpened = openRemotePopup();
+        if (!popupOpened) {
+            showError('Popup blocked. Please allow popups for AllRelay.');
+            renderStreams();
+            return;
+        }
+    }
+
     try {
         await apiCall(API.toggleStream, 'POST', { stream: streamName, active });
         
@@ -338,12 +354,24 @@ async function handleToggleStream(streamName, active) {
         if (stream) {
             stream.active = active;
         }
+
+        if (streamName === 'screen') {
+            if (!active) {
+                closeRemotePopup();
+            } else if (pageMode === 'dashboard') {
+                focusRemotePopup();
+            }
+        }
         
         renderStreams();
         updateStatusDisplay();
+        updateRemoteUI();
         
         showSuccess(`${streamName} ${active ? 'enabled' : 'disabled'}`);
     } catch (error) {
+        if (popupOpened) {
+            closeRemotePopup();
+        }
         showError(`Failed to toggle ${streamName}`);
         // Revert UI on error
         renderStreams();
@@ -376,7 +404,7 @@ function renderStreams() {
                 </label>
             </div>
             <div class="stream-name">${stream.name.charAt(0).toUpperCase() + stream.name.slice(1)}</div>
-            <div class="stream-port">Port ${stream.port}</div>
+            <div class="stream-port">${stream.name === 'screen' ? 'Opens popup remote window' : `Port ${stream.port}`}</div>
             ${stream.active ? renderStreamMetrics(stream) : ''}
         </div>
     `).join('');
@@ -480,6 +508,7 @@ function updateConnectionStatus(status) {
         if (!state.connected) {
             state.remotePowerOffAutoTried = false;
             state.remotePowerOffSent = false;
+            closeRemotePopup();
         }
         updateConnectionUI();
     }
@@ -496,6 +525,13 @@ function updateConnectionStatus(status) {
 
     const screen = getStream('screen');
     showScreenViewer(Boolean(screen?.active && state.connected));
+    if (pageMode === 'dashboard') {
+        if (screen?.active) {
+            focusRemotePopup();
+        } else {
+            closeRemotePopup();
+        }
+    }
     updateStatusDisplay();
     updateRemoteUI();
     maybeApplyRemoteMode();
@@ -539,6 +575,71 @@ function getStream(name) {
     return state.streams.find(stream => stream.name === name) || null;
 }
 
+function openRemotePopup() {
+    if (pageMode !== 'dashboard') return false;
+    if (state.remotePopup && !state.remotePopup.closed) {
+        focusRemotePopup();
+        return true;
+    }
+
+    const width = 430;
+    const height = 920;
+    const left = Math.max(0, Math.round((window.screen.width - width) / 2));
+    const top = Math.max(0, Math.round((window.screen.height - height) / 2));
+    const features = [
+        'popup=yes',
+        'noopener=no',
+        'resizable=yes',
+        'scrollbars=no',
+        'toolbar=no',
+        'menubar=no',
+        'location=no',
+        'status=no',
+        `width=${width}`,
+        `height=${height}`,
+        `left=${left}`,
+        `top=${top}`,
+    ].join(',');
+
+    state.remotePopup = window.open('/remote', 'allrelay-remote', features);
+    state.remotePopupCloseHandled = false;
+    if (!state.remotePopup) {
+        return false;
+    }
+    focusRemotePopup();
+    return true;
+}
+
+function focusRemotePopup() {
+    if (state.remotePopup && !state.remotePopup.closed) {
+        state.remotePopup.focus();
+    }
+}
+
+function closeRemotePopup() {
+    if (state.remotePopup && !state.remotePopup.closed) {
+        state.remotePopup.close();
+    }
+    state.remotePopup = null;
+    state.remotePopupCloseHandled = false;
+}
+
+function checkRemotePopupLifecycle() {
+    if (pageMode !== 'dashboard') return;
+    const screen = getStream('screen');
+    if (!state.remotePopup || !state.remotePopup.closed) {
+        if (!screen?.active) {
+            state.remotePopupCloseHandled = false;
+        }
+        return;
+    }
+    state.remotePopup = null;
+    if (screen?.active && !state.remotePopupCloseHandled) {
+        state.remotePopupCloseHandled = true;
+        handleToggleStream('screen', false);
+    }
+}
+
 function updateRemoteUI() {
     if (pageMode !== 'remote') return;
     const screen = getStream('screen');
@@ -578,7 +679,11 @@ async function toggleRemoteScreen() {
         showError('Connect from the dashboard first');
         return;
     }
-    await handleToggleStream('screen', !screen.active);
+    const nextActive = !screen.active;
+    await handleToggleStream('screen', nextActive);
+    if (!nextActive) {
+        window.close();
+    }
 }
 
 function maybeApplyRemoteMode() {
@@ -613,9 +718,18 @@ function wakeRemotePhoneScreen() {
 
 function restoreRemotePhoneScreen() {
     if (pageMode !== 'remote') return;
-    if (!state.ws || state.ws.readyState !== WebSocket.OPEN) return;
-    if (!state.remotePowerOffAutoTried && !state.remotePowerOffSent) return;
-    sendControlPacket(buildSetDisplayPowerControlMessage(true), { force: true, wake: true });
+    const screen = getStream('screen');
+    if (state.ws && state.ws.readyState === WebSocket.OPEN && (state.remotePowerOffAutoTried || state.remotePowerOffSent)) {
+        sendControlPacket(buildSetDisplayPowerControlMessage(true), { force: true, wake: true });
+    }
+    if (screen?.active) {
+        fetch(API.toggleStream, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ stream: 'screen', active: false }),
+            keepalive: true,
+        }).catch(() => {});
+    }
 }
 
 // ============================================
@@ -1135,13 +1249,9 @@ function mapBrowserKeyToAndroid(e) {
 }
 
 function showScreenViewer(show) {
-    screenActive = show;
-    const panel = document.getElementById('screenPanel');
-    if (panel && pageMode === 'dashboard') {
-        panel.style.display = show ? '' : 'none';
-    }
+    screenActive = pageMode === 'remote' && !!screenCanvasEl && !!screenCtx ? show : false;
     if (show && pageMode === 'remote' && screenCanvasEl) {
         screenCanvasEl.focus();
     }
-    if (!show) destroyScreenDecoder();
+    if (!screenActive) destroyScreenDecoder();
 }
