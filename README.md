@@ -18,8 +18,8 @@ AllRelay streams media directly over Wi‑Fi between Android and Ubuntu, with a 
 ### Android
 - Forked scrcpy server running as a root daemon
 - Can be launched by:
-  - **Magisk module** (persistent boot flow)
-  - **AllRelay Android app** (one-tap daemon control)
+  - **AllRelay Android app** (recommended — one-tap daemon control)
+  - **Magisk module** (auto-starts at boot; does NOT self-restart when killed)
   - **ADB** (manual testing)
 - Streams:
   - `:5000` screen
@@ -84,7 +84,13 @@ systemctl --user enable --now allrelay
 
 ### Android
 
-#### Option 1: Magisk module
+#### Option 1: AllRelay app (recommended)
+
+Install the APK, open it, and tap **Start** to launch the daemon.
+
+The app is the primary control surface — it can start, stop, and restart the daemon regardless of whether it was originally launched by Magisk or ADB.
+
+#### Option 2: Magisk module
 
 ```bash
 adb push bin/allrelay-magisk.zip /sdcard/
@@ -92,7 +98,9 @@ adb push bin/allrelay-magisk.zip /sdcard/
 
 Flash it from Magisk, then reboot.
 
-#### Option 2: Manual ADB test
+The module auto-starts the daemon once at boot. It does **not** self-restart when the daemon is killed — use the app to control it.
+
+#### Option 3: Manual ADB test
 
 ```bash
 adb push bin/scrcpy-server-allrelay /data/local/tmp/allrelay.jar

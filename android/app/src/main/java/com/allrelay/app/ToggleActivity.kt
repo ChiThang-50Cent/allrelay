@@ -19,6 +19,7 @@ import java.util.concurrent.Executors
 class ToggleActivity : Activity() {
     private val executor = Executors.newSingleThreadExecutor()
     private val mainHandler = Handler(Looper.getMainLooper())
+    private var isTransitioning = false
 
     private lateinit var statusText: TextView
     private lateinit var ipText: TextView
@@ -220,6 +221,9 @@ class ToggleActivity : Activity() {
     }
 
     private fun refreshStatus(showBusy: Boolean = true) {
+        if (isTransitioning) {
+            return
+        }
         if (showBusy) {
             statusText.text = "Status: Refreshing..."
         }
@@ -227,6 +231,7 @@ class ToggleActivity : Activity() {
             val rooted = RootDaemonManager.hasRoot()
             val status = RootDaemonManager.status(currentConfig())
             mainHandler.post {
+                if (isTransitioning) return@post
                 rootText.text = "Root: ${if (rooted) "OK" else "Unavailable"}"
                 renderStatus(status)
             }
@@ -234,6 +239,7 @@ class ToggleActivity : Activity() {
     }
 
     private fun runAction(busyText: String, action: () -> RootDaemonManager.Status) {
+        isTransitioning = true
         statusText.text = "Status: $busyText"
         setButtonsEnabled(false)
         executor.execute {
@@ -249,6 +255,7 @@ class ToggleActivity : Activity() {
                 )
             }
             mainHandler.post {
+                isTransitioning = false
                 renderStatus(result)
                 setButtonsEnabled(true)
             }

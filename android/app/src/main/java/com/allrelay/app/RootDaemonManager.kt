@@ -1,6 +1,7 @@
 package com.allrelay.app
 
 import android.content.Context
+import android.util.Log
 import java.io.File
 import java.util.concurrent.TimeUnit
 
@@ -52,26 +53,78 @@ object RootDaemonManager {
     }
 
     fun start(context: Context, config: Config): Status {
+        Log.d("AllRelay", "start() called config=$config")
         config.validate()
-        val jarPath = resolveJarPath(context)
-        val command = buildString {
-            appendLine("pkill -9 -f '$PROCESS_PATTERN' >/dev/null 2>&1 || true")
-            appendLine("rm -f '$ROOT_LOG_PATH'")
-            append("nohup sh -c 'CLASSPATH=$jarPath exec app_process / com.genymobile.scrcpy.Server 4.0")
-            append(" log_level=info")
-            append(" video=${config.screen}")
-            append(" audio=${config.mic}")
-            append(" audio_source=mic")
-            append(" wifi_mode=true")
-            append(" wifi_port=5000")
-            append(" speaker_enabled=${config.speaker}")
-            append(" camera_enabled=${config.camera}")
-            append(" daemon=true")
-            append(" control=${config.screen}")
-            append("' >'$ROOT_LOG_PATH' 2>&1 </dev/null &")
+
+        val existing = status(config)
+        Log.d("AllRelay", "existing status=$existing")
+        if (existing.running && existing.ports.containsAll(config.expectedPorts())) {
+            Log.d("AllRelay", "Daemon already running, skipping start")
+            return existing.copy(message = "Daemon already running")
         }
 
-        val result = runSu(command, timeoutSeconds = 15)
+        val jarPath = resolveJarPath(context)
+        Log.d("AllRelay", "jarPath=$jarPath")
+
+        val startScript = "/data/local/tmp/allrelay-start.sh"
+        val script = """
+#!/system/bin/sh
+# Kill existing instances
+pkill -9 -f 'app_process.*com.genymobile.scrcpy.Server' >/dev/null 2>&1 || true
+pkill -9 -f 'app_process.*Server' >/dev/null 2>&1 || true
+pkill -9 -f 'CLASSPATH.*scrcpy' >/dev/null 2>&1 || true
+sleep 2
+
+# Verify ports released
+if [ "\$(ss -tln 2>/dev/null | grep -E ':5000|:5001|:5002|:5003|:5004' | wc -l)" -gt 0 ]; then
+  echo 'WARNING: ports still in use after kill' >> '$ROOT_LOG_PATH'
+  fuser -k 5000/tcp 5001/tcp 5002/tcp 5003/tcp 5004/tcp 2>/dev/null || true
+fi
+
+rm -f '$ROOT_LOG_PATH'
+
+# Start daemon
+CLASSPATH=$jarPath exec app_process / com.genymobile.scrcpy.Server \
+  4.0 \
+  log_level=info \
+  video=${config.screen} \
+  audio=${config.mic} \
+  audio_source=mic \
+  wifi_mode=true \
+  wifi_port=5000 \
+  speaker_enabled=${config.speaker} \
+  camera_enabled=${config.camera} \
+  daemon=true \
+  control=${config.screen} \
+  > '$ROOT_LOG_PATH' 2>&1 &
+""".trimIndent()
+
+        // Write script via stdin to avoid quoting issues
+        try {
+            val writeProcess = ProcessBuilder("su").start()
+            writeProcess.outputStream.bufferedWriter().use { writer ->
+                writer.write("cat > '$startScript' << 'EOF'")
+                writer.newLine()
+                writer.write(script)
+                writer.newLine()
+                writer.write("EOF")
+                writer.newLine()
+                writer.write("chmod 755 '$startScript'")
+                writer.newLine()
+            }
+            val writeFinished = writeProcess.waitFor(10, TimeUnit.SECONDS)
+            if (!writeFinished) {
+                writeProcess.destroyForcibly()
+                Log.e("AllRelay", "Write script timed out")
+            } else {
+                Log.d("AllRelay", "Write script exit=${writeProcess.exitValue()}")
+            }
+        } catch (e: Exception) {
+            Log.e("AllRelay", "Write script failed: $e")
+        }
+
+        val result = runSu("sh '$startScript'", timeoutSeconds = 15)
+        Log.d("AllRelay", "start result exit=${result.exitCode} stdout='${result.stdout}' stderr='${result.stderr}'")
         if (result.exitCode != 0) {
             return Status(
                 running = false,
@@ -85,6 +138,7 @@ object RootDaemonManager {
         repeat(10) {
             Thread.sleep(1000)
             val status = status(config)
+            Log.d("AllRelay", "health check $it: $status")
             if (status.running && status.ports.containsAll(config.expectedPorts())) {
                 return status.copy(message = "Daemon running")
             }
@@ -107,34 +161,22 @@ object RootDaemonManager {
     }
 
     fun status(config: Config? = null): Status {
-        val result = runSu(
-            """
-            PID="$(ps -A -o PID,PPID,NAME,ARGS | grep '$PROCESS_PATTERN' | grep -v grep | awk 'NR==1 {print \$1}')"
-            if [ -z "${'$'}PID" ]; then
-              PID="$(for f in /proc/[0-9]*/cmdline; do tr '\000' ' ' < "${'$'}f" 2>/dev/null | grep -q '$PROCESS_PATTERN' && basename "$(dirname "${'$'}f")" && break; done)"
-            fi
-            if [ -n "${'$'}PID" ]; then
-              echo "RUNNING:${'$'}PID"
-            else
-              echo "STOPPED"
-            fi
-            ss -tln 2>/dev/null | awk 'NR>1 {print ${'$'}4}' | sed 's/.*://' | sort -u | while read -r p; do
-              [ -n "${'$'}p" ] && echo "PORT:${'$'}p"
-            done
-            """.trimIndent(),
-            timeoutSeconds = 10,
+        val pidResult = runSu(
+            "ps -A -o PID,ARGS | grep -E 'app_process.*com.genymobile.scrcpy.Server' | grep -v grep | awk 'NR==1{print \$1}'",
+            timeoutSeconds = 5
         )
-
-        val pid = result.stdout.lineSequence()
-            .firstOrNull { it.startsWith("RUNNING:") }
-            ?.substringAfter(':')
-            ?.trim()
-            ?.takeIf { it.isNotEmpty() }
+        val pid = pidResult.stdout.trim().takeIf { it.isNotEmpty() }
         val running = pid != null
-        val ports = result.stdout.lineSequence()
+
+        val portsResult = runSu(
+            "for p in 5000 5001 5002 5003 5004; do ss -tln 2>/dev/null | grep -q \":\$p\" && echo PORT:\$p; done",
+            timeoutSeconds = 5
+        )
+        val ports = portsResult.stdout.lineSequence()
             .filter { it.startsWith("PORT:") }
-            .mapNotNull { it.substringAfter(':').trim().toIntOrNull() }
+            .mapNotNull { it.substringAfter(":").trim().toIntOrNull() }
             .toSet()
+
         val expected = config?.expectedPorts().orEmpty()
         val hasDaemonPorts = ports.intersect(setOf(5000, 5001, 5002, 5003, 5004)).isNotEmpty()
         val message = when {
@@ -157,11 +199,16 @@ object RootDaemonManager {
     }
 
     private fun resolveJarPath(context: Context): String {
-        copyBundledJarIfPresent(context)?.let { return it }
+        copyBundledJarIfPresent(context)?.let {
+            Log.d("AllRelay", "resolveJarPath: using bundled jar at $it")
+            return it
+        }
         if (fileExistsViaRoot(MAGISK_JAR)) {
+            Log.d("AllRelay", "resolveJarPath: using magisk jar at $MAGISK_JAR")
             return MAGISK_JAR
         }
         if (fileExistsViaRoot(LOCAL_TMP_JAR)) {
+            Log.d("AllRelay", "resolveJarPath: using tmp jar at $LOCAL_TMP_JAR")
             return LOCAL_TMP_JAR
         }
         error("No bundled allrelay.jar found. Install app with bundled server or keep Magisk module installed.")
@@ -177,9 +224,11 @@ object RootDaemonManager {
                 val outFile = File(dir, SERVER_ASSET_NAME)
                 input.copyTo(outFile.outputStream())
                 outFile.setReadable(true, false)
+                Log.d("AllRelay", "copyBundledJarIfPresent: copied to ${outFile.absolutePath}")
                 outFile.absolutePath
             }
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            Log.d("AllRelay", "copyBundledJarIfPresent: failed $e")
             null
         }
     }
@@ -195,14 +244,19 @@ object RootDaemonManager {
         return if (text.isBlank()) "<no log yet>" else text
     }
 
-    private fun runSu(command: String, timeoutSeconds: Long): CommandResult {
+    private fun runSu(command: String, timeoutSeconds: Long, useStdin: Boolean = false): CommandResult {
         return try {
-            val process = ProcessBuilder("su").start()
-            process.outputStream.bufferedWriter().use { writer ->
-                writer.write(command)
-                writer.newLine()
-                writer.write("exit")
-                writer.newLine()
+            val process = if (useStdin) {
+                ProcessBuilder("su").start().apply {
+                    outputStream.bufferedWriter().use { writer ->
+                        writer.write(command)
+                        writer.newLine()
+                        writer.write("exit")
+                        writer.newLine()
+                    }
+                }
+            } else {
+                ProcessBuilder("su", "-c", command).start()
             }
 
             val finished = process.waitFor(timeoutSeconds, TimeUnit.SECONDS)
@@ -213,8 +267,10 @@ object RootDaemonManager {
 
             val stdout = process.inputStream.bufferedReader().readText()
             val stderr = process.errorStream.bufferedReader().readText()
+            Log.d("AllRelay", "runSu cmd='$command' exit=${process.exitValue()} stdout='$stdout' stderr='$stderr'")
             CommandResult(process.exitValue(), stdout, stderr)
         } catch (e: Exception) {
+            Log.e("AllRelay", "runSu exception: $e")
             CommandResult(-1, "", e.message ?: e.javaClass.simpleName)
         }
     }

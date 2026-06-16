@@ -125,13 +125,10 @@ update_heartbeat() {
     date +%s > "$HEARTBEAT_FILE"
 }
 
-# ─── Monitor loop — restart if process dies ──────────────────────
-# With daemon=true, the Java server handles stream reconnections
-# internally. We only restart if the entire process crashes.
+# ─── Monitor loop — log when daemon dies, but do NOT restart
+# Restart control is delegated to the AllRelay app (ToggleActivity).
+# Magisk service only auto-starts at boot time.
 monitor_loop() {
-    local max_restarts=10
-    local restart_count=0
-    
     while true; do
         local pid
         if [ -f "$PID_FILE" ]; then
@@ -143,17 +140,10 @@ monitor_loop() {
             fi
         fi
         
-        # Server died — restart with backoff
-        restart_count=$((restart_count + 1))
-        
-        if [ $restart_count -gt $max_restarts ]; then
-            log "ERROR: Max restarts ($max_restarts) exceeded. Giving up."
-            return 1
-        fi
-        
-        log "Server crashed! Restarting (attempt $restart_count/$max_restarts)..."
-        sleep 5
-        start_server
+        # Server died — log and exit, do NOT restart
+        log "Server stopped (not restarting — use AllRelay app to control)"
+        rm -f "$PID_FILE"
+        return 0
     done
 }
 

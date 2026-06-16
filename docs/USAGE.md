@@ -15,7 +15,17 @@ Outputs:
 
 ## Android (Phone)
 
-### Option 1: Magisk module
+### Option 1: AllRelay app (recommended)
+
+Install the APK, open it, and tap **Start**. The app launches the daemon with your chosen stream toggles.
+
+- **Start** — launches the daemon if not running
+- **Stop** — kills the daemon (works even if it was started by Magisk or ADB)
+- **Restart** — stop then start
+
+The app is the master control. If you use both the app and Magisk, the app takes precedence.
+
+### Option 2: Magisk module
 
 ```bash
 adb push bin/allrelay-magisk.zip /sdcard/
@@ -23,9 +33,11 @@ adb push bin/allrelay-magisk.zip /sdcard/
 
 Then open **Magisk → Modules → Install from storage**, choose `allrelay-magisk.zip`, and reboot.
 
-After reboot, the daemon can keep the AllRelay ports available in the background.
+The module auto-starts the daemon **once** at boot. It does **not** self-restart when killed — use the app to restart it.
 
-### Option 2: Manual ADB run for testing
+> **Tip:** Even if you use Magisk, install the AllRelay app so you can stop/start the daemon manually.
+
+### Option 3: Manual ADB run for testing
 
 ```bash
 adb push bin/scrcpy-server-allrelay /data/local/tmp/allrelay.jar
