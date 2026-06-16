@@ -6,7 +6,7 @@
 #   1. Waits for Wi-Fi to be connected
 #   2. Hides recording indicators (privacy green dot)
 #   3. Starts the AllRelay Java server as a background daemon
-#   4. Sets up mDNS advertising
+#   4. Starts discovery responders (UDP fallback; mDNS best-effort)
 #   5. Monitors and restarts if crashed
 
 MODDIR=${0%/*}

@@ -1,11 +1,10 @@
-// Package video handles video stream processing using GStreamer pipelines.
+// Package video handles Ubuntu-side video stream processing.
 //
 // Video streams (screen H.264, camera H.264) arrive over TCP from the
-// Android device. This package spawns GStreamer subprocesses to decode
-// and route the video to the appropriate output:
-//
-//	Camera → v4l2loopback (/dev/video10) via v4l2sink
-//	Monitor → SDL2/GL window via glimagesink (Phase 3.2)
+// Android device. This package contains helper subprocess pipelines used for
+// camera/video handling. Historically this was GStreamer-centric, but the
+// current camera path uses ffmpeg while some optional helpers still use
+// GStreamer.
 package video
 
 import (
@@ -19,22 +18,22 @@ import (
 	"time"
 )
 
-// Pipeline manages a GStreamer subprocess that reads H.264 from stdin
+// Pipeline manages a subprocess pipeline that reads H.264 from stdin
 // and renders it to a video output sink.
 //
 // The GStreamer command is executed as a child process. H.264 data is
 // written via the Write() method and piped to the process's stdin.
 // The pipeline runs until Close() is called or the process exits.
 type Pipeline struct {
-	name   string
+	name     string
 	pipeline string
-	cmd    *exec.Cmd
-	stdin  io.WriteCloser
-	done   chan error
-	mu     sync.Mutex
+	cmd      *exec.Cmd
+	stdin    io.WriteCloser
+	done     chan error
+	mu       sync.Mutex
 }
 
-// NewPipeline creates a GStreamer pipeline with the given description.
+// NewPipeline creates a gst-launch-based pipeline with the given description.
 //
 // The pipeline string is passed directly to gst-launch-1.0. H.264 data
 // enters via fdsrc fd=0 (stdin). The caller must ensure the pipeline

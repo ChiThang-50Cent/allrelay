@@ -1,304 +1,148 @@
 # AllRelay
 
-> Turn your rooted Android phone into wireless peripherals for your Ubuntu PC.
+> Turn a rooted Android phone into wireless screen, camera, mic, and speaker for Ubuntu.
 
-AllRelay transforms your Android phone into four wireless peripherals — a **monitor**, **webcam**, **microphone**, and **speaker** — all connected over Wi-Fi with low latency.
+AllRelay streams media directly over Wi‑Fi between Android and Ubuntu, with a web dashboard to discover the phone, connect, and toggle streams independently.
 
-Built as a fork of [scrcpy](https://github.com/Genymobile/scrcpy), AllRelay extends it with multi-stream support, reverse audio, direct Wi-Fi transport, and Magisk root integration for background operation.
+## What it does
 
----
+- **Screen + control**: Android screen in a dedicated browser popup with touch/keyboard control
+- **Camera**: Android camera exposed to Linux apps via `v4l2loopback`
+- **Microphone**: Android mic exposed as a Linux audio input
+- **Speaker**: PC audio played on the phone speaker
+- **Independent toggles**: each stream can be turned on/off without killing the others
+- **Phone discovery from PC**: web UI uses a UDP subnet scan; no phone-initiated session required
 
-## Features
+## Current architecture
 
-| # | Function | Direction | Description |
-|---|----------|-----------|-------------|
-| 1 | **Monitor** | Phone → PC | Screen mirroring with touch/keyboard input |
-| 2 | **Camera** | Phone → PC | Phone camera as virtual webcam (v4l2loopback) |
-| 3 | **Microphone** | Phone → PC | Phone mic as PipeWire audio source |
-| 4 | **Speaker** | PC → Phone | PC system audio through phone speaker |
+### Android
+- Forked scrcpy server running as a root daemon
+- Can be launched by:
+  - **Magisk module** (persistent boot flow)
+  - **AllRelay Android app** (one-tap daemon control)
+  - **ADB** (manual testing)
+- Streams:
+  - `:5000` screen
+  - `:5001` camera
+  - `:5002` mic
+  - `:5003` speaker
+  - `:5004` control
+  - `:5009/udp` discovery responder
 
-- **Independent toggles**: Enable/disable each stream without affecting others
-- **Low latency**: <100ms glass-to-glass for video, <50ms for audio
-- **Wi-Fi Direct**: No USB/ADB needed after initial setup
-- **Auto-start**: Magisk module for silent background operation on boot
-- **Heartbeat monitoring**: Real-time device status (battery, Wi-Fi signal, CPU)
-- **Auto-reconnection**: Exponential backoff on Wi-Fi disconnection
-- **Input injection**: Forward PC keyboard/mouse to phone
-
----
+### Ubuntu
+- `allrelay-server` Go backend
+- Web dashboard on `http://localhost:9090`
+- Browser popup uses **WebSocket + WebCodecs** for screen mirroring
+- Camera uses **ffmpeg → v4l2loopback**
+- Audio integrates with **PipeWire/PulseAudio**
+- Packaged as a **user systemd service** so audio works in the user session
 
 ## Requirements
 
-### Android (Phone)
-- Android 12+ (API 31)
-- **Rooted** with [Magisk](https://github.com/topjohnwu/Magisk) 20.4+
-- ARM64 architecture
-- 5GHz Wi-Fi recommended
+### Android
+- Android 12+
+- Rooted with Magisk
+- ARM64
 
-### Ubuntu (PC)
-- Ubuntu 22.04 LTS or later
-- [PipeWire](https://pipewire.org/) (for audio)
-- [v4l2loopback](https://github.com/umlaeute/v4l2loopback) (for camera)
-- [GStreamer](https://gstreamer.freedesktop.org/) 1.0 (for video display)
-- Go 1.22+ (to build the server)
+### Ubuntu
+- Ubuntu 22.04+
+- PipeWire / pipewire-pulse
+- `v4l2loopback`
+- Go 1.22+ (only if building from source)
 
----
+## Build
 
-## Quick Start
-
-### 1. Build AllRelay
+### Main package build
 
 ```bash
-git clone https://github.com/yourusername/allrelay.git
-cd allrelay
-
-# Build everything (server JAR + Go server + tools)
-./scripts/build.sh all
+./scripts/build-deb.sh
 ```
 
-### 2. Install on Phone (Magisk Module)
+Outputs:
+- `bin/allrelay_0.1.0_amd64.deb`
+- `bin/scrcpy-server-allrelay`
+- `bin/allrelay-magisk.zip`
+
+### Optional helper builds
 
 ```bash
-# Build the Magisk module ZIP
-./scripts/build-magisk.sh
+./scripts/build.sh server   # Android server artifact only
+./scripts/build.sh mdns     # legacy mDNS helper only
+```
 
-# Push to phone
+## Install
+
+### Ubuntu
+
+```bash
+sudo dpkg -i bin/allrelay_0.1.0_amd64.deb
+systemctl --user enable --now allrelay
+```
+
+### Android
+
+#### Option 1: Magisk module
+
+```bash
 adb push bin/allrelay-magisk.zip /sdcard/
-
-# Flash via Magisk Manager, then reboot
 ```
 
-### 3. Install on Ubuntu
+Flash it from Magisk, then reboot.
+
+#### Option 2: Manual ADB test
 
 ```bash
-# System-wide installation (requires sudo)
-sudo ./scripts/install.sh
-
-# Or user-only installation
-./scripts/install.sh --user
-
-# Configure your phone's IP
-sudoedit /etc/allrelay/phone_ip   # system install
-# or edit ~/.config/systemd/user/allrelay.service (user install)
+adb push bin/scrcpy-server-allrelay /data/local/tmp/allrelay.jar
+adb shell "su -c 'CLASSPATH=/data/local/tmp/allrelay.jar app_process / \
+  com.genymobile.scrcpy.Server 4.0 \
+  log_level=info \
+  wifi_mode=true \
+  wifi_port=5000 \
+  video=true \
+  audio=true \
+  audio_source=mic \
+  speaker_enabled=true \
+  camera_enabled=true \
+  daemon=true \
+  control=true \
+  >/data/local/tmp/allrelay-unified.log 2>&1 &'"
 ```
 
-### 4. Start
+## Use
 
-```bash
-# On the PC (systemd auto-start or manual):
-sudo systemctl enable --now allrelay
+1. Open `http://localhost:9090`
+2. Click **Scan** to find the phone via UDP subnet scan
+3. Click **Connect**
+4. Toggle streams independently
+5. Turning on **Screen** opens the dedicated remote popup automatically
 
-# Or just start the server directly:
-allrelay-server --host 192.168.1.100
+## Repository layout
 
-# Discover phone from the web UI via UDP subnet scan:
-# open http://localhost:9090 and click Scan
-# Optional legacy helper:
-allrelay-discover
-```
-
----
-
-## Architecture
-
-```
-┌─────────────────────────┐         ┌──────────────────────────┐
-│     Android Phone       │         │      Ubuntu PC           │
-│                         │         │                          │
-│  Screen ──→ H.264 ──────┼─TCP:5000→│── GStreamer → SDL2      │
-│  Camera ──→ H.264 ──────┼─TCP:5001→│── GStreamer → v4l2     │
-│  Mic ─────→ Opus ───────┼─TCP:5002→│── PipeWire source       │
-│  Speaker ←── Opus ──────┼─TCP:5003─│── PipeWire sink         │
-│  Control ←── JSON ──────┼─TCP:5004─│── Input injection       │
-│  Heartbeat ──→ UDP:5005 ┼─────────→│── Status monitor        │
-└─────────────────────────┘         └──────────────────────────┘
-```
-
-- **Android**: Forked scrcpy Java server (MediaCodec, AAudio, Camera2)
-- **Ubuntu**: Go server (protocol parsing, GStreamer pipelines, PipeWire routing)
-- **Protocol**: 16-byte header per packet (stream_id + PTS + flags + payload_size)
-- **Transport**: TCP with Nagle disabled for low latency
-
----
-
-## Project Structure
-
-```
+```text
 allrelay/
-├── allrelay-server/       # Go server (Ubuntu side)
-│   ├── cmd/
-│   │   ├── allrelay-server/   # Main server binary
-│   │   └── mock-android-server/ # Test tool
-│   └── internal/
-│       ├── control/       # Control protocol & toggles
-│       ├── heartbeat/     # UDP heartbeat monitor
-│       ├── input/         # X11 keyboard/mouse capture
-│       ├── protocol/      # 16-byte packet parser + demuxer
-│       ├── reconnect/     # Auto-reconnection logic
-│       ├── transport/     # TCP connection manager
-│       └── video/         # GStreamer pipelines + v4l2
-├── scrcpy/                # Forked scrcpy (Android + C client)
-│   └── server/src/main/java/com/genymobile/scrcpy/
-├── magisk/                # Magisk module
-│   ├── module.prop
-│   ├── customize.sh
-│   ├── service.sh         # Boot service (starts Java server)
-│   ├── post-fs-data.sh    # AAudio MMAP + SELinux
-│   ├── system/bin/        # Server JAR + daemon wrapper
-│   └── sepolicy/          # SELinux policy
-├── configs/
-│   ├── pipewire/          # PipeWire virtual device configs
-│   └── systemd/           # systemd service unit
-├── scripts/               # Build, install, test scripts
-├── docs/                  # Technical documentation
-├── plans/                 # Project planning & tracking
-└── SPEC.md                # Full technical specification
+├── allrelay-server/   # Go backend + web UI
+├── android/           # Android controller app
+├── scrcpy/            # Forked scrcpy server/client sources
+├── magisk/            # Magisk module
+├── configs/           # PipeWire + systemd configs
+├── scripts/           # Build/install helpers
+└── docs/              # Project notes and protocol docs
 ```
 
----
+## Notes
 
-## CLI Reference
+- The web UI is the primary control surface.
+- Discovery in the dashboard uses **UDP subnet scan**.
+- `allrelay-discover` is only a **legacy optional helper**.
+- Screen/control use the **raw binary scrcpy control protocol**, not JSON.
+- The packaged Linux service is a **user service**, not a system service.
 
-### allrelay-server
+## Related docs
 
-```
-Usage:
-  allrelay-server --host 192.168.1.100 [flags]
-
-Flags:
-  --host string        Phone IP address (required)
-  --port int           Base TCP port (default 5000)
-  --no-screen          Disable screen stream
-  --no-camera          Disable camera stream
-  --no-mic             Disable microphone stream
-  --no-speaker         Disable speaker stream
-  --no-control         Disable control channel
-  --no-input           Disable input capture (keyboard/mouse → phone)
-  --no-heartbeat       Disable heartbeat/status monitoring
-  --no-reconnect       Disable auto-reconnection
-  -v                   Verbose debug output
-```
-
-### allrelay-discover
-
-```
-Usage:
-  allrelay-discover [--timeout 5s]
-
-Legacy helper to discover AllRelay phones on the local network via mDNS.
-Primary discovery now happens in the web UI via UDP subnet scan.
-```
-
----
-
-## Development
-
-### Build Environment
-
-```bash
-# Android SDK (for Java server)
-export ANDROID_SDK_ROOT=/path/to/android-sdk
-
-# Go (for Ubuntu server)
-cd allrelay-server && go build ./cmd/allrelay-server/
-
-# Run tests
-go test ./...                              # Go server tests
-cd scrcpy && ./gradlew :server:test        # Java server tests
-cd scrcpy && ninja -C x test               # C client tests
-```
-
-### Testing
-
-```bash
-# End-to-end Wi-Fi test (requires phone connected via ADB)
-./scripts/test-e2e-wifi.sh
-
-# Wi-Fi transport test
-./scripts/test-wifi-transport.sh
-
-# Mock Android server (for testing without a phone)
-cd allrelay-server && go run ./cmd/mock-android-server/
-```
-
----
-
-## Documentation
-
-| Document | Description |
-|----------|-------------|
-| [SPEC.md](SPEC.md) | Full technical specification |
-| [docs/wifi-protocol.md](docs/wifi-protocol.md) | Wire protocol format |
-| [docs/architecture-research.md](docs/architecture-research.md) | Architecture decisions |
-| [docs/open-source-research.md](docs/open-source-research.md) | Reuse analysis |
-| [plans/CURRENT_WORK.md](plans/CURRENT_WORK.md) | Current development status |
-
----
-
-## Performance
-
-| Stream | Resolution | FPS | Bitrate | Latency |
-|--------|-----------|-----|---------|---------|
-| Monitor | 1080×2640 | 60 | 4-8 Mbps | <35ms |
-| Camera | 1920×1080 | 30 | 2-5 Mbps | <40ms |
-| Microphone | 48kHz mono | — | 32-64 Kbps | <36ms |
-| Speaker | 48kHz mono | — | 64-128 Kbps | <36ms |
-
-*Measured on Samsung SM-F711B with 5GHz Wi-Fi 6 (802.11ax)*
-
----
-
-## FAQ
-
-### Why root?
-
-Root enables:
-- **No consent dialog** for screen capture (VirtualDisplay without MediaProjection)
-- **No recording indicator** (hidden green privacy dot)
-- **AAudio MMAP Exclusive** for 10-20x lower audio latency
-- **Silent background operation** (Magisk daemon, no notification)
-- **FLAG_SECURE content capture** (secure apps like banking)
-
-Without root, you can still use AllRelay, but with a consent dialog and visible recording indicator.
-
-### Why not just use scrcpy?
-
-scrcpy is excellent for screen mirroring over USB. AllRelay adds:
-- **Wi-Fi direct** (no ADB tunnel)
-- **Multiple streams** (screen + camera + mic + speaker simultaneously)
-- **Reverse audio** (PC → phone speaker)
-- **Independent toggles** per function
-- **Auto-start daemon** via Magisk
-
-### What Wi-Fi do I need?
-
-5GHz 802.11ac or 802.11ax is recommended. 2.4GHz may work for audio-only but will have too much jitter for video. A dedicated 5GHz hotspot on the phone works well.
-
----
+- `docs/USAGE.md`
+- `docs/wifi-protocol.md`
+- `docs/root-causes.md`
 
 ## License
 
-AllRelay is licensed under the **Apache License 2.0**, matching scrcpy upstream.
-
-```
-Copyright 2026 AllRelay Contributors
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-```
-
----
-
-## Acknowledgments
-
-AllRelay is built on the shoulders of giants:
-
-- [**scrcpy**](https://github.com/Genymobile/scrcpy) — The base project we forked (Apache 2.0)
-- [**GStreamer**](https://gstreamer.freedesktop.org/) — Media pipeline framework (LGPL)
-- [**FFmpeg**](https://ffmpeg.org/) — H.264/Opus decoding (LGPL)
-- [**PipeWire**](https://pipewire.org/) — Linux audio/video routing (MIT)
-- [**v4l2loopback**](https://github.com/umlaeute/v4l2loopback) — Virtual video device (GPL)
-- [**Magisk**](https://github.com/topjohnwu/Magisk) — Android root solution
+Apache License 2.0, following scrcpy upstream.

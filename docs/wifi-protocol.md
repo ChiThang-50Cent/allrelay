@@ -2,7 +2,7 @@
 
 > Protocol version: 1  
 > Date: 2026-06-11  
-> Scope: Phase 3 (multi-stream over raw TCP with 16-byte header, GStreamer pipelines, input capture)
+> Scope: current Wi‑Fi transport (multi-stream over raw TCP with 16-byte header, browser screen viewer, camera/mic/speaker streams)
 
 ---
 
@@ -159,18 +159,16 @@ Byte offset  Hex                                             ASCII
 2. **Video port only**: read 64 bytes device name
 3. **Create demuxer per stream** — reads 16-byte AllRelay headers
 4. **Session packets**: detected by bit 63, `PayloadSize` set to 0
-5. **Config packets**: bit 62, fed as Annex B to GStreamer pipeline
-6. **Media frames**: decoded via GStreamer pipeline
+5. **Config packets**: bit 62, preserved so downstream consumers can reconfigure codecs
+6. **Media frames**: routed per stream type
 
-### GStreamer Pipeline
+### Current stream handling
 
-```
-fdsrc fd=0 ! h264parse ! avdec_h264 ! videoconvert ! autovideosink sync=false
-```
-
-H.264 data (config + frames) is piped to stdin of a `gst-launch-1.0`
-subprocess. Config data is converted to Annex B byte-stream format before
-feeding to the decoder.
+- **Screen**: H.264 access units are forwarded to the browser over WebSocket binary frames and decoded with **WebCodecs**.
+- **Camera**: H.264 is decoded on Ubuntu and written to `v4l2loopback` (currently via **ffmpeg**).
+- **Mic**: Opus is decoded on Ubuntu and exposed as a Linux input source.
+- **Speaker**: Ubuntu captures audio, encodes Opus, and sends it back to Android.
+- **Control**: browser input is forwarded as raw **binary scrcpy control messages**, not JSON.
 
 ## Android Server Connection Accept (Phase 3)
 
@@ -194,7 +192,7 @@ the Android server waits for optional stream connections.
 | Ports              | Single socket (multiplexed)   | Per-stream ports (5000+)   |
 | Connection health  | Dummy byte on first socket    | Dummy byte on every socket |
 | Server lifecycle   | Started by client via ADB     | Must be pre-started        |
-| Device discovery   | ADB device list               | mDNS (_allrelay._tcp)      |
+| Device discovery   | ADB device list               | UDP subnet scan (+ optional mDNS responder) |
 | Control channel    | Bidirectional LocalSocket     | TCP port 5004 |
 | Header format      | Original scrcpy (12-byte)     | AllRelay 16-byte header    |
 | Camera stream      | Not supported                 | TCP port 5001              |

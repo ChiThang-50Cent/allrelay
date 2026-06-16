@@ -1,14 +1,9 @@
-# AllRelay Server — systemd service
+# AllRelay Server — legacy system-wide systemd service template
 #
-# Runs the AllRelay Ubuntu server that connects to the Android phone
-# and routes all streams. Requires the phone IP to be configured.
-#
-# Install:
-#   sudo cp allrelay.service /etc/systemd/system/
-#   sudo systemctl daemon-reload
-#   sudo systemctl enable --now allrelay
-#
-# The service runs per-user to access PipeWire (user session).
+# This file is kept as a reference/template for manual installs.
+# The packaged/recommended Linux flow uses the user unit in:
+#   deb/usr/lib/systemd/user/allrelay.service
+# so audio can access the user's PipeWire session.
 
 [Unit]
 Description=AllRelay Server — Wireless phone peripherals for Ubuntu

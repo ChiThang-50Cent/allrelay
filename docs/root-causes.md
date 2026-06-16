@@ -1,6 +1,8 @@
 # Root Cause Analysis — AllRelay Debugging Session (2026-06-11)
 
-> Ghi lại nguyên nhân gốc và bài học từ session debug mic/camera/speaker kéo dài cả ngày.
+> Historical debugging notes from an early session.
+>
+> **Important:** some solutions below are now superseded. In particular, the old FIFO-based mic workaround is **not** the current design. The current project uses direct Opus decode on Ubuntu for mic handling.
 
 ---
 

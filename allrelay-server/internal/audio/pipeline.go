@@ -1,10 +1,10 @@
-// Package audio handles audio stream processing using GStreamer pipelines.
+// Package audio handles Ubuntu-side audio stream processing.
 //
 // Audio streams flow in both directions:
-//   - Mic: Phone → Go (Opus) → decode → PipeWire sink
+//   - Mic: Phone → Go (Opus) → decode → PipeWire sink/source setup
 //   - Speaker: PipeWire capture → encode (Opus) → Go → Phone
 //
-// This package manages the GStreamer subprocess for speaker capture.
+// The current speaker capture path uses ffmpeg rather than GStreamer.
 package audio
 
 import (
@@ -15,16 +15,16 @@ import (
 	"os/exec"
 )
 
-// CapturePipeline manages a GStreamer subprocess that captures system audio,
+// CapturePipeline manages a subprocess that captures system audio,
 // encodes it to Opus (Ogg-wrapped), and outputs on stdout.
 //
 // Data is read via the Read() method from the pipeline's stdout.
 // The pipeline runs until Close() is called or the process exits.
 type CapturePipeline struct {
-	name    string
-	cmd     *exec.Cmd
-	stdout  io.ReadCloser
-	done    chan error
+	name   string
+	cmd    *exec.Cmd
+	stdout io.ReadCloser
+	done   chan error
 }
 
 // SpeakerCapturePipeline creates a pipeline that captures system audio

@@ -212,7 +212,8 @@ func (ws *WebServer) handlePhones(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleScanPhones triggers a UDP subnet scan for AllRelay phones.
-// Android phones advertise as _allrelay._tcp on port 5000.
+// Android phones listen for discovery queries on UDP port 5009 and reply
+// with their name/base TCP port.
 func (ws *WebServer) handleScanPhones(w http.ResponseWriter, r *http.Request) {
 	results := ws.scanner.Scan()
 

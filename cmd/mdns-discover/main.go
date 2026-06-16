@@ -1,12 +1,13 @@
-// Package main implements an mDNS discovery tool for AllRelay.
+// Package main implements a legacy mDNS discovery helper for AllRelay.
 //
-// It listens for AllRelay services on the local network and prints
-// discovered devices with their IP addresses and ports.
+// The main product flow now uses the web dashboard's UDP subnet scan.
+// This helper remains optional for environments where mDNS is useful.
 //
 // Usage:
-//   mdns-discover              # List all AllRelay devices
-//   mdns-discover --once       # Find first device and exit
-//   mdns-discover --json       # Output as JSON
+//
+//	mdns-discover              # List all AllRelay devices
+//	mdns-discover --once       # Find first device and exit
+//	mdns-discover --json       # Output as JSON
 package main
 
 import (
@@ -24,9 +25,9 @@ import (
 )
 
 const (
-	ServiceType    = "_allrelay._tcp"
-	ServiceDomain  = "local"
-	LookupTimeout  = 5 * time.Second
+	ServiceType   = "_allrelay._tcp"
+	ServiceDomain = "local"
+	LookupTimeout = 5 * time.Second
 )
 
 // Device represents a discovered AllRelay device.
@@ -96,7 +97,7 @@ func discoverDevices(timeout time.Duration, verbose bool) ([]Device, error) {
 		for entry := range results {
 			device := parseEntry(entry)
 			if verbose {
-				fmt.Fprintf(os.Stderr, "Found: %s (%s:%d)\n", 
+				fmt.Fprintf(os.Stderr, "Found: %s (%s:%d)\n",
 					device.Name, device.IP, device.Port)
 			}
 			devices = append(devices, device)

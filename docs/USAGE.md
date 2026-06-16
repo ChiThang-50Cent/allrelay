@@ -1,89 +1,105 @@
 # AllRelay — Usage Guide
 
-## Android (Phone)
-
-### Cách 1: Magisk Module (tự động sau reboot)
+## Build artifacts
 
 ```bash
-# Copy zip vào phone
-adb push bin/allrelay-magisk.zip /sdcard/
-
-# Mở Magisk → Modules → Install from storage → chọn allrelay-magisk.zip → Reboot
+./scripts/build-deb.sh
 ```
 
-Sau reboot, server tự chạy, port 5001 (camera) + 5003 (speaker) luôn mở.
-Không cần ADB gì nữa.
+Outputs:
+- `bin/allrelay_0.1.0_amd64.deb`
+- `bin/scrcpy-server-allrelay`
+- `bin/allrelay-magisk.zip`
 
-### Cách 2: Chạy thủ công qua ADB (để test)
+---
+
+## Android (Phone)
+
+### Option 1: Magisk module
 
 ```bash
-# Push JAR
+adb push bin/allrelay-magisk.zip /sdcard/
+```
+
+Then open **Magisk → Modules → Install from storage**, choose `allrelay-magisk.zip`, and reboot.
+
+After reboot, the daemon can keep the AllRelay ports available in the background.
+
+### Option 2: Manual ADB run for testing
+
+```bash
 adb push bin/scrcpy-server-allrelay /data/local/tmp/allrelay.jar
 
-# Chạy
 adb shell "su -c 'CLASSPATH=/data/local/tmp/allrelay.jar app_process / \
   com.genymobile.scrcpy.Server 4.0 \
   log_level=info \
-  no_video=true \
-  audio=false \
   wifi_mode=true \
   wifi_port=5000 \
+  video=true \
+  audio=true \
+  audio_source=mic \
   speaker_enabled=true \
   camera_enabled=true \
-  daemon=true &'"
+  daemon=true \
+  control=true \
+  >/data/local/tmp/allrelay-unified.log 2>&1 &'"
+```
+
+Useful checks:
+
+```bash
+adb shell "su -c 'ss -tlnp | grep -E \"5000|5001|5002|5003|5004|5009\"'"
+adb shell "su -c 'head -40 /data/local/tmp/allrelay-unified.log'"
 ```
 
 ---
 
 ## Ubuntu (PC)
 
-### Cài đặt (1 lần duy nhất, cần sudo)
+### Install the package
 
 ```bash
-# Cài .deb
 sudo dpkg -i bin/allrelay_0.1.0_amd64.deb
-
-# Tự động start
-sudo systemctl enable --now allrelay
+systemctl --user enable --now allrelay
 ```
 
-### Kiểm tra
+### Check service status
 
 ```bash
-systemctl status allrelay      # xem trạng thái
-journalctl -u allrelay -f      # xem log real-time
+systemctl --user status allrelay
+journalctl --user -u allrelay -f
 ```
 
-### Sử dụng
+### Open the dashboard
 
-1. Mở trình duyệt: **http://localhost:9090**
-2. Bấm **"Scan Network"** để tìm phone tự động (2 giây)
-3. Hoặc nhập IP phone thủ công (vd: 192.168.1.83)
-4. Bấm **"Connect"**
-5. Bật/tắt từng stream riêng biệt:
-   - 🔊 Speaker: âm thanh PC → phone
-   - 📷 Camera: camera phone → PC (xuất hiện trong Meet/Zoom)
-
-### Camera cho Google Meet / Zoom
-
-1. **Bật camera stream trong AllRelay TRƯỚC**
-2. **Sau đó mới mở Meet/Zoom** — WebRTC chỉ scan camera lúc load trang
-3. Chọn camera **"AllRelay Cam"** trong dropdown
-
-### Gỡ cài đặt
-
-```bash
-sudo systemctl stop allrelay
-sudo dpkg -r allrelay
+```text
+http://localhost:9090
 ```
+
+### Typical flow
+
+1. Click **Scan** to find the phone via UDP subnet scan
+2. Or enter the phone IP manually
+3. Click **Connect**
+4. Toggle streams independently:
+   - **Screen** → opens the remote popup
+   - **Camera** → exposes the phone camera on Linux via `v4l2loopback`
+   - **Mic** → exposes the phone mic as a Linux audio input
+   - **Speaker** → plays PC audio on the phone
+
+### Camera tips for Meet / Zoom / Chrome
+
+1. Start the **Camera** stream first
+2. Then open the meeting app/page
+3. Select the AllRelay virtual camera
 
 ---
 
-## File cần thiết
+## Files
 
-| File | Mục đích |
-|------|----------|
-| `bin/allrelay_0.1.0_amd64.deb` | Package cho Ubuntu |
-| `bin/allrelay-magisk.zip` | Magisk module cho Android |
-| `bin/allrelay-server` | Go binary (có thể chạy trực tiếp) |
-| `bin/scrcpy-server-allrelay` | JAR cho Android (dùng với ADB) |
+| File | Purpose |
+|------|---------|
+| `bin/allrelay_0.1.0_amd64.deb` | Ubuntu package |
+| `bin/allrelay-magisk.zip` | Magisk module |
+| `bin/allrelay-server` | Built Go server binary |
+| `bin/scrcpy-server-allrelay` | Android server artifact used by ADB/app/Magisk |
