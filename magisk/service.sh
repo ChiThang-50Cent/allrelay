@@ -84,9 +84,10 @@ start_server() {
     
     # Launch with app_process (runs in system_server context with root)
     # daemon=true: keep alive, accept reconnections without restart
+    # screen/control enabled: remote popup uses ports 5000 + 5004
     # speaker_enabled=true: PC→phone audio on port 5003
     # camera_enabled=true: phone camera→PC on port 5001
-    # no_video=true audio=false: disable screen+mic (handled separately)
+    # audio=true + audio_source=mic: phone mic daemon on port 5002
     nohup sh -c "
         CLASSPATH='$SERVER_JAR' \
         app_process / com.genymobile.scrcpy.Server \
@@ -94,11 +95,13 @@ start_server() {
             log_level=info \
             wifi_mode=true \
             wifi_port=5000 \
-            no_video=true \
-            audio=false \
+            video=true \
+            audio=true \
+            audio_source=mic \
             speaker_enabled=true \
             camera_enabled=true \
             daemon=true \
+            control=true \
             >> '$LOG_FILE' 2>&1
     " &
     

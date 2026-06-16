@@ -25,6 +25,7 @@ class ToggleActivity : Activity() {
     private lateinit var rootText: TextView
     private lateinit var portsText: TextView
     private lateinit var logText: TextView
+    private lateinit var screenSwitch: Switch
     private lateinit var cameraSwitch: Switch
     private lateinit var micSwitch: Switch
     private lateinit var speakerSwitch: Switch
@@ -97,9 +98,11 @@ class ToggleActivity : Activity() {
         portsText = infoLine(layout, "Ports", "-")
 
         layout.addView(sectionTitle("Streams"))
+        screenSwitch = createStreamToggle("Screen + control daemons (:5000, :5004)", true)
         cameraSwitch = createStreamToggle("Camera daemon (:5001)", true)
         micSwitch = createStreamToggle("Mic daemon (:5002)", true)
         speakerSwitch = createStreamToggle("Speaker daemon (:5003)", true)
+        layout.addView(screenSwitch)
         layout.addView(cameraSwitch)
         layout.addView(micSwitch)
         layout.addView(speakerSwitch)
@@ -191,6 +194,7 @@ class ToggleActivity : Activity() {
 
     private fun currentConfig(): RootDaemonManager.Config {
         return RootDaemonManager.Config(
+            screen = screenSwitch.isChecked,
             camera = cameraSwitch.isChecked,
             mic = micSwitch.isChecked,
             speaker = speakerSwitch.isChecked,

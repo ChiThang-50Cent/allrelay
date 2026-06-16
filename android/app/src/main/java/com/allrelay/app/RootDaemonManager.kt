@@ -12,15 +12,20 @@ object RootDaemonManager {
     private const val PROCESS_PATTERN = "com.genymobile.scrcpy.Server"
 
     data class Config(
+        val screen: Boolean,
         val camera: Boolean,
         val mic: Boolean,
         val speaker: Boolean,
     ) {
         fun validate() {
-            require(camera || mic || speaker) { "Enable at least one stream" }
+            require(screen || camera || mic || speaker) { "Enable at least one stream" }
         }
 
         fun expectedPorts(): Set<Int> = buildSet {
+            if (screen) {
+                add(5000)
+                add(5004)
+            }
             if (camera) add(5001)
             if (mic) add(5002)
             if (speaker) add(5003)
@@ -54,7 +59,7 @@ object RootDaemonManager {
             appendLine("rm -f '$ROOT_LOG_PATH'")
             append("nohup sh -c 'CLASSPATH=$jarPath exec app_process / com.genymobile.scrcpy.Server 4.0")
             append(" log_level=info")
-            append(" no_video=true")
+            append(" video=${config.screen}")
             append(" audio=${config.mic}")
             append(" audio_source=mic")
             append(" wifi_mode=true")
@@ -62,7 +67,7 @@ object RootDaemonManager {
             append(" speaker_enabled=${config.speaker}")
             append(" camera_enabled=${config.camera}")
             append(" daemon=true")
-            append(" control=false")
+            append(" control=${config.screen}")
             append("' >'$ROOT_LOG_PATH' 2>&1 </dev/null &")
         }
 
@@ -131,7 +136,7 @@ object RootDaemonManager {
             .mapNotNull { it.substringAfter(':').trim().toIntOrNull() }
             .toSet()
         val expected = config?.expectedPorts().orEmpty()
-        val hasDaemonPorts = ports.intersect(setOf(5001, 5002, 5003)).isNotEmpty()
+        val hasDaemonPorts = ports.intersect(setOf(5000, 5001, 5002, 5003, 5004)).isNotEmpty()
         val message = when {
             !hasRoot() -> "Root unavailable"
             running && expected.isNotEmpty() && !ports.containsAll(expected) -> "Process up, waiting for ports ${expected.sorted()}"
@@ -144,14 +149,6 @@ object RootDaemonManager {
 
         return Status(
             running = effectiveRunning,
-            pid = pid,
-            ports = ports,
-            message = message,
-            logTail = readLogTail(),
-        )
-
-        return Status(
-            running = running,
             pid = pid,
             ports = ports,
             message = message,
