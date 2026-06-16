@@ -49,9 +49,10 @@ func TestReadHeader(t *testing.T) {
 
 func TestReadHeader_Session(t *testing.T) {
 	var buf bytes.Buffer
-	binary.Write(&buf, binary.BigEndian, uint32(0x01))
-	binary.Write(&buf, binary.BigEndian, uint64(FlagSession))
-	binary.Write(&buf, binary.BigEndian, uint32(0))
+	binary.Write(&buf, binary.BigEndian, uint32(StreamScreen))
+	binary.Write(&buf, binary.BigEndian, uint32(FlagSession>>32))
+	binary.Write(&buf, binary.BigEndian, uint32(1080))
+	binary.Write(&buf, binary.BigEndian, uint32(2400))
 
 	header, err := ReadHeader(&buf)
 	if err != nil {
@@ -62,6 +63,12 @@ func TestReadHeader_Session(t *testing.T) {
 	}
 	if header.MediaType() != "session" {
 		t.Errorf("MediaType = %s, want session", header.MediaType())
+	}
+	if header.SessionWidth != 1080 || header.SessionHeight != 2400 {
+		t.Fatalf("session size = %dx%d, want 1080x2400", header.SessionWidth, header.SessionHeight)
+	}
+	if header.PayloadSize != 0 {
+		t.Fatalf("PayloadSize = %d, want 0 for session packet", header.PayloadSize)
 	}
 }
 
@@ -92,6 +99,7 @@ func TestReadHeader_AllStreamIDs(t *testing.T) {
 		{StreamCamera, "camera"},
 		{StreamMic, "mic"},
 		{StreamSpeaker, "speaker"},
+		{StreamControl, "control"},
 	}
 
 	for _, tt := range tests {
@@ -117,7 +125,7 @@ func TestReadHeader_AllStreamIDs(t *testing.T) {
 
 func TestReadHeader_MediaPacket(t *testing.T) {
 	var buf bytes.Buffer
-	binary.Write(&buf, binary.BigEndian, uint32(0x02)) // camera
+	binary.Write(&buf, binary.BigEndian, uint32(0x02))   // camera
 	binary.Write(&buf, binary.BigEndian, uint64(999999)) // plain PTS
 	binary.Write(&buf, binary.BigEndian, uint32(5000))
 

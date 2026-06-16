@@ -35,8 +35,10 @@ const (
 
 // Flag bits in pts_and_flags.
 const (
+	FlagSession  uint64 = 1 << 63
 	FlagConfig   uint64 = 1 << 62
 	FlagKeyFrame uint64 = 1 << 61
+	ptsMask      uint64 = (1 << 53) - 1
 )
 
 // StreamName returns a human-readable name for a stream ID.
@@ -73,6 +75,11 @@ type Header struct {
 	SessionHeight uint32
 }
 
+// IsSession returns true if this is a session metadata packet.
+func (h *Header) IsSession() bool {
+	return h.PTSAndFlags&FlagSession != 0
+}
+
 // IsConfig returns true if this is a codec config packet.
 func (h *Header) IsConfig() bool {
 	return h.PTSAndFlags&FlagConfig != 0
@@ -83,20 +90,41 @@ func (h *Header) IsKeyFrame() bool {
 	return h.PTSAndFlags&FlagKeyFrame != 0
 }
 
+// PTS returns the presentation timestamp portion of pts_and_flags.
+func (h *Header) PTS() uint64 {
+	return h.PTSAndFlags & ptsMask
+}
+
+// MediaType returns a coarse packet classification for logging/tests.
+func (h *Header) MediaType() string {
+	switch {
+	case h.IsSession():
+		return "session"
+	case h.IsConfig():
+		return "config"
+	case h.IsKeyFrame():
+		return "keyframe"
+	default:
+		return "media"
+	}
+}
+
 // ReadHeader reads and parses a 16-byte AllRelay header from the reader.
 // Returns io.EOF if the stream ends cleanly.
 //
 // Session packets use a different byte layout:
-//   bytes 0-3: stream_id
-//   bytes 4-7: flags (upper 32 bits of session flag)
-//   bytes 8-11: width
-//   bytes 12-15: height
-//   payload: 0 bytes
+//
+//	bytes 0-3: stream_id
+//	bytes 4-7: flags (upper 32 bits of session flag)
+//	bytes 8-11: width
+//	bytes 12-15: height
+//	payload: 0 bytes
 //
 // Non-session packets use:
-//   bytes 0-3:  stream_id
-//   bytes 4-11: pts_and_flags (8 bytes)
-//   bytes 12-15: payload_size
+//
+//	bytes 0-3:  stream_id
+//	bytes 4-11: pts_and_flags (8 bytes)
+//	bytes 12-15: payload_size
 func ReadHeader(r io.Reader) (*Header, error) {
 	buf := make([]byte, HeaderSize)
 	if _, err := io.ReadFull(r, buf); err != nil {
@@ -114,7 +142,7 @@ func ReadHeader(r io.Reader) (*Header, error) {
 	// Session flag (bit 63 of the 8-byte field) is bit 31 of bytes 4-7.
 	// So we check if the upper 4 bytes (buf[4:8]) have bit 31 set.
 	upperFlags := binary.BigEndian.Uint32(buf[4:8])
-	isSession := (upperFlags & 0x80000000) != 0
+	isSession := (upperFlags & uint32(FlagSession>>32)) != 0
 
 	if isSession {
 		// Session layout:
