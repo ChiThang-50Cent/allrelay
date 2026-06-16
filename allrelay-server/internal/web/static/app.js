@@ -836,7 +836,6 @@ function initScreenViewer() {
     screenCanvasEl = document.getElementById('screenCanvas');
     if (!screenCanvasEl) return;
     screenCtx = screenCanvasEl.getContext('2d');
-    window.addEventListener('resize', () => fitPopupToVideo(screenVideoSize.width, screenVideoSize.height, false));
 
     if (pageMode !== 'remote') {
         return;
@@ -942,7 +941,6 @@ function ensureScreenDecoder() {
             }
             screenVideoSize.width = frame.displayWidth;
             screenVideoSize.height = frame.displayHeight;
-            fitPopupToVideo(frame.displayWidth, frame.displayHeight);
 
             screenCtx.drawImage(frame, 0, 0);
             frame.close();
@@ -1211,15 +1209,15 @@ function handleScreenSession(data) {
     resetScreenDecoderForReconfigure();
 }
 
-function fitPopupToVideo(width, height, allowWindowResize = true) {
+function fitPopupToVideo(width, height) {
     if (pageMode !== 'remote' || !width || !height) return;
     const fitKey = `${width}x${height}`;
-    if (screenLastPopupFitKey === fitKey && !allowWindowResize) {
+    if (screenLastPopupFitKey === fitKey) {
         return;
     }
     screenLastPopupFitKey = fitKey;
 
-    if (!screenCanvasEl) return;
+    if (!screenCanvasEl || typeof window.resizeTo !== 'function') return;
 
     const availWidth = Math.max(360, window.screen.availWidth - 48);
     const availHeight = Math.max(480, window.screen.availHeight - 48);
@@ -1227,14 +1225,12 @@ function fitPopupToVideo(width, height, allowWindowResize = true) {
     const targetInnerWidth = Math.max(240, Math.round(width * scale));
     const targetInnerHeight = Math.max(320, Math.round(height * scale));
 
-    if (allowWindowResize && typeof window.resizeTo === 'function') {
-        const chromeWidth = Math.max(0, window.outerWidth - window.innerWidth);
-        const chromeHeight = Math.max(0, window.outerHeight - window.innerHeight);
-        try {
-            window.resizeTo(targetInnerWidth + chromeWidth, targetInnerHeight + chromeHeight);
-        } catch (e) {
-            // ignore popup resize failures
-        }
+    const chromeWidth = Math.max(0, window.outerWidth - window.innerWidth);
+    const chromeHeight = Math.max(0, window.outerHeight - window.innerHeight);
+    try {
+        window.resizeTo(targetInnerWidth + chromeWidth, targetInnerHeight + chromeHeight);
+    } catch (e) {
+        // ignore popup resize failures
     }
 }
 
