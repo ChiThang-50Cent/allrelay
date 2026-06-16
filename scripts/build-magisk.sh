@@ -35,17 +35,16 @@ SERVER_JAR_DST="$PROJECT_ROOT/magisk/system/bin/scrcpy-server-allrelay.jar"
 
 if [ ! -f "$SERVER_JAR_SRC" ]; then
     echo -e "${YELLOW}Server JAR not found, building...${NC}"
-    
-    # Check Android SDK
-    if [ -z "$ANDROID_SDK_ROOT" ] && [ -z "$ANDROID_HOME" ]; then
+
+    SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-$HOME/android-sdk}}"
+    if [ ! -d "$SDK_ROOT" ]; then
         echo -e "${RED}ERROR: Android SDK not found.${NC}"
-        echo "Set ANDROID_SDK_ROOT or ANDROID_HOME."
+        echo "Set ANDROID_SDK_ROOT / ANDROID_HOME or install under $HOME/android-sdk."
         exit 1
     fi
-    
+
     cd "$PROJECT_ROOT/scrcpy"
-    ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-$ANDROID_HOME}" \
-        ./gradlew :server:assembleRelease
+    ANDROID_SDK_ROOT="$SDK_ROOT" ./gradlew :server:assembleRelease
     
     # Copy from build output
     APK="$PROJECT_ROOT/scrcpy/server/build/outputs/apk/release/server-release-unsigned.apk"

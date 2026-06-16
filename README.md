@@ -63,11 +63,15 @@ Outputs:
 - `bin/scrcpy-server-allrelay`
 - `bin/allrelay-magisk.zip`
 
-### Optional single-artifact build
+### Android-only build
 
 ```bash
-./scripts/build.sh          # Android server artifact only
+./scripts/build-magisk.sh
 ```
+
+This also refreshes:
+- `bin/scrcpy-server-allrelay`
+- `bin/allrelay-magisk.zip`
 
 ## Install
 

@@ -34,16 +34,12 @@ done
 
 echo "=== [3/4] Build Android APK + Magisk module ==="
 if [ -d "$ROOT/scrcpy" ]; then
-    cd "$ROOT/scrcpy"
-    ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-$HOME/android-sdk}" \
-        ./gradlew :server:assembleRelease 2>&1 | tail -2
-    cp server/build/outputs/apk/release/server-release-unsigned.apk "$BIN_DIR/scrcpy-server-allrelay"
-    cp "$BIN_DIR/scrcpy-server-allrelay" "$ROOT/magisk/system/bin/scrcpy-server-allrelay.jar"
+    bash "$ROOT/scripts/build-magisk.sh" >/tmp/allrelay-build-magisk.log 2>&1 || {
+        tail -120 /tmp/allrelay-build-magisk.log
+        exit 1
+    }
+    echo "   Android server + Magisk build complete"
     echo "   APK: $BIN_DIR/scrcpy-server-allrelay ($(du -h "$BIN_DIR/scrcpy-server-allrelay" | cut -f1))"
-    
-    # Build Magisk module
-    cd "$ROOT/magisk"
-    zip -r "$BIN_DIR/allrelay-magisk.zip" . -x "*.git*" > /dev/null 2>&1
     echo "   Magisk: $BIN_DIR/allrelay-magisk.zip ($(du -h "$BIN_DIR/allrelay-magisk.zip" | cut -f1))"
 fi
 
