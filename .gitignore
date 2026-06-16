@@ -55,6 +55,7 @@ SPEC.md
 docs/research/
 plans/
 
-# === Generated scripts ===
+# === Generated packaging / scripts ===
 scripts/test-phase3.sh
 deb/usr/bin/
+deb/usr/share/allrelay/

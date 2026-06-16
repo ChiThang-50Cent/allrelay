@@ -63,7 +63,7 @@ cd allrelay
 ./scripts/build-magisk.sh
 
 # Push to phone
-adb push bin/allrelay-magisk-v0.4.0-alpha.zip /sdcard/
+adb push bin/allrelay-magisk.zip /sdcard/
 
 # Flash via Magisk Manager, then reboot
 ```
@@ -91,7 +91,9 @@ sudo systemctl enable --now allrelay
 # Or just start the server directly:
 allrelay-server --host 192.168.1.100
 
-# Discover phone via mDNS:
+# Discover phone from the web UI via UDP subnet scan:
+# open http://localhost:9090 and click Scan
+# Optional legacy helper:
 allrelay-discover
 ```
 
@@ -183,7 +185,8 @@ Flags:
 Usage:
   allrelay-discover [--timeout 5s]
 
-Discovers AllRelay phones on the local network via mDNS.
+Legacy helper to discover AllRelay phones on the local network via mDNS.
+Primary discovery now happens in the web UI via UDP subnet scan.
 ```
 
 ---

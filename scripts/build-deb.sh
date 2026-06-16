@@ -13,9 +13,12 @@ go build -o "$BIN_DIR/allrelay-server" ./cmd/allrelay-server/
 echo "   Binary: $BIN_DIR/allrelay-server ($(du -h "$BIN_DIR/allrelay-server" | cut -f1))"
 
 echo "=== [2/4] Copy files to package ==="
+mkdir -p "$DEB_DIR/usr/bin"
 cp "$BIN_DIR/allrelay-server" "$DEB_DIR/usr/bin/"
 chmod 755 "$DEB_DIR/usr/bin/allrelay-server"
 
+rm -rf "$DEB_DIR/usr/share/allrelay"
+mkdir -p "$DEB_DIR/usr/share/allrelay/static" "$DEB_DIR/usr/share/allrelay/templates"
 cp "$WEB_DIR/static/app.js" "$DEB_DIR/usr/share/allrelay/static/"
 cp "$WEB_DIR/static/style.css" "$DEB_DIR/usr/share/allrelay/static/"
 cp "$WEB_DIR/templates/index.html" "$DEB_DIR/usr/share/allrelay/templates/"

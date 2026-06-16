@@ -12,8 +12,8 @@
 # What this installs:
 #   - AllRelay Go server binary → /usr/local/bin/allrelay-server
 #   - PipeWire config files for mic/speaker virtual devices
-#   - systemd service (auto-start on boot)
-#   - Required dependencies (v4l2loopback, PipeWire, GStreamer)
+#   - systemd service (auto-start on boot/login)
+#   - Required dependencies (v4l2loopback, PipeWire)
 
 set -e
 
@@ -116,13 +116,6 @@ else
     echo -e "  v4l2:  ${YELLOW}⚠ v4l2loopback not loaded (required for camera)${NC}"
     echo -e "         Install: sudo apt install v4l2loopback-dkms v4l2loopback-utils"
     echo -e "         Then:    sudo modprobe v4l2loopback devices=1 video_nr=10 card_label=\"AllRelay Camera\""
-fi
-
-# Check GStreamer
-if pkg-config --exists gstreamer-1.0 2>/dev/null; then
-    echo -e "  GStreamer: ${GREEN}✓${NC}"
-else
-    echo -e "  GStreamer: ${YELLOW}⚠ not found (optional, for video pipeline)${NC}"
 fi
 
 echo ""
@@ -247,15 +240,16 @@ USEREOF
     fi
 fi
 
-# ─── Step 6: Install mDNS discovery tool ─────────────────────────
-echo -e "${YELLOW}[6/6] Installing mDNS discovery tool...${NC}"
+# ─── Step 6: Install optional legacy discovery helper ────────────
+echo -e "${YELLOW}[6/6] Installing optional legacy discovery helper...${NC}"
 
 if [ -f "$PROJECT_ROOT/bin/mdns-discover" ]; then
     cp "$PROJECT_ROOT/bin/mdns-discover" "$BIN_DIR/allrelay-discover"
     chmod 755 "$BIN_DIR/allrelay-discover"
     echo -e "  ${GREEN}✓ $BIN_DIR/allrelay-discover${NC}"
+    echo -e "  ${YELLOW}⚠ Optional only: primary discovery now uses the web dashboard UDP scan${NC}"
 else
-    echo -e "  ${YELLOW}⚠ mdns-discover not built (run scripts/build.sh mdns first)${NC}"
+    echo -e "  ${YELLOW}⚠ Optional helper not built (run scripts/build.sh mdns if you still want it)${NC}"
 fi
 
 echo ""
@@ -281,7 +275,7 @@ echo "     systemctl --user restart pipewire pipewire-pulse"
 echo ""
 echo -e "  4. ${BOLD}Install Magisk module on phone:${NC}"
 echo "     bash $PROJECT_ROOT/scripts/build-magisk.sh"
-echo "     adb push $PROJECT_ROOT/bin/allrelay-magisk-*.zip /sdcard/"
+echo "     adb push $PROJECT_ROOT/bin/allrelay-magisk.zip /sdcard/"
 echo "     (flash via Magisk Manager)"
 echo ""
 echo -e "  5. ${BOLD}Start AllRelay:${NC}"
@@ -292,6 +286,7 @@ else
 fi
 echo ""
 echo -e "  6. ${BOLD}Discover phone:${NC}"
-echo "     allrelay-discover"
+echo "     Open the web UI and use Scan (UDP subnet scan)"
+echo "     Optional legacy helper: allrelay-discover"
 echo ""
 echo -e "${BLUE}Enjoy your wireless phone peripherals! 🎉${NC}"

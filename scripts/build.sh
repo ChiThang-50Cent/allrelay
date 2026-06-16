@@ -1,6 +1,6 @@
 #!/bin/bash
 # AllRelay Build Script
-# Builds the scrcpy-server with AllRelay modifications
+# Builds the Android server artifact and optional helper binaries
 
 set -e
 
@@ -46,9 +46,9 @@ check_prerequisites() {
     echo -e "${GREEN}Prerequisites OK${NC}"
 }
 
-# Build server (scrcpy-server.jar)
+# Build Android server artifact used by ADB/Magisk/app bundling
 build_server() {
-    echo -e "\n${YELLOW}Building scrcpy-server...${NC}"
+    echo -e "\n${YELLOW}Building Android server artifact...${NC}"
     
     cd "$PROJECT_ROOT/scrcpy"
     
@@ -66,8 +66,8 @@ build_server() {
         
         # Copy to bin directory
         mkdir -p "$PROJECT_ROOT/bin"
-        cp "$SERVER_JAR" "$PROJECT_ROOT/bin/scrcpy-server"
-        echo -e "${GREEN}Copied to: $PROJECT_ROOT/bin/scrcpy-server${NC}"
+        cp "$SERVER_JAR" "$PROJECT_ROOT/bin/scrcpy-server-allrelay"
+        echo -e "${GREEN}Copied to: $PROJECT_ROOT/bin/scrcpy-server-allrelay${NC}"
     else
         echo -e "${RED}Error: Server build failed${NC}"
         exit 1
@@ -87,21 +87,21 @@ build_client() {
     rm -rf x
     meson setup x --buildtype=release --strip -Db_lto=true \
         -Dcompile_server=false \
-        -Dprebuilt_server="$PROJECT_ROOT/bin/scrcpy-server"
+        -Dprebuilt_server="$PROJECT_ROOT/bin/scrcpy-server-allrelay"
     
     ninja -Cx
     
     echo -e "${GREEN}Client built: $PROJECT_ROOT/scrcpy/x/app/scrcpy${NC}"
 }
 
-# Build mDNS discovery tool
+# Build legacy mDNS discovery helper (optional; web UI uses UDP subnet scan)
 build_mdns_tool() {
-    echo -e "\n${YELLOW}Building mDNS discovery tool...${NC}"
+    echo -e "\n${YELLOW}Building legacy mDNS discovery helper...${NC}"
     
     cd "$PROJECT_ROOT"
     go build -o bin/mdns-discover ./cmd/mdns-discover
     
-    echo -e "${GREEN}mDNS tool built: $PROJECT_ROOT/bin/mdns-discover${NC}"
+    echo -e "${GREEN}Legacy discovery helper built: $PROJECT_ROOT/bin/mdns-discover${NC}"
 }
 
 # Main menu
@@ -126,9 +126,9 @@ case "${1:-all}" in
         echo "Usage: $0 {server|client|mdns|all}"
         echo ""
         echo "Commands:"
-        echo "  server  - Build Android server (requires Android SDK)"
+        echo "  server  - Build Android server artifact (requires Android SDK)"
         echo "  client  - Build Linux client"
-        echo "  mdns    - Build mDNS discovery tool"
+        echo "  mdns    - Build legacy mDNS discovery helper"
         echo "  all     - Build everything"
         exit 1
         ;;

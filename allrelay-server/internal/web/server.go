@@ -211,7 +211,7 @@ func (ws *WebServer) handlePhones(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(phones)
 }
 
-// handleScanPhones triggers an mDNS network scan for AllRelay phones.
+// handleScanPhones triggers a UDP subnet scan for AllRelay phones.
 // Android phones advertise as _allrelay._tcp on port 5000.
 func (ws *WebServer) handleScanPhones(w http.ResponseWriter, r *http.Request) {
 	results := ws.scanner.Scan()

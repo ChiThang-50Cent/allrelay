@@ -17,10 +17,10 @@ var upgrader = websocket.Upgrader{
 
 // Client represents a WebSocket client
 type Client struct {
-	hub  *Hub
-	conn *websocket.Conn
-	send chan []byte  // text messages (JSON status, events)
-	sendBin chan []byte  // binary messages (H.264 NAL units for screen)
+	hub     *Hub
+	conn    *websocket.Conn
+	send    chan []byte // text messages (JSON status, events)
+	sendBin chan []byte // binary messages (H.264 NAL units for screen)
 }
 
 // Hub maintains the set of active clients and broadcasts messages
@@ -162,7 +162,7 @@ func (ws *WebServer) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 	ws.mu.RLock()
 	status := ws.currentConn
 	ws.mu.RUnlock()
-	
+
 	msg := WSMessage{Type: "status", Data: status}
 	data, _ := json.Marshal(msg)
 	client.send <- data
@@ -179,7 +179,7 @@ func (c *Client) readPump() {
 	}()
 
 	for {
-		_, message, err := c.conn.ReadMessage()
+		messageType, message, err := c.conn.ReadMessage()
 		if err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {
 				slog.Error("WebSocket read error", "error", err)
@@ -187,7 +187,14 @@ func (c *Client) readPump() {
 			break
 		}
 
-		// Handle incoming messages
+		if messageType == websocket.BinaryMessage {
+			if c.hub.OnControl != nil {
+				c.hub.OnControl(message)
+			}
+			continue
+		}
+
+		// Handle incoming text/JSON messages
 		var msg WSMessage
 		if err := json.Unmarshal(message, &msg); err != nil {
 			slog.Error("Invalid WebSocket message", "error", err)
@@ -199,7 +206,7 @@ func (c *Client) readPump() {
 		case "ping":
 			c.send <- []byte(`{"type":"pong"}`)
 		case "control":
-			// Forward control message to Android via the hub callback
+			// Backward-compatible fallback for older clients.
 			if c.hub.OnControl != nil {
 				data, _ := json.Marshal(msg.Data)
 				c.hub.OnControl(data)
