@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AllRelay Remote</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body data-page="remote">
+    <div class="remote-shell">
+        <header class="header remote-header">
+            <div class="header-content">
+                <div class="logo">
+                    <div class="logo-icon">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/>
+                        </svg>
+                    </div>
+                    <div>
+                        <h1>AllRelay Remote</h1>
+                        <p class="panel-subtitle">Dedicated tab for keyboard/mouse control</p>
+                    </div>
+                </div>
+                <div class="remote-header-actions">
+                    <div class="connection-status" id="connectionStatus">
+                        <span class="status-dot disconnected"></span>
+                        <span class="status-text">Disconnected</span>
+                    </div>
+                    <a class="btn btn-secondary btn-sm" href="/" rel="noopener noreferrer">Back to Dashboard</a>
+                </div>
+            </div>
+        </header>
+
+        <main class="remote-main">
+            <section class="panel remote-controls-panel">
+                <div class="panel-header">
+                    <div class="panel-title-group">
+                        <h2>Remote Control</h2>
+                        <p class="panel-subtitle">Screen stays mirrored here. Phone display is turned off automatically while controlling.</p>
+                    </div>
+                    <div class="panel-actions">
+                        <button class="btn btn-secondary btn-sm" id="remoteScreenToggleBtn">Start Screen</button>
+                        <button class="btn btn-secondary btn-sm" id="remoteWakeBtn">Wake Phone Screen</button>
+                    </div>
+                </div>
+                <div class="panel-body remote-meta-row">
+                    <div class="status-card compact-status-card">
+                        <div class="status-label">Phone</div>
+                        <div class="status-value remote-status-value" id="remotePhoneStatus">--</div>
+                        <div class="status-meta" id="remotePowerStatus">Remote standby</div>
+                    </div>
+                </div>
+            </section>
+
+            <section class="panel screen-panel remote-screen-panel" id="screenPanel">
+                <div class="panel-header">
+                    <div class="panel-title-group">
+                        <h2>Remote Screen</h2>
+                        <p class="panel-subtitle">Click the canvas to focus keyboard input</p>
+                    </div>
+                    <span class="screen-fps" id="screenFPS"></span>
+                </div>
+                <div class="panel-body screen-body remote-screen-body">
+                    <canvas id="screenCanvas" class="screen-canvas"></canvas>
+                    <div class="screen-placeholder" id="screenPlaceholder">
+                        <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                            <rect x="2" y="3" width="20" height="14" rx="2" ry="2"/>
+                            <line x1="8" y1="21" x2="16" y2="21"/>
+                            <line x1="12" y1="17" x2="12" y2="21"/>
+                        </svg>
+                        <p>Start the screen stream from the dashboard or with the button above.</p>
+                    </div>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>

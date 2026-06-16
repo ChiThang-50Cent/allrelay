@@ -7,7 +7,7 @@
     <link rel="stylesheet" href="/static/style.css">
     <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@300;400;500;600;700&display=swap" rel="stylesheet">
 </head>
-<body>
+<body data-page="dashboard">
     <div class="dashboard">
         <!-- Header -->
         <header class="header">
@@ -62,8 +62,14 @@
             <!-- Screen Viewer Panel -->
             <section class="panel screen-panel" id="screenPanel" style="display: none;">
                 <div class="panel-header">
-                    <h2>Screen</h2>
-                    <span class="screen-fps" id="screenFPS"></span>
+                    <div class="panel-title-group">
+                        <h2>Screen</h2>
+                        <p class="panel-subtitle">View here, control in the remote tab</p>
+                    </div>
+                    <div class="panel-actions">
+                        <a class="btn btn-secondary btn-sm" href="/remote" target="_blank" rel="noopener noreferrer">Open Remote Tab</a>
+                        <span class="screen-fps" id="screenFPS"></span>
+                    </div>
                 </div>
                 <div class="panel-body screen-body">
                     <canvas id="screenCanvas" class="screen-canvas"></canvas>

@@ -14,9 +14,9 @@ import (
 
 // ServerConfig holds web server configuration
 type ServerConfig struct {
-	Port    int
-	Host    string
-	Debug   bool
+	Port  int
+	Host  string
+	Debug bool
 }
 
 // DefaultConfig returns default web server config
@@ -52,8 +52,8 @@ type StreamStatus struct {
 
 // ConnectionStatus represents the full connection status
 type ConnectionStatus struct {
-	Phone    *PhoneDevice    `json:"phone"`
-	Streams  []StreamStatus  `json:"streams"`
+	Phone     *PhoneDevice   `json:"phone"`
+	Streams   []StreamStatus `json:"streams"`
 	Connected bool           `json:"connected"`
 }
 
@@ -75,9 +75,9 @@ func NewWebServer(config ServerConfig) *WebServer {
 	go hub.Run()
 
 	ws := &WebServer{
-		config: config,
-		phones: make(map[string]*PhoneDevice),
-		hub:    hub,
+		config:  config,
+		phones:  make(map[string]*PhoneDevice),
+		hub:     hub,
 		scanner: discovery.NewScanner(),
 		currentConn: &ConnectionStatus{
 			Streams: []StreamStatus{
@@ -85,7 +85,6 @@ func NewWebServer(config ServerConfig) *WebServer {
 				{Name: "camera", Port: 5001},
 				{Name: "mic", Port: 5002},
 				{Name: "speaker", Port: 5003},
-				{Name: "control", Port: 5004},
 			},
 		},
 	}
@@ -111,6 +110,9 @@ func (ws *WebServer) Start() error {
 
 	// WebSocket endpoint
 	mux.HandleFunc("/ws", ws.HandleWebSocket)
+
+	// Remote control page
+	mux.HandleFunc("/remote", ws.handleRemote)
 
 	// Static files (CSS, JS, images)
 	staticPaths := []string{
@@ -166,13 +168,21 @@ func (ws *WebServer) Hub() *Hub {
 	return ws.hub
 }
 func (ws *WebServer) handleIndex(w http.ResponseWriter, r *http.Request) {
+	ws.serveTemplate(w, r, "index.html")
+}
+
+func (ws *WebServer) handleRemote(w http.ResponseWriter, r *http.Request) {
+	ws.serveTemplate(w, r, "remote.html")
+}
+
+func (ws *WebServer) serveTemplate(w http.ResponseWriter, r *http.Request, name string) {
 	// Try multiple paths for flexibility
 	paths := []string{
-		"/usr/share/allrelay/templates/index.html",
-		"allrelay-server/internal/web/templates/index.html",
-		"internal/web/templates/index.html",
-		"../allrelay-server/internal/web/templates/index.html",
-		"templates/index.html",
+		"/usr/share/allrelay/templates/" + name,
+		"allrelay-server/internal/web/templates/" + name,
+		"internal/web/templates/" + name,
+		"../allrelay-server/internal/web/templates/" + name,
+		"templates/" + name,
 	}
 
 	for _, path := range paths {
@@ -183,7 +193,7 @@ func (ws *WebServer) handleIndex(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	slog.Error("Template not found", "tried", paths)
+	slog.Error("Template not found", "name", name, "tried", paths)
 	http.Error(w, "Template not found", http.StatusInternalServerError)
 }
 

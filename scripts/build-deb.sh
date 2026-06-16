@@ -19,6 +19,7 @@ chmod 755 "$DEB_DIR/usr/bin/allrelay-server"
 cp "$WEB_DIR/static/app.js" "$DEB_DIR/usr/share/allrelay/static/"
 cp "$WEB_DIR/static/style.css" "$DEB_DIR/usr/share/allrelay/static/"
 cp "$WEB_DIR/templates/index.html" "$DEB_DIR/usr/share/allrelay/templates/"
+cp "$WEB_DIR/templates/remote.html" "$DEB_DIR/usr/share/allrelay/templates/"
 
 chmod 755 "$DEB_DIR/DEBIAN/postinst"
 chmod 755 "$DEB_DIR/DEBIAN/prerm"

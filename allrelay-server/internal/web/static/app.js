@@ -3,6 +3,8 @@
  * Handles UI interactions, API communication, and WebSocket real-time updates
  */
 
+const pageMode = document.body.dataset.page || 'dashboard';
+
 // API endpoints
 const API = {
     phones: '/api/phones',
@@ -23,11 +25,12 @@ const state = {
         { name: 'screen', port: 5000, active: false, icon: '📺', fps: 0, bitrate: 0, latency: 0, bytes: 0, frames: 0 },
         { name: 'camera', port: 5001, active: false, icon: '📷', fps: 0, bitrate: 0, latency: 0, bytes: 0, frames: 0 },
         { name: 'mic', port: 5002, active: false, icon: '🎤', fps: 0, bitrate: 0, latency: 0, bytes: 0, frames: 0 },
-        { name: 'speaker', port: 5003, active: false, icon: '🔊', fps: 0, bitrate: 0, latency: 0, bytes: 0, frames: 0 },
-        { name: 'control', port: 5004, active: false, icon: '🎮', fps: 0, bitrate: 0, latency: 0, bytes: 0, frames: 0 }
+        { name: 'speaker', port: 5003, active: false, icon: '🔊', fps: 0, bitrate: 0, latency: 0, bytes: 0, frames: 0 }
     ],
     ws: null,
-    wsReconnectTimer: null
+    wsReconnectTimer: null,
+    remotePowerOffAutoTried: false,
+    remotePowerOffSent: false,
 };
 
 // DOM Elements
@@ -35,10 +38,12 @@ const elements = {};
 
 // Initialize the application
 function init() {
-    // Cache DOM elements
+    // Cache shared DOM elements
     elements.connectionStatus = document.getElementById('connectionStatus');
-    elements.statusDot = elements.connectionStatus.querySelector('.status-dot');
-    elements.statusText = elements.connectionStatus.querySelector('.status-text');
+    elements.statusDot = elements.connectionStatus?.querySelector('.status-dot') || null;
+    elements.statusText = elements.connectionStatus?.querySelector('.status-text') || null;
+
+    // Dashboard-only elements
     elements.phoneIP = document.getElementById('phoneIP');
     elements.connectBtn = document.getElementById('connectBtn');
     elements.scanBtn = document.getElementById('scanBtn');
@@ -47,25 +52,51 @@ function init() {
     elements.enableAllBtn = document.getElementById('enableAllBtn');
     elements.disableAllBtn = document.getElementById('disableAllBtn');
 
-    // Bind event listeners
-    elements.connectBtn.addEventListener('click', handleConnect);
-    elements.scanBtn.addEventListener('click', handleScan);
-    elements.enableAllBtn.addEventListener('click', () => toggleAllStreams(true));
-    elements.disableAllBtn.addEventListener('click', () => toggleAllStreams(false));
+    // Remote-only elements
+    elements.remoteScreenToggleBtn = document.getElementById('remoteScreenToggleBtn');
+    elements.remoteWakeBtn = document.getElementById('remoteWakeBtn');
+    elements.remotePhoneStatus = document.getElementById('remotePhoneStatus');
+    elements.remotePowerStatus = document.getElementById('remotePowerStatus');
 
-    // Stream toggle via event delegation (robust with dynamic content)
-    elements.streamsGrid.addEventListener('change', (e) => {
-        const toggle = e.target.closest('.stream-toggle-input');
-        if (toggle) {
-            const streamName = toggle.dataset.stream;
-            handleToggleStream(streamName, toggle.checked);
-        }
-    });
+    // Dashboard event listeners
+    if (elements.connectBtn) {
+        elements.connectBtn.addEventListener('click', handleConnect);
+    }
+    if (elements.scanBtn) {
+        elements.scanBtn.addEventListener('click', handleScan);
+    }
+    if (elements.enableAllBtn) {
+        elements.enableAllBtn.addEventListener('click', () => toggleAllStreams(true));
+    }
+    if (elements.disableAllBtn) {
+        elements.disableAllBtn.addEventListener('click', () => toggleAllStreams(false));
+    }
+    if (elements.streamsGrid) {
+        elements.streamsGrid.addEventListener('change', (e) => {
+            const toggle = e.target.closest('.stream-toggle-input');
+            if (toggle) {
+                const streamName = toggle.dataset.stream;
+                handleToggleStream(streamName, toggle.checked);
+            }
+        });
+    }
+    if (elements.phoneIP) {
+        elements.phoneIP.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') handleConnect();
+        });
+    }
 
-    // Enter key on input
-    elements.phoneIP.addEventListener('keypress', (e) => {
-        if (e.key === 'Enter') handleConnect();
-    });
+    // Remote event listeners
+    if (elements.remoteScreenToggleBtn) {
+        elements.remoteScreenToggleBtn.addEventListener('click', toggleRemoteScreen);
+    }
+    if (elements.remoteWakeBtn) {
+        elements.remoteWakeBtn.addEventListener('click', wakeRemotePhoneScreen);
+    }
+    if (pageMode === 'remote') {
+        window.addEventListener('beforeunload', restoreRemotePhoneScreen);
+        window.addEventListener('pagehide', restoreRemotePhoneScreen);
+    }
 
     // Initial render
     renderStreams();
@@ -102,6 +133,7 @@ function connectWebSocket() {
                 clearTimeout(state.wsReconnectTimer);
                 state.wsReconnectTimer = null;
             }
+            maybeApplyRemoteMode();
         };
         
         state.ws.onmessage = (event) => {
@@ -172,10 +204,12 @@ function updateStreamFromWS(streamData) {
         Object.assign(stream, streamData);
         renderStreams();
         updateStatusDisplay();
+        updateRemoteUI();
 
         // Show/hide screen viewer
         if (stream.name === 'screen') {
             showScreenViewer(stream.active && state.connected);
+            maybeApplyRemoteMode();
         }
     }
 }
@@ -327,6 +361,7 @@ function toggleAllStreams(active) {
 // ============================================
 
 function renderStreams() {
+    if (!elements.streamsGrid) return;
     elements.streamsGrid.innerHTML = state.streams.map(stream => `
         <div class="stream-card ${stream.active ? 'active' : 'inactive'}" data-stream="${stream.name}">
             <div class="stream-header">
@@ -378,6 +413,7 @@ function renderStreamMetrics(stream) {
 }
 
 function renderPhoneList() {
+    if (!elements.phoneList) return;
     if (state.phones.length === 0) {
         elements.phoneList.innerHTML = `
             <div class="empty-state">
@@ -410,21 +446,27 @@ function renderPhoneList() {
 
 function updateConnectionUI() {
     // Update status indicator
-    elements.statusDot.className = `status-dot ${state.connected ? 'connected' : 'disconnected'}`;
-    elements.statusText.textContent = state.connected ? 'Connected' : 'Disconnected';
+    if (elements.statusDot) {
+        elements.statusDot.className = `status-dot ${state.connected ? 'connected' : 'disconnected'}`;
+    }
+    if (elements.statusText) {
+        elements.statusText.textContent = state.connected ? 'Connected' : 'Disconnected';
+    }
 
-    // Update connect button
-    if (state.connected) {
-        elements.connectBtn.textContent = 'Disconnect';
-        elements.connectBtn.className = 'btn btn-danger';
-        elements.connectBtn.onclick = handleDisconnect;
-        elements.phoneIP.disabled = true;
-    } else {
-        elements.connectBtn.textContent = 'Connect';
-        elements.connectBtn.className = 'btn btn-primary';
-        elements.connectBtn.onclick = handleConnect;
-        elements.phoneIP.disabled = false;
-        elements.phoneIP.value = '';
+    // Update connect button (dashboard only)
+    if (elements.connectBtn && elements.phoneIP) {
+        if (state.connected) {
+            elements.connectBtn.textContent = 'Disconnect';
+            elements.connectBtn.className = 'btn btn-danger';
+            elements.connectBtn.onclick = handleDisconnect;
+            elements.phoneIP.disabled = true;
+        } else {
+            elements.connectBtn.textContent = 'Connect';
+            elements.connectBtn.className = 'btn btn-primary';
+            elements.connectBtn.onclick = handleConnect;
+            elements.phoneIP.disabled = false;
+            elements.phoneIP.value = '';
+        }
     }
 
     // Re-render phone list to update button states
@@ -435,6 +477,10 @@ function updateConnectionStatus(status) {
     if (status.connected !== state.connected) {
         state.connected = status.connected;
         state.currentPhone = status.phone;
+        if (!state.connected) {
+            state.remotePowerOffAutoTried = false;
+            state.remotePowerOffSent = false;
+        }
         updateConnectionUI();
     }
 
@@ -448,7 +494,11 @@ function updateConnectionStatus(status) {
         renderStreams();
     }
 
+    const screen = getStream('screen');
+    showScreenViewer(Boolean(screen?.active && state.connected));
     updateStatusDisplay();
+    updateRemoteUI();
+    maybeApplyRemoteMode();
 }
 
 function updateStatusDisplay() {
@@ -483,6 +533,89 @@ function updateStatusDisplay() {
             }
         }
     });
+}
+
+function getStream(name) {
+    return state.streams.find(stream => stream.name === name) || null;
+}
+
+function updateRemoteUI() {
+    if (pageMode !== 'remote') return;
+    const screen = getStream('screen');
+
+    if (elements.remotePhoneStatus) {
+        elements.remotePhoneStatus.textContent = state.connected
+            ? (state.currentPhone?.ip || state.currentPhone?.name || 'Connected')
+            : 'Disconnected';
+        elements.remotePhoneStatus.className = `status-value remote-status-value ${state.connected ? 'active' : 'inactive'}`;
+    }
+
+    if (elements.remotePowerStatus) {
+        if (!state.connected) {
+            elements.remotePowerStatus.textContent = 'Connect from dashboard first';
+        } else if (screen?.active) {
+            elements.remotePowerStatus.textContent = state.remotePowerOffSent || state.remotePowerOffAutoTried
+                ? 'Remote mode active · phone display off requested'
+                : 'Remote mode ready';
+        } else {
+            elements.remotePowerStatus.textContent = 'Start the screen stream to control';
+        }
+    }
+
+    if (elements.remoteScreenToggleBtn) {
+        elements.remoteScreenToggleBtn.textContent = screen?.active ? 'Stop Screen' : 'Start Screen';
+        elements.remoteScreenToggleBtn.disabled = !state.connected;
+    }
+
+    if (elements.remoteWakeBtn) {
+        elements.remoteWakeBtn.disabled = !state.connected;
+    }
+}
+
+async function toggleRemoteScreen() {
+    const screen = getStream('screen');
+    if (!screen || !state.connected) {
+        showError('Connect from the dashboard first');
+        return;
+    }
+    await handleToggleStream('screen', !screen.active);
+}
+
+function maybeApplyRemoteMode() {
+    if (pageMode !== 'remote') return;
+    const screen = getStream('screen');
+    if (!state.connected || !screen?.active) {
+        state.remotePowerOffAutoTried = false;
+        state.remotePowerOffSent = false;
+        return;
+    }
+    if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
+        return;
+    }
+    if (!state.remotePowerOffAutoTried) {
+        sendControlPacket(buildSetDisplayPowerControlMessage(false), { markPowerOff: false });
+        state.remotePowerOffAutoTried = true;
+        if (elements.remotePowerStatus) {
+            elements.remotePowerStatus.textContent = 'Requested phone display off for remote mode';
+        }
+    }
+}
+
+function wakeRemotePhoneScreen() {
+    if (pageMode !== 'remote') return;
+    sendControlPacket(buildSetDisplayPowerControlMessage(true), { force: true, wake: true });
+    state.remotePowerOffAutoTried = false;
+    state.remotePowerOffSent = false;
+    if (elements.remotePowerStatus) {
+        elements.remotePowerStatus.textContent = 'Requested phone display on';
+    }
+}
+
+function restoreRemotePhoneScreen() {
+    if (pageMode !== 'remote') return;
+    if (!state.ws || state.ws.readyState !== WebSocket.OPEN) return;
+    if (!state.remotePowerOffAutoTried && !state.remotePowerOffSent) return;
+    sendControlPacket(buildSetDisplayPowerControlMessage(true), { force: true, wake: true });
 }
 
 // ============================================
@@ -571,42 +704,100 @@ let screenFpsCounter = 0;
 let screenActive = false;
 let screenConfigured = false;
 let screenConfig = { sps: [], pps: [] };
+let screenVideoSize = { width: 0, height: 0 };
+let screenPointerDown = false;
 
 function initScreenViewer() {
     screenCanvasEl = document.getElementById('screenCanvas');
+    if (!screenCanvasEl) return;
     screenCtx = screenCanvasEl.getContext('2d');
 
-    // Mouse events for control
-    screenCanvasEl.addEventListener('mousedown', (e) => {
+    if (pageMode !== 'remote') {
+        return;
+    }
+
+    screenCanvasEl.tabIndex = 0;
+
+    const sendTouch = (action, e) => {
         if (!screenActive) return;
-        const rect = screenCanvasEl.getBoundingClientRect();
-        sendControlMessage({ type: 'touch', action: 'down', x: (e.clientX - rect.left) / rect.width, y: (e.clientY - rect.top) / rect.height, pointer_id: 0 });
+        const position = getScreenPointerPosition(e);
+        if (!position) return;
+        sendControlPacket(buildTouchControlMessage({
+            action,
+            pointerId: 0,
+            x: position.x,
+            y: position.y,
+            screenWidth: position.screenWidth,
+            screenHeight: position.screenHeight,
+            pressure: action === ANDROID_MOTION_ACTION_UP ? 0 : 1,
+            actionButton: ANDROID_BUTTON_PRIMARY,
+            buttons: action === ANDROID_MOTION_ACTION_UP ? 0 : ANDROID_BUTTON_PRIMARY,
+        }), { markPowerOff: true });
+    };
+
+    screenCanvasEl.addEventListener('mousedown', (e) => {
+        if (!screenActive || e.button !== 0) return;
+        e.preventDefault();
+        screenCanvasEl.focus();
+        screenPointerDown = true;
+        sendTouch(ANDROID_MOTION_ACTION_DOWN, e);
     });
     screenCanvasEl.addEventListener('mouseup', (e) => {
-        if (!screenActive) return;
-        const rect = screenCanvasEl.getBoundingClientRect();
-        sendControlMessage({ type: 'touch', action: 'up', x: (e.clientX - rect.left) / rect.width, y: (e.clientY - rect.top) / rect.height, pointer_id: 0 });
+        if (!screenActive || e.button !== 0) return;
+        e.preventDefault();
+        sendTouch(ANDROID_MOTION_ACTION_UP, e);
+        screenPointerDown = false;
+    });
+    screenCanvasEl.addEventListener('mouseleave', (e) => {
+        if (!screenActive || !screenPointerDown) return;
+        sendTouch(ANDROID_MOTION_ACTION_UP, e);
+        screenPointerDown = false;
     });
     screenCanvasEl.addEventListener('mousemove', (e) => {
-        if (!screenActive || !e.buttons) return;
-        const rect = screenCanvasEl.getBoundingClientRect();
-        sendControlMessage({ type: 'touch', action: 'move', x: (e.clientX - rect.left) / rect.width, y: (e.clientY - rect.top) / rect.height, pointer_id: 0 });
+        if (!screenActive || !screenPointerDown) return;
+        e.preventDefault();
+        sendTouch(ANDROID_MOTION_ACTION_MOVE, e);
     });
 
-    // Keyboard events
     document.addEventListener('keydown', (e) => {
         if (!screenActive) return;
-        sendControlMessage({ type: 'key', action: 'down', keycode: e.keyCode, meta_state: 0 });
+        const keycode = mapBrowserKeyToAndroid(e);
+        if (keycode == null) return;
+        e.preventDefault();
+        sendControlPacket(buildKeyControlMessage({
+            action: ANDROID_KEY_ACTION_DOWN,
+            keycode,
+            repeat: e.repeat ? 1 : 0,
+            metaState: 0,
+        }), { markPowerOff: true });
     });
     document.addEventListener('keyup', (e) => {
         if (!screenActive) return;
-        sendControlMessage({ type: 'key', action: 'up', keycode: e.keyCode, meta_state: 0 });
+        const keycode = mapBrowserKeyToAndroid(e);
+        if (keycode == null) return;
+        e.preventDefault();
+        sendControlPacket(buildKeyControlMessage({
+            action: ANDROID_KEY_ACTION_UP,
+            keycode,
+            repeat: 0,
+            metaState: 0,
+        }), { markPowerOff: true });
     });
 }
 
-function sendControlMessage(data) {
+function sendControlPacket(data, options = {}) {
+    if (!(data instanceof Uint8Array)) return;
+    if (pageMode === 'remote' && options.force !== true && !screenActive) return;
     if (state.ws && state.ws.readyState === WebSocket.OPEN) {
-        state.ws.send(JSON.stringify({ type: 'control', data }));
+        if (pageMode === 'remote' && options.wake !== true && options.markPowerOff === true && !state.remotePowerOffSent) {
+            state.ws.send(buildSetDisplayPowerControlMessage(false));
+            state.remotePowerOffSent = true;
+            state.remotePowerOffAutoTried = true;
+            if (elements.remotePowerStatus) {
+                elements.remotePowerStatus.textContent = 'Phone display off while remote control is active';
+            }
+        }
+        state.ws.send(data);
     }
 }
 
@@ -623,6 +814,8 @@ function ensureScreenDecoder() {
                 screenCanvasEl.width = frame.displayWidth;
                 screenCanvasEl.height = frame.displayHeight;
             }
+            screenVideoSize.width = frame.displayWidth;
+            screenVideoSize.height = frame.displayHeight;
 
             screenCtx.drawImage(frame, 0, 0);
             frame.close();
@@ -675,6 +868,8 @@ function destroyScreenDecoder() {
     }
     screenConfigured = false;
     screenConfig = { sps: [], pps: [] };
+    screenVideoSize = { width: 0, height: 0 };
+    screenPointerDown = false;
     screenFrameCount = 0;
     screenFpsCounter = 0;
     if (screenCanvasEl) {
@@ -832,9 +1027,121 @@ function byteArrayEquals(a, b) {
     return true;
 }
 
+const SCRCPY_CONTROL_TYPE_KEYCODE = 0;
+const SCRCPY_CONTROL_TYPE_TOUCH = 2;
+const SCRCPY_CONTROL_TYPE_SET_DISPLAY_POWER = 10;
+const ANDROID_KEY_ACTION_DOWN = 0;
+const ANDROID_KEY_ACTION_UP = 1;
+const ANDROID_MOTION_ACTION_DOWN = 0;
+const ANDROID_MOTION_ACTION_UP = 1;
+const ANDROID_MOTION_ACTION_MOVE = 2;
+const ANDROID_BUTTON_PRIMARY = 1;
+
+function getScreenPointerPosition(e) {
+    if (!screenCanvasEl || !screenVideoSize.width || !screenVideoSize.height) {
+        return null;
+    }
+    const rect = screenCanvasEl.getBoundingClientRect();
+    if (!rect.width || !rect.height) {
+        return null;
+    }
+    const relX = clamp((e.clientX - rect.left) / rect.width, 0, 1);
+    const relY = clamp((e.clientY - rect.top) / rect.height, 0, 1);
+    return {
+        x: Math.round(relX * (screenVideoSize.width - 1)),
+        y: Math.round(relY * (screenVideoSize.height - 1)),
+        screenWidth: screenVideoSize.width,
+        screenHeight: screenVideoSize.height,
+    };
+}
+
+function buildKeyControlMessage({ action, keycode, repeat = 0, metaState = 0 }) {
+    const data = new Uint8Array(14);
+    const view = new DataView(data.buffer);
+    view.setUint8(0, SCRCPY_CONTROL_TYPE_KEYCODE);
+    view.setUint8(1, action);
+    view.setInt32(2, keycode, false);
+    view.setInt32(6, repeat, false);
+    view.setInt32(10, metaState, false);
+    return data;
+}
+
+function buildTouchControlMessage({ action, pointerId, x, y, screenWidth, screenHeight, pressure, actionButton, buttons }) {
+    const data = new Uint8Array(32);
+    const view = new DataView(data.buffer);
+    view.setUint8(0, SCRCPY_CONTROL_TYPE_TOUCH);
+    view.setUint8(1, action);
+    setUint64BE(view, 2, pointerId);
+    view.setInt32(10, x, false);
+    view.setInt32(14, y, false);
+    view.setUint16(18, screenWidth, false);
+    view.setUint16(20, screenHeight, false);
+    view.setUint16(22, floatToU16FixedPoint(pressure), false);
+    view.setInt32(24, actionButton, false);
+    view.setInt32(28, buttons, false);
+    return data;
+}
+
+function buildSetDisplayPowerControlMessage(on) {
+    const data = new Uint8Array(2);
+    const view = new DataView(data.buffer);
+    view.setUint8(0, SCRCPY_CONTROL_TYPE_SET_DISPLAY_POWER);
+    view.setUint8(1, on ? 1 : 0);
+    return data;
+}
+
+function setUint64BE(view, offset, value) {
+    const big = BigInt(value);
+    view.setUint32(offset, Number((big >> 32n) & 0xffffffffn), false);
+    view.setUint32(offset + 4, Number(big & 0xffffffffn), false);
+}
+
+function floatToU16FixedPoint(value) {
+    const clamped = clamp(value, 0, 1);
+    return Math.round(clamped * 0xffff);
+}
+
+function clamp(value, min, max) {
+    return Math.min(max, Math.max(min, value));
+}
+
+function mapBrowserKeyToAndroid(e) {
+    const special = {
+        Enter: 66,
+        Backspace: 67,
+        Delete: 112,
+        Escape: 4,
+        Tab: 61,
+        ' ': 62,
+        ArrowUp: 19,
+        ArrowDown: 20,
+        ArrowLeft: 21,
+        ArrowRight: 22,
+        Home: 3,
+        End: 123,
+        PageUp: 92,
+        PageDown: 93,
+    };
+    if (special[e.key] != null) {
+        return special[e.key];
+    }
+    if (/^[a-zA-Z]$/.test(e.key)) {
+        return 29 + (e.key.toUpperCase().charCodeAt(0) - 65);
+    }
+    if (/^[0-9]$/.test(e.key)) {
+        return 7 + Number(e.key);
+    }
+    return null;
+}
+
 function showScreenViewer(show) {
     screenActive = show;
     const panel = document.getElementById('screenPanel');
-    if (panel) panel.style.display = show ? '' : 'none';
+    if (panel && pageMode === 'dashboard') {
+        panel.style.display = show ? '' : 'none';
+    }
+    if (show && pageMode === 'remote' && screenCanvasEl) {
+        screenCanvasEl.focus();
+    }
     if (!show) destroyScreenDecoder();
 }
