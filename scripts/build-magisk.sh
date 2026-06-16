@@ -10,7 +10,7 @@
 #   ./scripts/build-magisk.sh
 #
 # Output:
-#   bin/allrelay-magisk-{version}.zip
+#   bin/allrelay-magisk.zip
 
 set -e
 
@@ -73,7 +73,7 @@ chmod +x "$PROJECT_ROOT/magisk/META-INF/com/google/android/update-binary"
 
 # ─── Create ZIP ───────────────────────────────────────────────────
 OUTPUT_DIR="$PROJECT_ROOT/bin"
-OUTPUT_FILE="$OUTPUT_DIR/allrelay-magisk-${VERSION}.zip"
+OUTPUT_FILE="$OUTPUT_DIR/allrelay-magisk.zip"
 
 mkdir -p "$OUTPUT_DIR"
 
@@ -102,7 +102,7 @@ echo "  1. Push the ZIP to your phone:"
 echo "     adb push $OUTPUT_FILE /sdcard/"
 echo ""
 echo "  2. Open Magisk Manager → Modules → Install from storage"
-echo "     Select: allrelay-magisk-${VERSION}.zip"
+echo "     Select: allrelay-magisk.zip"
 echo ""
 echo "  3. Reboot your phone"
 echo ""

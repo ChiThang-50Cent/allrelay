@@ -124,8 +124,7 @@ allrelay/
 ├── android/           # Android controller app
 ├── scrcpy/            # Forked scrcpy server/client sources
 ├── magisk/            # Magisk module
-├── configs/           # PipeWire + systemd configs
-├── scripts/           # Build/install helpers
+├── scripts/           # Build helpers / dev utilities
 └── docs/              # Project notes and protocol docs
 ```
 

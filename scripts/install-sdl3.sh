@@ -51,7 +51,7 @@ if pkg-config --exists sdl3; then
     ok "SDL3 $(pkg-config --modversion sdl3) installed"
     rm -rf "$SDL_DIR"
     echo ""
-    echo "Now run: ./scripts/build-phase2.sh"
+    echo "Now run: ./scripts/build.sh client"
 else
     echo "ERROR: SDL3 not found after install"
     echo "Check: ls /usr/local/lib/libSDL3*"
