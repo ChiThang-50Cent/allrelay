@@ -63,11 +63,10 @@ Outputs:
 - `bin/scrcpy-server-allrelay`
 - `bin/allrelay-magisk.zip`
 
-### Optional helper builds
+### Optional single-artifact build
 
 ```bash
-./scripts/build.sh server   # Android server artifact only
-./scripts/build.sh mdns     # legacy mDNS helper only
+./scripts/build.sh          # Android server artifact only
 ```
 
 ## Install
@@ -132,7 +131,6 @@ allrelay/
 
 - The web UI is the primary control surface.
 - Discovery in the dashboard uses **UDP subnet scan**.
-- `allrelay-discover` is only a **legacy optional helper**.
 - Screen/control use the **raw binary scrcpy control protocol**, not JSON.
 - The packaged Linux service is a **user service**, not a system service.
 
