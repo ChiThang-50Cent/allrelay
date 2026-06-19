@@ -33,6 +33,10 @@ const state = {
     remotePowerOffSent: false,
     remotePopup: null,
     remotePopupCloseHandled: false,
+    clipboardSyncPermissionRequested: false,
+    clipboardReadEnabled: false,
+    lastLocalClipboardText: '',
+    lastSentClipboardText: '',
 };
 
 let screenConfigKey = '';
@@ -103,6 +107,8 @@ function init() {
         window.addEventListener('beforeunload', restoreRemotePhoneScreen);
         window.addEventListener('pagehide', restoreRemotePhoneScreen);
         window.addEventListener('blur', resetKeyboardState);
+        document.addEventListener('paste', handleRemotePaste);
+        setInterval(syncLocalClipboardLoop, 1000);
     }
 
     // Initial render
@@ -523,6 +529,7 @@ function updateConnectionStatus(status) {
         state.currentPhone = status.phone;
         if (!state.connected) {
             resetRemotePowerState();
+            resetClipboardState();
             closeRemotePopup();
         }
         updateConnectionUI();
@@ -710,6 +717,7 @@ function maybeApplyRemoteMode() {
     if (!state.remotePowerOffAutoTried) {
         sendDisplayPowerRequest(false);
     }
+    maybeEnableLocalClipboardSync();
 }
 
 function wakeRemotePhoneScreen() {
@@ -794,6 +802,71 @@ function showToast(message, type = 'info') {
         toast.style.transform = 'translateY(20px)';
         setTimeout(() => toast.remove(), 300);
     }, 3000);
+}
+
+// TODO(allrelay): Revisit Android -> PC clipboard sync. Browsers may reject
+// clipboard writes from WebSocket/timer callbacks, so for now remote clipboard
+// support is intentionally one-way: local clipboard / paste -> Android.
+async function maybeEnableLocalClipboardSync() {
+    if (pageMode !== 'remote' || state.clipboardSyncPermissionRequested) {
+        return;
+    }
+    state.clipboardSyncPermissionRequested = true;
+    if (!navigator.clipboard?.readText) {
+        return;
+    }
+    try {
+        const text = await navigator.clipboard.readText();
+        state.clipboardReadEnabled = true;
+        state.lastLocalClipboardText = text;
+        state.lastSentClipboardText = text;
+    } catch (error) {
+        // Paste still works even if clipboard read permission is denied.
+    }
+}
+
+function resetClipboardState() {
+    state.clipboardSyncPermissionRequested = false;
+    state.clipboardReadEnabled = false;
+    state.lastLocalClipboardText = '';
+    state.lastSentClipboardText = '';
+}
+
+async function syncLocalClipboardLoop() {
+    const screen = getStream('screen');
+    if (pageMode !== 'remote' || !screenActive || !state.connected || !screen?.active) {
+        return;
+    }
+    if (!state.clipboardReadEnabled || !navigator.clipboard?.readText) {
+        return;
+    }
+
+    try {
+        const text = await navigator.clipboard.readText();
+        if (!text || text === state.lastLocalClipboardText) {
+            return;
+        }
+        state.lastLocalClipboardText = text;
+        if (text === state.lastSentClipboardText) {
+            return;
+        }
+        const sent = sendControlPacket(buildSetClipboardControlMessage(text, false), { force: true, markPowerOff: false });
+        if (sent) {
+            state.lastSentClipboardText = text;
+        }
+    } catch (error) {
+        // Best-effort only.
+    }
+}
+
+function handleRemotePaste(e) {
+    if (pageMode !== 'remote' || !screenActive) return;
+    const text = e.clipboardData?.getData('text/plain') || '';
+    if (!text) return;
+    e.preventDefault();
+    state.lastLocalClipboardText = text;
+    state.lastSentClipboardText = text;
+    sendControlPacket(buildSetClipboardControlMessage(text, true), { force: true, markPowerOff: false });
 }
 
 function connectToPhone(ip) {
@@ -923,14 +996,16 @@ function initScreenViewer() {
 }
 
 function sendControlPacket(data, options = {}) {
-    if (!(data instanceof Uint8Array)) return;
-    if (pageMode === 'remote' && options.force !== true && !screenActive) return;
+    if (!(data instanceof Uint8Array)) return false;
+    if (pageMode === 'remote' && options.force !== true && !screenActive) return false;
     if (state.ws && state.ws.readyState === WebSocket.OPEN) {
         if (pageMode === 'remote' && options.wake !== true && options.markPowerOff === true && !state.remotePowerOffSent) {
             sendDisplayPowerRequest(false);
         }
         state.ws.send(data);
+        return true;
     }
+    return false;
 }
 
 function resetRemotePowerState() {
@@ -1269,8 +1344,10 @@ function fitPopupToVideo(width, height) {
 const SCRCPY_CONTROL_TYPE_KEYCODE = 0;
 const SCRCPY_CONTROL_TYPE_TEXT = 1;
 const SCRCPY_CONTROL_TYPE_TOUCH = 2;
+const SCRCPY_CONTROL_TYPE_SET_CLIPBOARD = 9;
 const SCRCPY_CONTROL_TYPE_SET_DISPLAY_POWER = 10;
 const SCRCPY_INJECT_TEXT_MAX_LENGTH = 300;
+const SCRCPY_CLIPBOARD_TEXT_MAX_LENGTH = (1 << 18) - 14;
 const ANDROID_KEY_ACTION_DOWN = 0;
 const ANDROID_KEY_ACTION_UP = 1;
 const ANDROID_MOTION_ACTION_DOWN = 0;
@@ -1327,6 +1404,19 @@ function buildTextControlMessage(text) {
     view.setUint8(0, SCRCPY_CONTROL_TYPE_TEXT);
     view.setUint32(1, encoded.length, false);
     data.set(encoded, 5);
+    return data;
+}
+
+function buildSetClipboardControlMessage(text, paste = false) {
+    const encoder = new TextEncoder();
+    const encoded = encoder.encode(truncateUTF8(text, SCRCPY_CLIPBOARD_TEXT_MAX_LENGTH));
+    const data = new Uint8Array(1 + 8 + 1 + 4 + encoded.length);
+    const view = new DataView(data.buffer);
+    view.setUint8(0, SCRCPY_CONTROL_TYPE_SET_CLIPBOARD);
+    setUint64BE(view, 1, 0);
+    view.setUint8(9, paste ? 1 : 0);
+    view.setUint32(10, encoded.length, false);
+    data.set(encoded, 14);
     return data;
 }
 
