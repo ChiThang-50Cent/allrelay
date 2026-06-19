@@ -12,6 +12,7 @@
 - Remote screen popup no longer steals focus on repeated status updates, so minimizing the popup now stays minimized.
 - Remote screen mode now issues explicit display power off/on requests at screen start/stop and remote wake/restore boundaries.
 - Android daemon launch now follows scrcpy-style remote power semantics with `power_on=false` and `keep_active=true` to avoid unintended wake-ups while keeping the device awake during remote screen sessions.
+- Remote keyboard input now supports Shift-modified uppercase entry, common punctuation keys, printable text injection, and richer Android modifier meta-state handling closer to scrcpy behavior.
 
 ### Packaging
-- Rebuilt and verified updated Ubuntu package, Android debug APK, and Magisk module artifacts for the Web UI helper, popup, and screen power fixes.
+- Rebuilt and verified updated Ubuntu package, Android debug APK, and Magisk module artifacts for the Web UI helper, popup, screen power, and keyboard compatibility fixes.

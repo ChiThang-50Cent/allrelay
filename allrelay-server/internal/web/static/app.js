@@ -102,6 +102,7 @@ function init() {
     if (pageMode === 'remote') {
         window.addEventListener('beforeunload', restoreRemotePhoneScreen);
         window.addEventListener('pagehide', restoreRemotePhoneScreen);
+        window.addEventListener('blur', resetKeyboardState);
     }
 
     // Initial render
@@ -820,6 +821,8 @@ let screenConfigured = false;
 let screenConfig = { sps: [], pps: [] };
 let screenVideoSize = { width: 0, height: 0 };
 let screenPointerDown = false;
+const textInjectedKeysDown = new Set();
+const modifierKeysDown = new Set();
 
 function initScreenViewer() {
     screenCanvasEl = document.getElementById('screenCanvas');
@@ -875,6 +878,17 @@ function initScreenViewer() {
 
     document.addEventListener('keydown', (e) => {
         if (!screenActive) return;
+        updateModifierKeyState(e, true);
+
+        if (shouldInjectTextInput(e)) {
+            e.preventDefault();
+            if (e.code) {
+                textInjectedKeysDown.add(e.code);
+            }
+            sendControlPacket(buildTextControlMessage(e.key), { markPowerOff: true });
+            return;
+        }
+
         const keycode = mapBrowserKeyToAndroid(e);
         if (keycode == null) return;
         e.preventDefault();
@@ -882,20 +896,29 @@ function initScreenViewer() {
             action: ANDROID_KEY_ACTION_DOWN,
             keycode,
             repeat: e.repeat ? 1 : 0,
-            metaState: 0,
+            metaState: getAndroidMetaState(e),
         }), { markPowerOff: true });
     });
     document.addEventListener('keyup', (e) => {
         if (!screenActive) return;
+        if (e.code && textInjectedKeysDown.has(e.code)) {
+            textInjectedKeysDown.delete(e.code);
+            e.preventDefault();
+            return;
+        }
         const keycode = mapBrowserKeyToAndroid(e);
-        if (keycode == null) return;
+        if (keycode == null) {
+            updateModifierKeyState(e, false);
+            return;
+        }
         e.preventDefault();
         sendControlPacket(buildKeyControlMessage({
             action: ANDROID_KEY_ACTION_UP,
             keycode,
             repeat: 0,
-            metaState: 0,
+            metaState: getAndroidMetaState(e),
         }), { markPowerOff: true });
+        updateModifierKeyState(e, false);
     });
 }
 
@@ -1244,14 +1267,28 @@ function fitPopupToVideo(width, height) {
 }
 
 const SCRCPY_CONTROL_TYPE_KEYCODE = 0;
+const SCRCPY_CONTROL_TYPE_TEXT = 1;
 const SCRCPY_CONTROL_TYPE_TOUCH = 2;
 const SCRCPY_CONTROL_TYPE_SET_DISPLAY_POWER = 10;
+const SCRCPY_INJECT_TEXT_MAX_LENGTH = 300;
 const ANDROID_KEY_ACTION_DOWN = 0;
 const ANDROID_KEY_ACTION_UP = 1;
 const ANDROID_MOTION_ACTION_DOWN = 0;
 const ANDROID_MOTION_ACTION_UP = 1;
 const ANDROID_MOTION_ACTION_MOVE = 2;
 const ANDROID_BUTTON_PRIMARY = 1;
+const AMETA_SHIFT_ON = 0x01;
+const AMETA_ALT_ON = 0x02;
+const AMETA_SHIFT_LEFT_ON = 0x40;
+const AMETA_SHIFT_RIGHT_ON = 0x80;
+const AMETA_CTRL_ON = 0x1000;
+const AMETA_CTRL_LEFT_ON = 0x2000;
+const AMETA_CTRL_RIGHT_ON = 0x4000;
+const AMETA_META_ON = 0x10000;
+const AMETA_META_LEFT_ON = 0x20000;
+const AMETA_META_RIGHT_ON = 0x40000;
+const AMETA_CAPS_LOCK_ON = 0x100000;
+const AMETA_NUM_LOCK_ON = 0x200000;
 
 function getScreenPointerPosition(e) {
     if (!screenCanvasEl || !screenVideoSize.width || !screenVideoSize.height) {
@@ -1279,6 +1316,17 @@ function buildKeyControlMessage({ action, keycode, repeat = 0, metaState = 0 }) 
     view.setInt32(2, keycode, false);
     view.setInt32(6, repeat, false);
     view.setInt32(10, metaState, false);
+    return data;
+}
+
+function buildTextControlMessage(text) {
+    const encoder = new TextEncoder();
+    const encoded = encoder.encode(truncateUTF8(text, SCRCPY_INJECT_TEXT_MAX_LENGTH));
+    const data = new Uint8Array(1 + 4 + encoded.length);
+    const view = new DataView(data.buffer);
+    view.setUint8(0, SCRCPY_CONTROL_TYPE_TEXT);
+    view.setUint32(1, encoded.length, false);
+    data.set(encoded, 5);
     return data;
 }
 
@@ -1321,31 +1369,124 @@ function clamp(value, min, max) {
     return Math.min(max, Math.max(min, value));
 }
 
+function truncateUTF8(text, maxBytes) {
+    if (!text) return '';
+    const encoder = new TextEncoder();
+    let out = '';
+    for (const ch of text) {
+        const next = out + ch;
+        if (encoder.encode(next).length > maxBytes) {
+            break;
+        }
+        out = next;
+    }
+    return out;
+}
+
+function shouldInjectTextInput(e) {
+    if (e.isComposing) return false;
+    if (!e.key || e.key.length !== 1) return false;
+    if (e.ctrlKey || e.metaKey) return false;
+    if (e.altKey && !e.getModifierState('AltGraph')) return false;
+    return true;
+}
+
+function updateModifierKeyState(e, isDown) {
+    if (!e.code) return;
+    if (!['ShiftLeft', 'ShiftRight', 'ControlLeft', 'ControlRight', 'AltLeft', 'AltRight', 'MetaLeft', 'MetaRight'].includes(e.code)) {
+        return;
+    }
+    if (isDown) {
+        modifierKeysDown.add(e.code);
+    } else {
+        modifierKeysDown.delete(e.code);
+    }
+}
+
+function resetKeyboardState() {
+    textInjectedKeysDown.clear();
+    modifierKeysDown.clear();
+}
+
+function getAndroidMetaState(e) {
+    let metaState = 0;
+
+    const shiftLeft = modifierKeysDown.has('ShiftLeft');
+    const shiftRight = modifierKeysDown.has('ShiftRight');
+    const ctrlLeft = modifierKeysDown.has('ControlLeft');
+    const ctrlRight = modifierKeysDown.has('ControlRight');
+    const altLeft = modifierKeysDown.has('AltLeft');
+    const altRight = modifierKeysDown.has('AltRight') || e.getModifierState('AltGraph');
+    const metaLeft = modifierKeysDown.has('MetaLeft');
+    const metaRight = modifierKeysDown.has('MetaRight');
+
+    if (shiftLeft) metaState |= AMETA_SHIFT_LEFT_ON;
+    if (shiftRight) metaState |= AMETA_SHIFT_RIGHT_ON;
+    if (shiftLeft || shiftRight) metaState |= AMETA_SHIFT_ON;
+    if (altLeft) metaState |= AMETA_ALT_LEFT_ON;
+    if (altRight) metaState |= AMETA_ALT_RIGHT_ON;
+    if (altLeft || altRight) metaState |= AMETA_ALT_ON;
+    if (ctrlLeft) metaState |= AMETA_CTRL_LEFT_ON;
+    if (ctrlRight) metaState |= AMETA_CTRL_RIGHT_ON;
+    if (ctrlLeft || ctrlRight) metaState |= AMETA_CTRL_ON;
+    if (metaLeft) metaState |= AMETA_META_LEFT_ON;
+    if (metaRight) metaState |= AMETA_META_RIGHT_ON;
+    if (metaLeft || metaRight) metaState |= AMETA_META_ON;
+    if (e.getModifierState('CapsLock')) metaState |= AMETA_CAPS_LOCK_ON;
+    if (e.getModifierState('NumLock')) metaState |= AMETA_NUM_LOCK_ON;
+
+    return metaState;
+}
+
 function mapBrowserKeyToAndroid(e) {
-    const special = {
+    const codeMap = {
         Enter: 66,
+        NumpadEnter: 160,
         Backspace: 67,
         Delete: 112,
-        Escape: 4,
+        Escape: 111,
         Tab: 61,
-        ' ': 62,
+        Space: 62,
         ArrowUp: 19,
         ArrowDown: 20,
         ArrowLeft: 21,
         ArrowRight: 22,
-        Home: 3,
+        Home: 122,
         End: 123,
         PageUp: 92,
         PageDown: 93,
+        ShiftLeft: 59,
+        ShiftRight: 60,
+        ControlLeft: 113,
+        ControlRight: 114,
+        AltLeft: 57,
+        AltRight: 58,
+        MetaLeft: 117,
+        MetaRight: 118,
+        Minus: 69,
+        Equal: 70,
+        BracketLeft: 71,
+        BracketRight: 72,
+        Backslash: 73,
+        Semicolon: 74,
+        Quote: 75,
+        Slash: 76,
+        Backquote: 68,
+        Comma: 55,
+        Period: 56,
     };
-    if (special[e.key] != null) {
-        return special[e.key];
+
+    if (codeMap[e.code] != null) {
+        return codeMap[e.code];
     }
-    if (/^[a-zA-Z]$/.test(e.key)) {
-        return 29 + (e.key.toUpperCase().charCodeAt(0) - 65);
+    if (/^Key[A-Z]$/.test(e.code)) {
+        return 29 + (e.code.charCodeAt(3) - 65);
     }
-    if (/^[0-9]$/.test(e.key)) {
-        return 7 + Number(e.key);
+    if (/^Digit[0-9]$/.test(e.code)) {
+        return 7 + Number(e.code.slice(5));
+    }
+    if (/^Numpad[0-9]$/.test(e.code)) {
+        return 144 + Number(e.code.slice(6));
     }
     return null;
 }
@@ -1355,5 +1496,8 @@ function showScreenViewer(show) {
     if (show && pageMode === 'remote' && screenCanvasEl) {
         screenCanvasEl.focus();
     }
-    if (!screenActive) destroyScreenDecoder();
+    if (!screenActive) {
+        resetKeyboardState();
+        destroyScreenDecoder();
+    }
 }
