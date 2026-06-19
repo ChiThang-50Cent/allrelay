@@ -84,6 +84,8 @@ fi
 rm -f '$ROOT_LOG_PATH'
 
 # Start daemon
+# power_on=false: do not wake the phone just because the control channel connects
+# keep_active=true: match scrcpy keep-active semantics while screen remote mode is enabled
 CLASSPATH=$jarPath exec app_process / com.genymobile.scrcpy.Server \
   4.0 \
   log_level=info \
@@ -96,6 +98,8 @@ CLASSPATH=$jarPath exec app_process / com.genymobile.scrcpy.Server \
   camera_enabled=${config.camera} \
   daemon=true \
   control=${config.screen} \
+  power_on=false \
+  keep_active=${config.screen} \
   > '$ROOT_LOG_PATH' 2>&1 &
 """.trimIndent()
 

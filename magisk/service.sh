@@ -88,6 +88,8 @@ start_server() {
     # speaker_enabled=true: PC→phone audio on port 5003
     # camera_enabled=true: phone camera→PC on port 5001
     # audio=true + audio_source=mic: phone mic daemon on port 5002
+    # power_on=false: do not wake the phone when the control channel attaches
+    # keep_active=true: keep the device awake while remote screen mode is in use
     nohup sh -c "
         CLASSPATH='$SERVER_JAR' \
         app_process / com.genymobile.scrcpy.Server \
@@ -102,6 +104,8 @@ start_server() {
             camera_enabled=true \
             daemon=true \
             control=true \
+            power_on=false \
+            keep_active=true \
             >> '$LOG_FILE' 2>&1
     " &
     

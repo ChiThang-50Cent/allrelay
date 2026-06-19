@@ -368,9 +368,13 @@ async function handleToggleStream(streamName, active) {
 
         if (streamName === 'screen') {
             if (!active) {
+                sendDisplayPowerRequest(true);
                 closeRemotePopup();
-            } else if (pageMode === 'dashboard') {
-                focusRemotePopup();
+            } else {
+                sendDisplayPowerRequest(false);
+                if (pageMode === 'dashboard') {
+                    focusRemotePopup();
+                }
             }
         }
         
@@ -517,8 +521,7 @@ function updateConnectionStatus(status) {
         state.connected = status.connected;
         state.currentPhone = status.phone;
         if (!state.connected) {
-            state.remotePowerOffAutoTried = false;
-            state.remotePowerOffSent = false;
+            resetRemotePowerState();
             closeRemotePopup();
         }
         updateConnectionUI();
@@ -536,12 +539,8 @@ function updateConnectionStatus(status) {
 
     const screen = getStream('screen');
     showScreenViewer(Boolean(screen?.active && state.connected));
-    if (pageMode === 'dashboard') {
-        if (screen?.active) {
-            focusRemotePopup();
-        } else {
-            closeRemotePopup();
-        }
+    if (pageMode === 'dashboard' && !screen?.active) {
+        closeRemotePopup();
     }
     updateStatusDisplay();
     updateRemoteUI();
@@ -701,37 +700,27 @@ function maybeApplyRemoteMode() {
     if (pageMode !== 'remote') return;
     const screen = getStream('screen');
     if (!state.connected || !screen?.active) {
-        state.remotePowerOffAutoTried = false;
-        state.remotePowerOffSent = false;
+        resetRemotePowerState();
         return;
     }
     if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
         return;
     }
     if (!state.remotePowerOffAutoTried) {
-        sendControlPacket(buildSetDisplayPowerControlMessage(false), { markPowerOff: false });
-        state.remotePowerOffAutoTried = true;
-        if (elements.remotePowerStatus) {
-            elements.remotePowerStatus.textContent = 'Requested phone display off for remote mode';
-        }
+        sendDisplayPowerRequest(false);
     }
 }
 
 function wakeRemotePhoneScreen() {
     if (pageMode !== 'remote') return;
-    sendControlPacket(buildSetDisplayPowerControlMessage(true), { force: true, wake: true });
-    state.remotePowerOffAutoTried = false;
-    state.remotePowerOffSent = false;
-    if (elements.remotePowerStatus) {
-        elements.remotePowerStatus.textContent = 'Requested phone display on';
-    }
+    sendDisplayPowerRequest(true);
 }
 
 function restoreRemotePhoneScreen() {
     if (pageMode !== 'remote') return;
     const screen = getStream('screen');
     if (state.ws && state.ws.readyState === WebSocket.OPEN && (state.remotePowerOffAutoTried || state.remotePowerOffSent)) {
-        sendControlPacket(buildSetDisplayPowerControlMessage(true), { force: true, wake: true });
+        sendDisplayPowerRequest(true);
     }
     if (screen?.active) {
         fetch(API.toggleStream, {
@@ -915,15 +904,35 @@ function sendControlPacket(data, options = {}) {
     if (pageMode === 'remote' && options.force !== true && !screenActive) return;
     if (state.ws && state.ws.readyState === WebSocket.OPEN) {
         if (pageMode === 'remote' && options.wake !== true && options.markPowerOff === true && !state.remotePowerOffSent) {
-            state.ws.send(buildSetDisplayPowerControlMessage(false));
-            state.remotePowerOffSent = true;
-            state.remotePowerOffAutoTried = true;
-            if (elements.remotePowerStatus) {
-                elements.remotePowerStatus.textContent = 'Phone display off while remote control is active';
-            }
+            sendDisplayPowerRequest(false);
         }
         state.ws.send(data);
     }
+}
+
+function resetRemotePowerState() {
+    state.remotePowerOffAutoTried = false;
+    state.remotePowerOffSent = false;
+}
+
+function sendDisplayPowerRequest(on) {
+    if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
+        return false;
+    }
+    state.ws.send(buildSetDisplayPowerControlMessage(on));
+    if (on) {
+        resetRemotePowerState();
+        if (elements.remotePowerStatus) {
+            elements.remotePowerStatus.textContent = 'Requested phone display on';
+        }
+    } else {
+        state.remotePowerOffSent = true;
+        state.remotePowerOffAutoTried = true;
+        if (elements.remotePowerStatus) {
+            elements.remotePowerStatus.textContent = 'Requested phone display off for remote mode';
+        }
+    }
+    return true;
 }
 
 function ensureScreenDecoder() {
