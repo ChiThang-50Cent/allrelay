@@ -4,8 +4,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -14,17 +16,19 @@ import (
 
 // ServerConfig holds web server configuration
 type ServerConfig struct {
-	Port  int
-	Host  string
-	Debug bool
+	Port    int
+	Host    string
+	Debug   bool
+	URLFile string
 }
 
 // DefaultConfig returns default web server config
 func DefaultConfig() ServerConfig {
 	return ServerConfig{
-		Port:  8080,
-		Host:  "0.0.0.0",
-		Debug: false,
+		Port:    8080,
+		Host:    "0.0.0.0",
+		Debug:   false,
+		URLFile: "",
 	}
 }
 
@@ -141,13 +145,32 @@ func (ws *WebServer) Start() error {
 	mux.HandleFunc("/", ws.handleIndex)
 
 	addr := fmt.Sprintf("%s:%d", ws.config.Host, ws.config.Port)
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+
+	if tcpAddr, ok := listener.Addr().(*net.TCPAddr); ok {
+		ws.config.Port = tcpAddr.Port
+	}
+
 	ws.httpServer = &http.Server{
-		Addr:    addr,
+		Addr:    listener.Addr().String(),
 		Handler: mux,
 	}
 
-	slog.Info("Web UI starting", "address", addr)
-	return ws.httpServer.ListenAndServe()
+	url := ws.URL()
+	if ws.config.URLFile != "" {
+		if err := os.MkdirAll(filepath.Dir(ws.config.URLFile), 0o755); err != nil {
+			return err
+		}
+		if err := os.WriteFile(ws.config.URLFile, []byte(url+"\n"), 0o644); err != nil {
+			return err
+		}
+	}
+
+	slog.Info("Web UI starting", "address", listener.Addr().String(), "url", url)
+	return ws.httpServer.Serve(listener)
 }
 
 // Stop gracefully stops the web server
@@ -156,6 +179,16 @@ func (ws *WebServer) Stop() error {
 		return ws.httpServer.Close()
 	}
 	return nil
+}
+
+// URL returns the current local web UI URL.
+func (ws *WebServer) URL() string {
+	host := ws.config.Host
+	switch host {
+	case "", "0.0.0.0", "::":
+		host = "localhost"
+	}
+	return fmt.Sprintf("http://%s:%d", host, ws.config.Port)
 }
 
 // GetController returns the server controller

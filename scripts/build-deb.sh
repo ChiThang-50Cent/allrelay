@@ -15,7 +15,9 @@ echo "   Binary: $BIN_DIR/allrelay-server ($(du -h "$BIN_DIR/allrelay-server" | 
 echo "=== [2/4] Copy files to package ==="
 mkdir -p "$DEB_DIR/usr/bin"
 cp "$BIN_DIR/allrelay-server" "$DEB_DIR/usr/bin/"
+cp "$ROOT/scripts/allrelay-helper.sh" "$DEB_DIR/usr/bin/allrelay"
 chmod 755 "$DEB_DIR/usr/bin/allrelay-server"
+chmod 755 "$DEB_DIR/usr/bin/allrelay"
 
 rm -rf "$DEB_DIR/usr/share/allrelay"
 mkdir -p "$DEB_DIR/usr/share/allrelay/static" "$DEB_DIR/usr/share/allrelay/templates"

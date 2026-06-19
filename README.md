@@ -59,7 +59,7 @@ AllRelay streams media directly over Wi‑Fi between Android and Ubuntu, with a 
 ```
 
 Outputs:
-- `bin/allrelay_0.1.0_amd64.deb`
+- `bin/allrelay_0.2.0_amd64.deb`
 - `bin/scrcpy-server-allrelay`
 - `bin/allrelay-magisk.zip`
 
@@ -78,7 +78,7 @@ This also refreshes:
 ### Ubuntu
 
 ```bash
-sudo dpkg -i bin/allrelay_0.1.0_amd64.deb
+sudo dpkg -i bin/allrelay_0.2.0_amd64.deb
 systemctl --user enable --now allrelay
 ```
 

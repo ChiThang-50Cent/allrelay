@@ -7,7 +7,7 @@
 ```
 
 Outputs:
-- `bin/allrelay_0.1.0_amd64.deb`
+- `bin/allrelay_0.2.0_amd64.deb`
 - `bin/scrcpy-server-allrelay`
 - `bin/allrelay-magisk.zip`
 
@@ -71,7 +71,7 @@ adb shell "su -c 'head -40 /data/local/tmp/allrelay-unified.log'"
 ### Install the package
 
 ```bash
-sudo dpkg -i bin/allrelay_0.1.0_amd64.deb
+sudo dpkg -i bin/allrelay_0.2.0_amd64.deb
 systemctl --user enable --now allrelay
 ```
 
@@ -111,7 +111,7 @@ http://localhost:9090
 
 | File | Purpose |
 |------|---------|
-| `bin/allrelay_0.1.0_amd64.deb` | Ubuntu package |
+| `bin/allrelay_0.2.0_amd64.deb` | Ubuntu package |
 | `bin/allrelay-magisk.zip` | Magisk module |
 | `bin/allrelay-server` | Built Go server binary |
 | `bin/scrcpy-server-allrelay` | Android server artifact used by ADB/app/Magisk |

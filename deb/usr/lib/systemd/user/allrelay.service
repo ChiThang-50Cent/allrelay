@@ -4,7 +4,10 @@ After=pipewire.service pipewire-pulse.service
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/allrelay-server --web-port 9090 -v
+ExecStartPre=/usr/bin/mkdir -p %t/allrelay
+ExecStartPre=/usr/bin/rm -f %t/allrelay/url
+ExecStart=/usr/bin/allrelay-server --web-host 127.0.0.1 --web-port 0 --web-url-file %t/allrelay/url -v
+ExecStopPost=/usr/bin/rm -f %t/allrelay/url
 Restart=on-failure
 RestartSec=5
 

@@ -11,7 +11,8 @@
 //
 // Usage:
 //
-//	allrelay-server --web --web-port 9090
+//	allrelay-server --web-port 9090
+//	allrelay-server --web-host 127.0.0.1 --web-port 0 --web-url-file /tmp/allrelay.url
 //	allrelay-server --host 192.168.1.100
 package main
 
@@ -21,6 +22,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/allrelay/allrelay-server/internal/web"
@@ -28,7 +30,9 @@ import (
 
 func main() {
 	host := flag.String("host", "", "Phone IP address (direct mode)")
-	webPort := flag.Int("web-port", 9090, "Web UI port")
+	webHost := flag.String("web-host", "0.0.0.0", "Web UI host/interface")
+	webPort := flag.Int("web-port", 9090, "Web UI port (use 0 for auto-select)")
+	webURLFile := flag.String("web-url-file", "", "Write actual Web UI URL to this file after startup")
 	verbose := flag.Bool("v", false, "Verbose debug output")
 	flag.Parse()
 
@@ -40,7 +44,9 @@ func main() {
 
 	// Create web server with integrated controller
 	webConfig := web.DefaultConfig()
+	webConfig.Host = strings.TrimSpace(*webHost)
 	webConfig.Port = *webPort
+	webConfig.URLFile = strings.TrimSpace(*webURLFile)
 	webConfig.Debug = *verbose
 
 	webServer := web.NewWebServer(webConfig)
@@ -56,7 +62,6 @@ func main() {
 
 	// Start web server
 	go func() {
-		slog.Info("Starting AllRelay Web UI", "port", *webPort)
 		if err := webServer.Start(); err != nil {
 			slog.Error("Web server error", "error", err)
 		}
@@ -66,8 +71,14 @@ func main() {
 
 	if *host != "" {
 		slog.Info("AllRelay running", "mode", "direct", "host", *host)
+	} else if *webPort == 0 {
+		slog.Info("AllRelay running", "mode", "web", "url", "dynamic (use allrelay open or check startup log)")
 	} else {
-		slog.Info("AllRelay running", "mode", "web", "url", fmt.Sprintf("http://localhost:%d", *webPort))
+		displayHost := *webHost
+		if displayHost == "" || displayHost == "0.0.0.0" || displayHost == "::" {
+			displayHost = "localhost"
+		}
+		slog.Info("AllRelay running", "mode", "web", "url", fmt.Sprintf("http://%s:%d", displayHost, *webPort))
 	}
 	slog.Info("Open browser and connect to your phone!")
 

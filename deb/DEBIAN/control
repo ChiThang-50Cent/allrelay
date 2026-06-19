@@ -1,5 +1,5 @@
 Package: allrelay
-Version: 0.1.0
+Version: 0.2.0
 Section: net
 Priority: optional
 Architecture: amd64
@@ -13,5 +13,5 @@ Description: Stream Android phone media to PC over Wi-Fi
  Features:
   * Camera as virtual webcam (v4l2loopback /dev/video10)
   * Speaker audio (PC -> phone) with low-latency Opus
-  * Web dashboard at http://localhost:9090
+  * Web dashboard via the `allrelay open` helper command
   * Independent streams — each can be toggled separately
