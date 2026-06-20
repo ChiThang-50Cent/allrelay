@@ -19,12 +19,15 @@ package main
 import (
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 
+	"github.com/allrelay/allrelay-server/internal/logging"
 	"github.com/allrelay/allrelay-server/internal/web"
 )
 
@@ -33,13 +36,29 @@ func main() {
 	webHost := flag.String("web-host", "0.0.0.0", "Web UI host/interface")
 	webPort := flag.Int("web-port", 9090, "Web UI port (use 0 for auto-select)")
 	webURLFile := flag.String("web-url-file", "", "Write actual Web UI URL to this file after startup")
+	logFile := flag.String("log-file", defaultLogFilePath(), "Append remote/web logs to this file")
+	logFileMaxBytes := flag.Int64("log-file-max-bytes", logging.DefaultMaxBytes, "Maximum size for the single log file before trimming oldest lines")
 	verbose := flag.Bool("v", false, "Verbose debug output")
 	flag.Parse()
 
+	logger, logWriter, err := buildLogger(*verbose, strings.TrimSpace(*logFile), *logFileMaxBytes)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to initialize logger: %v\n", err)
+		os.Exit(1)
+	}
+	if logWriter != nil {
+		defer logWriter.Close()
+	}
+	if logger != nil {
+		slog.SetDefault(logger)
+	}
 	if *verbose {
 		slog.SetLogLoggerLevel(slog.LevelDebug)
 	} else {
 		slog.SetLogLoggerLevel(slog.LevelInfo)
+	}
+	if strings.TrimSpace(*logFile) != "" {
+		slog.Info("Remote log file enabled", "path", strings.TrimSpace(*logFile), "max_bytes", *logFileMaxBytes)
 	}
 
 	// Create web server with integrated controller
@@ -88,4 +107,37 @@ func main() {
 	<-sigCh
 
 	slog.Info("Shutting down...")
+}
+
+func buildLogger(verbose bool, logFile string, maxBytes int64) (*slog.Logger, io.Closer, error) {
+	level := slog.LevelInfo
+	if verbose {
+		level = slog.LevelDebug
+	}
+
+	writer := io.Writer(os.Stderr)
+	var closer io.Closer
+	if logFile != "" {
+		fileWriter, err := logging.NewSlidingFileWriter(logFile, maxBytes)
+		if err != nil {
+			return nil, nil, err
+		}
+		writer = io.MultiWriter(os.Stderr, fileWriter)
+		closer = fileWriter
+	}
+
+	handler := slog.NewTextHandler(writer, &slog.HandlerOptions{Level: level})
+	return slog.New(handler), closer, nil
+}
+
+func defaultLogFilePath() string {
+	stateHome := strings.TrimSpace(os.Getenv("XDG_STATE_HOME"))
+	if stateHome == "" {
+		home, err := os.UserHomeDir()
+		if err != nil || strings.TrimSpace(home) == "" {
+			return ""
+		}
+		stateHome = filepath.Join(home, ".local", "state")
+	}
+	return filepath.Join(stateHome, "allrelay", "remote.log")
 }

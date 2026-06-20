@@ -17,10 +17,12 @@ var upgrader = websocket.Upgrader{
 
 // Client represents a WebSocket client
 type Client struct {
-	hub     *Hub
-	conn    *websocket.Conn
-	send    chan []byte // text messages (JSON status, events)
-	sendBin chan []byte // binary messages (H.264 NAL units for screen)
+	hub        *Hub
+	conn       *websocket.Conn
+	remoteAddr string
+	userAgent  string
+	send       chan []byte // text messages (JSON status, events)
+	sendBin    chan []byte // binary messages (H.264 NAL units for screen)
 }
 
 // Hub maintains the set of active clients and broadcasts messages
@@ -52,8 +54,9 @@ func (h *Hub) Run() {
 		case client := <-h.register:
 			h.mu.Lock()
 			h.clients[client] = true
+			total := len(h.clients)
 			h.mu.Unlock()
-			slog.Debug("WebSocket client connected", "total", len(h.clients))
+			slog.Debug("WebSocket client connected", "total", total, "remote_addr", client.remoteAddr)
 
 		case client := <-h.unregister:
 			h.mu.Lock()
@@ -62,8 +65,9 @@ func (h *Hub) Run() {
 				close(client.send)
 				close(client.sendBin)
 			}
+			total := len(h.clients)
 			h.mu.Unlock()
-			slog.Debug("WebSocket client disconnected", "total", len(h.clients))
+			slog.Debug("WebSocket client disconnected", "total", total, "remote_addr", client.remoteAddr)
 
 		case message := <-h.broadcast:
 			h.mu.RLock()
@@ -150,10 +154,12 @@ func (ws *WebServer) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 
 	client := &Client{
-		hub:     ws.hub,
-		conn:    conn,
-		send:    make(chan []byte, 256),
-		sendBin: make(chan []byte, 64),
+		hub:        ws.hub,
+		conn:       conn,
+		remoteAddr: r.RemoteAddr,
+		userAgent:  r.UserAgent(),
+		send:       make(chan []byte, 256),
+		sendBin:    make(chan []byte, 64),
 	}
 
 	ws.hub.register <- client
@@ -211,7 +217,46 @@ func (c *Client) readPump() {
 				data, _ := json.Marshal(msg.Data)
 				c.hub.OnControl(data)
 			}
+		case "client_log":
+			c.logClientEvent(msg.Data)
 		}
+	}
+}
+
+func (c *Client) logClientEvent(data interface{}) {
+	payload, ok := data.(map[string]interface{})
+	if !ok {
+		slog.Warn("Invalid client log payload", "remote_addr", c.remoteAddr)
+		return
+	}
+
+	level, _ := payload["level"].(string)
+	event, _ := payload["event"].(string)
+	page, _ := payload["page"].(string)
+	fields, _ := payload["fields"].(map[string]interface{})
+	if event == "" {
+		event = "client_log"
+	}
+
+	args := []any{
+		"event", event,
+		"page", page,
+		"remote_addr", c.remoteAddr,
+		"user_agent", c.userAgent,
+	}
+	if len(fields) > 0 {
+		args = append(args, "fields", fields)
+	}
+
+	switch level {
+	case "debug":
+		slog.Debug("Remote client event", args...)
+	case "warn":
+		slog.Warn("Remote client event", args...)
+	case "error":
+		slog.Error("Remote client event", args...)
+	default:
+		slog.Info("Remote client event", args...)
 	}
 }
 

@@ -3,7 +3,9 @@ set -eu
 
 SERVICE="allrelay.service"
 RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/allrelay"
 URL_FILE="$RUNTIME_DIR/allrelay/url"
+LOG_FILE="$STATE_DIR/remote.log"
 
 wait_for_url() {
     systemctl --user start "$SERVICE" >/dev/null
@@ -68,6 +70,9 @@ case "$cmd" in
         echo "Restarted: $(tr -d '\n' < "$URL_FILE")"
         ;;
     logs)
+        if [ -f "$LOG_FILE" ]; then
+            exec tail -F "$LOG_FILE"
+        fi
         exec journalctl --user -u "$SERVICE" -f
         ;;
     *)

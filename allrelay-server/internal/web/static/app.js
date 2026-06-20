@@ -31,6 +31,7 @@ const state = {
     wsReconnectTimer: null,
     remotePowerOffAutoTried: false,
     remotePowerOffSent: false,
+    remoteModeLogEmitted: false,
     remotePopup: null,
     remotePopupCloseHandled: false,
     clipboardSyncPermissionRequested: false,
@@ -109,6 +110,19 @@ function init() {
         window.addEventListener('blur', resetKeyboardState);
         document.addEventListener('paste', handleRemotePaste);
         setInterval(syncLocalClipboardLoop, 1000);
+        window.addEventListener('error', (e) => {
+            emitClientLog('error', 'window_error', {
+                message: e.message,
+                source: e.filename,
+                line: e.lineno,
+                column: e.colno,
+            });
+        });
+        window.addEventListener('unhandledrejection', (e) => {
+            emitClientLog('error', 'unhandled_rejection', {
+                reason: summarizeLogValue(e.reason),
+            });
+        });
     }
 
     // Initial render
@@ -145,6 +159,7 @@ function connectWebSocket() {
         
         state.ws.onopen = () => {
             console.log('WebSocket connected');
+            emitClientLog('info', 'ws_open', { page: pageMode });
             // Clear reconnect timer
             if (state.wsReconnectTimer) {
                 clearTimeout(state.wsReconnectTimer);
@@ -176,9 +191,11 @@ function connectWebSocket() {
         
         state.ws.onerror = (error) => {
             console.error('WebSocket error:', error);
+            emitClientLog('error', 'ws_error', { error: summarizeLogValue(error) });
         };
     } catch (error) {
         console.error('Failed to create WebSocket:', error);
+        emitClientLog('error', 'ws_create_failed', { error: summarizeLogValue(error) });
         // Fallback to polling
     }
 }
@@ -241,6 +258,49 @@ function updateStreamFromWS(streamData) {
 function sendWebSocketMessage(type, data = {}) {
     if (state.ws && state.ws.readyState === WebSocket.OPEN) {
         state.ws.send(JSON.stringify({ type, data }));
+    }
+}
+
+function emitClientLog(level, event, fields = {}) {
+    if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
+        return;
+    }
+    sendWebSocketMessage('client_log', {
+        level,
+        event,
+        page: pageMode,
+        fields: sanitizeLogFields(fields),
+    });
+}
+
+function sanitizeLogFields(fields = {}) {
+    const result = {};
+    Object.entries(fields || {}).forEach(([key, value]) => {
+        result[key] = summarizeLogValue(value);
+    });
+    return result;
+}
+
+function summarizeLogValue(value) {
+    if (value == null) return value;
+    if (typeof value === 'string') {
+        return value.length > 300 ? value.slice(0, 300) + '…' : value;
+    }
+    if (typeof value === 'number' || typeof value === 'boolean') {
+        return value;
+    }
+    if (value instanceof Error) {
+        return {
+            name: value.name,
+            message: value.message,
+            stack: value.stack ? value.stack.slice(0, 600) : undefined,
+        };
+    }
+    try {
+        const json = JSON.stringify(value);
+        return json.length > 600 ? json.slice(0, 600) + '…' : JSON.parse(json);
+    } catch (error) {
+        return String(value);
     }
 }
 
@@ -718,6 +778,13 @@ function maybeApplyRemoteMode() {
         sendDisplayPowerRequest(false);
     }
     maybeEnableLocalClipboardSync();
+    if (!state.remoteModeLogEmitted) {
+        state.remoteModeLogEmitted = true;
+        emitClientLog('info', 'remote_mode_active', {
+            screen_active: !!screen?.active,
+            connected: state.connected,
+        });
+    }
 }
 
 function wakeRemotePhoneScreen() {
@@ -820,7 +887,9 @@ async function maybeEnableLocalClipboardSync() {
         state.clipboardReadEnabled = true;
         state.lastLocalClipboardText = text;
         state.lastSentClipboardText = text;
+        emitClientLog('info', 'clipboard_read_enabled');
     } catch (error) {
+        emitClientLog('warn', 'clipboard_read_unavailable', { error: summarizeLogValue(error) });
         // Paste still works even if clipboard read permission is denied.
     }
 }
@@ -1012,6 +1081,7 @@ function sendControlPacket(data, options = {}) {
 function resetRemotePowerState() {
     state.remotePowerOffAutoTried = false;
     state.remotePowerOffSent = false;
+    state.remoteModeLogEmitted = false;
 }
 
 function sendDisplayPowerRequest(on) {
@@ -1080,6 +1150,7 @@ function ensureScreenDecoder() {
         },
         error(err) {
             console.error('Screen decoder error:', err);
+            emitClientLog('error', 'screen_decoder_error', { error: summarizeLogValue(err) });
         }
     });
 
@@ -1111,6 +1182,12 @@ function configureScreenDecoderFromConfig(force = false) {
     screenConfigured = true;
     screenConfigKey = nextKey;
     console.log('Screen decoder configured', { codec, sps: screenConfig.sps.length, pps: screenConfig.pps.length, force });
+    emitClientLog('info', 'screen_decoder_configured', {
+        codec,
+        sps: screenConfig.sps.length,
+        pps: screenConfig.pps.length,
+        force,
+    });
     return true;
 }
 
@@ -1176,6 +1253,7 @@ function handleBinaryFrame(data) {
         }));
     } catch (err) {
         console.error('Screen decode error:', err);
+        emitClientLog('error', 'screen_decode_error', { error: summarizeLogValue(err) });
         resetScreenDecoderForReconfigure();
     }
 }
@@ -1371,6 +1449,8 @@ const ANDROID_MOTION_ACTION_MOVE = 2;
 const ANDROID_BUTTON_PRIMARY = 1;
 const AMETA_SHIFT_ON = 0x01;
 const AMETA_ALT_ON = 0x02;
+const AMETA_ALT_LEFT_ON = 0x10;
+const AMETA_ALT_RIGHT_ON = 0x20;
 const AMETA_SHIFT_LEFT_ON = 0x40;
 const AMETA_SHIFT_RIGHT_ON = 0x80;
 const AMETA_CTRL_ON = 0x1000;

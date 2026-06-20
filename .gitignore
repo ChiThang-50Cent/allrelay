@@ -54,6 +54,7 @@ RESEARCH_REPORT.md
 SPEC.md
 docs/research/
 plans/
+specs/
 
 # === Generated packaging / scripts ===
 scripts/test-phase3.sh
