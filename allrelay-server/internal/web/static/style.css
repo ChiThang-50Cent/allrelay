@@ -673,10 +673,11 @@ input:checked + .toggle-slider:before {
 
 .screen-canvas {
     width: 100%;
-    height: auto;
+    height: 100%;
     display: none;
     user-select: none;
     touch-action: none;
+    background: #000;
 }
 
 body[data-page="remote"] .screen-canvas {
@@ -734,7 +735,6 @@ body[data-page="remote"] .screen-canvas.active {
     display: block;
     width: 100vw;
     height: 100vh;
-    object-fit: contain;
 }
 
 .remote-popup-placeholder {

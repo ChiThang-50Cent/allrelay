@@ -893,6 +893,7 @@ let screenActive = false;
 let screenConfigured = false;
 let screenConfig = { sps: [], pps: [] };
 let screenVideoSize = { width: 0, height: 0 };
+let screenDrawRect = { left: 0, top: 0, width: 0, height: 0 };
 let screenPointerDown = false;
 const textInjectedKeysDown = new Set();
 const modifierKeysDown = new Set();
@@ -900,7 +901,7 @@ const modifierKeysDown = new Set();
 function initScreenViewer() {
     screenCanvasEl = document.getElementById('screenCanvas');
     if (!screenCanvasEl) return;
-    screenCtx = screenCanvasEl.getContext('2d');
+    screenCtx = screenCanvasEl.getContext('2d', { alpha: false });
 
     if (pageMode !== 'remote') {
         return;
@@ -910,7 +911,7 @@ function initScreenViewer() {
 
     const sendTouch = (action, e) => {
         if (!screenActive) return;
-        const position = getScreenPointerPosition(e);
+        const position = getScreenPointerPosition(e, { clampToFrame: action !== ANDROID_MOTION_ACTION_DOWN });
         if (!position) return;
         sendControlPacket(buildTouchControlMessage({
             action,
@@ -1041,21 +1042,34 @@ function ensureScreenDecoder() {
             screenFrameCount++;
             screenFpsCounter++;
 
-            if (screenCanvasEl.width !== frame.displayWidth ||
-                screenCanvasEl.height !== frame.displayHeight) {
-                screenCanvasEl.width = frame.displayWidth;
-                screenCanvasEl.height = frame.displayHeight;
-            }
-            screenVideoSize.width = frame.displayWidth;
-            screenVideoSize.height = frame.displayHeight;
-
-            screenCtx.drawImage(frame, 0, 0);
-            frame.close();
-
             if (!screenCanvasEl.classList.contains('active')) {
                 screenCanvasEl.classList.add('active');
                 document.getElementById('screenPlaceholder').classList.add('hidden');
             }
+
+            screenVideoSize.width = frame.displayWidth;
+            screenVideoSize.height = frame.displayHeight;
+            const drawRect = resizeScreenCanvasForFrame(frame.displayWidth, frame.displayHeight);
+
+            screenCtx.save();
+            screenCtx.setTransform(1, 0, 0, 1, 0, 0);
+            screenCtx.imageSmoothingEnabled = true;
+            screenCtx.imageSmoothingQuality = 'high';
+            screenCtx.fillStyle = '#000';
+            screenCtx.fillRect(0, 0, screenCanvasEl.width, screenCanvasEl.height);
+            screenCtx.drawImage(
+                frame,
+                0,
+                0,
+                frame.displayWidth,
+                frame.displayHeight,
+                drawRect.backingLeft,
+                drawRect.backingTop,
+                drawRect.backingWidth,
+                drawRect.backingHeight,
+            );
+            screenCtx.restore();
+            frame.close();
 
             const now = Date.now();
             if (now - screenLastFpsTime >= 1000) {
@@ -1092,7 +1106,7 @@ function configureScreenDecoderFromConfig(force = false) {
     decoder.configure({
         codec,
         description,
-        optimizeForLatency: true,
+        optimizeForLatency: false,
     });
     screenConfigured = true;
     screenConfigKey = nextKey;
@@ -1111,6 +1125,7 @@ function destroyScreenDecoder() {
     screenPendingSessionSize = null;
     screenLastPopupFitKey = '';
     screenVideoSize = { width: 0, height: 0 };
+    screenDrawRect = { left: 0, top: 0, width: 0, height: 0 };
     screenPointerDown = false;
     screenFrameCount = 0;
     screenFpsCounter = 0;
@@ -1367,16 +1382,64 @@ const AMETA_META_RIGHT_ON = 0x40000;
 const AMETA_CAPS_LOCK_ON = 0x100000;
 const AMETA_NUM_LOCK_ON = 0x200000;
 
-function getScreenPointerPosition(e) {
+function resizeScreenCanvasForFrame(frameWidth, frameHeight) {
+    const cssWidth = Math.max(1, Math.round(screenCanvasEl?.clientWidth || screenCanvasEl?.getBoundingClientRect().width || frameWidth || 1));
+    const cssHeight = Math.max(1, Math.round(screenCanvasEl?.clientHeight || screenCanvasEl?.getBoundingClientRect().height || frameHeight || 1));
+    const dpr = Math.max(window.devicePixelRatio || 1, 1);
+    const backingWidth = Math.max(1, Math.round(cssWidth * dpr));
+    const backingHeight = Math.max(1, Math.round(cssHeight * dpr));
+
+    if (screenCanvasEl.width !== backingWidth || screenCanvasEl.height !== backingHeight) {
+        screenCanvasEl.width = backingWidth;
+        screenCanvasEl.height = backingHeight;
+    }
+
+    const scale = Math.min(cssWidth / frameWidth, cssHeight / frameHeight);
+    const drawWidth = Math.max(1, frameWidth * scale);
+    const drawHeight = Math.max(1, frameHeight * scale);
+    const left = (cssWidth - drawWidth) / 2;
+    const top = (cssHeight - drawHeight) / 2;
+
+    screenDrawRect = {
+        left,
+        top,
+        width: drawWidth,
+        height: drawHeight,
+    };
+
+    return {
+        backingLeft: Math.round(left * dpr),
+        backingTop: Math.round(top * dpr),
+        backingWidth: Math.max(1, Math.round(drawWidth * dpr)),
+        backingHeight: Math.max(1, Math.round(drawHeight * dpr)),
+    };
+}
+
+function getScreenPointerPosition(e, options = {}) {
     if (!screenCanvasEl || !screenVideoSize.width || !screenVideoSize.height) {
         return null;
     }
     const rect = screenCanvasEl.getBoundingClientRect();
-    if (!rect.width || !rect.height) {
+    const drawWidth = screenDrawRect.width || rect.width;
+    const drawHeight = screenDrawRect.height || rect.height;
+    if (!rect.width || !rect.height || !drawWidth || !drawHeight) {
         return null;
     }
-    const relX = clamp((e.clientX - rect.left) / rect.width, 0, 1);
-    const relY = clamp((e.clientY - rect.top) / rect.height, 0, 1);
+
+    const clampToFrame = options.clampToFrame === true;
+    const relLeft = screenDrawRect.left || 0;
+    const relTop = screenDrawRect.top || 0;
+    const frameX = e.clientX - rect.left - relLeft;
+    const frameY = e.clientY - rect.top - relTop;
+
+    if (!clampToFrame && (frameX < 0 || frameY < 0 || frameX > drawWidth || frameY > drawHeight)) {
+        return null;
+    }
+
+    const boundedX = clamp(frameX, 0, Math.max(drawWidth - 1, 0));
+    const boundedY = clamp(frameY, 0, Math.max(drawHeight - 1, 0));
+    const relX = drawWidth <= 1 ? 0 : boundedX / (drawWidth - 1);
+    const relY = drawHeight <= 1 ? 0 : boundedY / (drawHeight - 1);
     return {
         x: Math.round(relX * (screenVideoSize.width - 1)),
         y: Math.round(relY * (screenVideoSize.height - 1)),
