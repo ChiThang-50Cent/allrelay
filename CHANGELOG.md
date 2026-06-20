@@ -13,6 +13,8 @@
 - ADB auto-off now checks **host connection health** every 30 seconds instead of using a fixed 15-minute countdown. ADB TCP stays alive as long as at least one host remains connected; it only disables after 15 minutes of idle (no established host connections).
 - Backend `callPhoneADB` timeout increased from 3s to 10s to accommodate the phone-side `adbd` startup delay.
 - Backend preflights the host `adb` binary and reports a clear error if it is missing, per the spec failure mode.
+- Dashboard `apiCall()` now parses the server error response body and surfaces the actual message instead of a generic HTTP status error.
+- Dashboard `updateConnectionStatus()` now safely handles a missing `phone` field and refreshes ADB state without requiring a connection change event.
 
 ### Fixed
 - Android lint: added `<uses-feature android:required="false">` for camera hardware so the app no longer implies a required camera.
