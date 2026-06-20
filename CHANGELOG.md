@@ -14,15 +14,12 @@
 - Backend `callPhoneADB` timeout increased from 3s to 10s to accommodate the phone-side `adbd` startup delay.
 
 ### Fixed
-- Fixed deadlock in `/api/status` caused by calling `queryADBStatus()` while holding `ws.mu.Lock()`; ADB status is now queried outside the lock.
-- Fixed `.deb` packaging race that could ship a stale binary; build now copies the freshly compiled binary into the staging area before calling `dpkg-deb`.
-- Fixed ADB indicator flip-flop by using `hostState` (`device`/`unauthorized`/`disconnected`) as the source of truth rather than the occasionally unstable `hostConnected` boolean.
+- Android lint: added `<uses-feature android:required="false">` for camera hardware so the app no longer implies a required camera.
+- Android lint: removed obsolete `Build.VERSION.SDK_INT` check in `createNotificationChannel()` (`minSdk` is already 31).
 
 ### Cleanup
-- Removed verbose `console.log` debug output from dashboard frontend (`WebSocket connected/disconnected`, `Unknown WebSocket message type`, `Screen decoder configured`).
+- Removed verbose `console.log` debug output from dashboard frontend.
 - Removed verbose `Log.d` debug output from Android `RootDaemonManager`; kept `Log.e` error logging.
-- Fixed Go `go vet` warnings about non-constant format strings in `internal/web/adb.go`.
-- Fixed Android lint errors: added `<uses-feature android:required="false">` for camera hardware and removed obsolete `Build.VERSION.SDK_INT` check in `createNotificationChannel()`.
 
 ### Packaging
 - Rebuilt and verified Ubuntu `.deb`, Android debug APK with control service + Wireless ADB UI.
