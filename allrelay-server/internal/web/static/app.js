@@ -182,7 +182,6 @@ function connectWebSocket() {
         state.ws = new WebSocket(wsUrl);
         
         state.ws.onopen = () => {
-            console.log('WebSocket connected');
             emitClientLog('info', 'ws_open', { page: pageMode });
             // Clear reconnect timer
             if (state.wsReconnectTimer) {
@@ -208,7 +207,6 @@ function connectWebSocket() {
         state.ws.binaryType = 'arraybuffer';
         
         state.ws.onclose = () => {
-            console.log('WebSocket disconnected');
             // Attempt to reconnect after 3 seconds
             state.wsReconnectTimer = setTimeout(connectWebSocket, 3000);
         };
@@ -247,7 +245,7 @@ function handleWebSocketMessage(msg) {
             break;
             
         default:
-            console.log('Unknown WebSocket message type:', msg.type);
+            // Unknown message type, ignore
     }
 }
 
@@ -1343,7 +1341,6 @@ function configureScreenDecoderFromConfig(force = false) {
     });
     screenConfigured = true;
     screenConfigKey = nextKey;
-    console.log('Screen decoder configured', { codec, sps: screenConfig.sps.length, pps: screenConfig.pps.length, force });
     emitClientLog('info', 'screen_decoder_configured', {
         codec,
         sps: screenConfig.sps.length,

@@ -18,6 +18,10 @@
 - Fixed `.deb` packaging race that could ship a stale binary; build now copies the freshly compiled binary into the staging area before calling `dpkg-deb`.
 - Fixed ADB indicator flip-flop by using `hostState` (`device`/`unauthorized`/`disconnected`) as the source of truth rather than the occasionally unstable `hostConnected` boolean.
 
+### Cleanup
+- Removed verbose `console.log` debug output from dashboard frontend (`WebSocket connected/disconnected`, `Unknown WebSocket message type`, `Screen decoder configured`).
+- Removed verbose `Log.d` debug output from Android `RootDaemonManager`; kept `Log.e` error logging.
+
 ### Packaging
 - Rebuilt and verified Ubuntu `.deb`, Android debug APK with control service + Wireless ADB UI.
 

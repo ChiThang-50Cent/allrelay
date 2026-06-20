@@ -61,18 +61,14 @@ object RootDaemonManager {
     }
 
     fun start(context: Context, config: Config): Status {
-        Log.d("AllRelay", "start() called config=$config")
         config.validate()
 
         val existing = status(config)
-        Log.d("AllRelay", "existing status=$existing")
         if (existing.running && existing.ports.containsAll(config.expectedPorts())) {
-            Log.d("AllRelay", "Daemon already running, skipping start")
             return existing.copy(message = "Daemon already running")
         }
 
         val jarPath = resolveJarPath(context)
-        Log.d("AllRelay", "jarPath=$jarPath")
 
         val startScript = "/data/local/tmp/allrelay-start.sh"
         val script = """
@@ -128,15 +124,12 @@ CLASSPATH=$jarPath exec app_process / com.genymobile.scrcpy.Server \
             if (!writeFinished) {
                 writeProcess.destroyForcibly()
                 Log.e("AllRelay", "Write script timed out")
-            } else {
-                Log.d("AllRelay", "Write script exit=${writeProcess.exitValue()}")
             }
         } catch (e: Exception) {
             Log.e("AllRelay", "Write script failed: $e")
         }
 
         val result = runSu("sh '$startScript'", timeoutSeconds = 15)
-        Log.d("AllRelay", "start result exit=${result.exitCode} stdout='${result.stdout}' stderr='${result.stderr}'")
         if (result.exitCode != 0) {
             return Status(
                 running = false,
@@ -150,7 +143,6 @@ CLASSPATH=$jarPath exec app_process / com.genymobile.scrcpy.Server \
         repeat(10) {
             Thread.sleep(1000)
             val status = status(config)
-            Log.d("AllRelay", "health check $it: $status")
             if (status.running && status.ports.containsAll(config.expectedPorts())) {
                 return status.copy(message = "Daemon running")
             }
@@ -297,16 +289,11 @@ CLASSPATH=$jarPath exec app_process / com.genymobile.scrcpy.Server \
     }
 
     private fun resolveJarPath(context: Context): String {
-        copyBundledJarIfPresent(context)?.let {
-            Log.d("AllRelay", "resolveJarPath: using bundled jar at $it")
-            return it
-        }
+        copyBundledJarIfPresent(context)?.let { return it }
         if (fileExistsViaRoot(MAGISK_JAR)) {
-            Log.d("AllRelay", "resolveJarPath: using magisk jar at $MAGISK_JAR")
             return MAGISK_JAR
         }
         if (fileExistsViaRoot(LOCAL_TMP_JAR)) {
-            Log.d("AllRelay", "resolveJarPath: using tmp jar at $LOCAL_TMP_JAR")
             return LOCAL_TMP_JAR
         }
         error("No bundled allrelay.jar found. Install app with bundled server or keep Magisk module installed.")
@@ -322,11 +309,9 @@ CLASSPATH=$jarPath exec app_process / com.genymobile.scrcpy.Server \
                 val outFile = File(dir, SERVER_ASSET_NAME)
                 input.copyTo(outFile.outputStream())
                 outFile.setReadable(true, false)
-                Log.d("AllRelay", "copyBundledJarIfPresent: copied to ${outFile.absolutePath}")
                 outFile.absolutePath
             }
-        } catch (e: Exception) {
-            Log.d("AllRelay", "copyBundledJarIfPresent: failed $e")
+        } catch (_: Exception) {
             null
         }
     }
@@ -365,7 +350,6 @@ CLASSPATH=$jarPath exec app_process / com.genymobile.scrcpy.Server \
 
             val stdout = process.inputStream.bufferedReader().readText()
             val stderr = process.errorStream.bufferedReader().readText()
-            Log.d("AllRelay", "runSu cmd='$command' exit=${process.exitValue()} stdout='$stdout' stderr='$stderr'")
             CommandResult(process.exitValue(), stdout, stderr)
         } catch (e: Exception) {
             Log.e("AllRelay", "runSu exception: $e")
