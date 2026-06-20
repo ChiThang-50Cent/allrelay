@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -110,7 +111,7 @@ func (ws *WebServer) connectADB() (ADBStatus, error) {
 		if status.Message == "" {
 			status.Message = cmdErr.Error()
 		}
-		return status, fmt.Errorf(status.Message)
+		return status, errors.New(status.Message)
 	}
 
 	status = ws.queryADBStatus()
@@ -128,7 +129,7 @@ func (ws *WebServer) connectADB() (ADBStatus, error) {
 
 	if status.HostState == "unauthorized" {
 		status.Message = "ADB host key not yet authorized on the phone"
-		return status, fmt.Errorf(status.Message)
+		return status, errors.New(status.Message)
 	}
 	if !status.HostConnected {
 		if strings.TrimSpace(out) != "" {
@@ -136,7 +137,7 @@ func (ws *WebServer) connectADB() (ADBStatus, error) {
 		} else if status.Message == "" {
 			status.Message = "adb connect did not produce a connected device state"
 		}
-		return status, fmt.Errorf(status.Message)
+		return status, errors.New(status.Message)
 	}
 
 	status.Message = fmt.Sprintf("ADB connected to %s:%d", phone.IP, adbDashboardPort)
@@ -183,7 +184,7 @@ func (ws *WebServer) disconnectADB() (ADBStatus, error) {
 	status = ws.queryADBStatus()
 	status.Message = "ADB disconnected and phone-side ADB TCP disabled"
 	if cmdErr != nil && !strings.Contains(strings.ToLower(out), "no such device") {
-		return status, fmt.Errorf(strings.TrimSpace(out))
+		return status, errors.New(strings.TrimSpace(out))
 	}
 	return status, nil
 }
@@ -326,7 +327,7 @@ func (ws *WebServer) callPhoneADB(phoneIP, method, path string, payload map[stri
 		if strings.TrimSpace(status.Message) == "" {
 			status.Message = fmt.Sprintf("phone control API returned HTTP %d", resp.StatusCode)
 		}
-		return status, fmt.Errorf(status.Message)
+		return status, errors.New(status.Message)
 	}
 	return status, nil
 }

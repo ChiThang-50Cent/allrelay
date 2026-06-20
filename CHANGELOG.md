@@ -21,6 +21,8 @@
 ### Cleanup
 - Removed verbose `console.log` debug output from dashboard frontend (`WebSocket connected/disconnected`, `Unknown WebSocket message type`, `Screen decoder configured`).
 - Removed verbose `Log.d` debug output from Android `RootDaemonManager`; kept `Log.e` error logging.
+- Fixed Go `go vet` warnings about non-constant format strings in `internal/web/adb.go`.
+- Fixed Android lint errors: added `<uses-feature android:required="false">` for camera hardware and removed obsolete `Build.VERSION.SDK_INT` check in `createNotificationChannel()`.
 
 ### Packaging
 - Rebuilt and verified Ubuntu `.deb`, Android debug APK with control service + Wireless ADB UI.
