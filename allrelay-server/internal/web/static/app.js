@@ -13,7 +13,10 @@ const API = {
     disconnect: '/api/disconnect',
     status: '/api/status',
     toggleStream: '/api/streams/toggle',
-    metrics: '/api/streams/metrics'
+    metrics: '/api/streams/metrics',
+    adbConnect: '/api/adb/connect',
+    adbDisconnect: '/api/adb/disconnect',
+    adbStatus: '/api/adb/status',
 };
 
 // State management
@@ -21,6 +24,17 @@ const state = {
     phones: [],
     connected: false,
     currentPhone: null,
+    adb: {
+        ip: '',
+        port: 5555,
+        phoneReachable: false,
+        phoneEnabled: false,
+        phoneListening: false,
+        hostConnected: false,
+        hostState: '',
+        autoDisableAtMs: 0,
+        message: 'ADB: connect to a phone first',
+    },
     streams: [
         { name: 'screen', port: 5000, active: false, icon: '📺', fps: 0, bitrate: 0, latency: 0, bytes: 0, frames: 0 },
         { name: 'camera', port: 5001, active: false, icon: '📷', fps: 0, bitrate: 0, latency: 0, bytes: 0, frames: 0 },
@@ -62,6 +76,10 @@ function init() {
     elements.streamsGrid = document.getElementById('streamsGrid');
     elements.enableAllBtn = document.getElementById('enableAllBtn');
     elements.disableAllBtn = document.getElementById('disableAllBtn');
+    elements.adbConnectBtn = document.getElementById('adbConnectBtn');
+    elements.adbDisconnectBtn = document.getElementById('adbDisconnectBtn');
+    elements.adbStatusText = document.getElementById('adbStatusText');
+    elements.adbIndicator = document.getElementById('adbIndicator');
 
     // Remote-only elements
     elements.remoteScreenToggleBtn = document.getElementById('remoteScreenToggleBtn');
@@ -81,6 +99,12 @@ function init() {
     }
     if (elements.disableAllBtn) {
         elements.disableAllBtn.addEventListener('click', () => toggleAllStreams(false));
+    }
+    if (elements.adbConnectBtn) {
+        elements.adbConnectBtn.addEventListener('click', handleADBConnect);
+    }
+    if (elements.adbDisconnectBtn) {
+        elements.adbDisconnectBtn.addEventListener('click', handleADBDisconnect);
     }
     if (elements.streamsGrid) {
         elements.streamsGrid.addEventListener('change', (e) => {
@@ -322,10 +346,22 @@ async function apiCall(endpoint, method = 'GET', data = null) {
 
     try {
         const response = await fetch(endpoint, options);
-        if (!response.ok) {
-            throw new Error(`HTTP error! status: ${response.status}`);
+        const text = await response.text();
+        let payload = null;
+        try {
+            payload = text ? JSON.parse(text) : null;
+        } catch (error) {
+            payload = text;
         }
-        return await response.json();
+        if (!response.ok) {
+            const message = typeof payload === 'object' && payload?.message
+                ? payload.message
+                : (typeof payload === 'string' && payload.trim() ? payload.trim() : `HTTP error! status: ${response.status}`);
+            const err = new Error(message);
+            err.responsePayload = payload;
+            throw err;
+        }
+        return payload;
     } catch (error) {
         console.error('API call failed:', error);
         throw error;
@@ -378,6 +414,7 @@ async function handleDisconnect() {
         await apiCall(API.disconnect, 'POST');
         state.connected = false;
         state.currentPhone = null;
+        resetADBState();
         updateConnectionUI();
         showSuccess('Disconnected');
     } catch (error) {
@@ -410,6 +447,115 @@ async function handleScan() {
             </svg>
             Scan Network
         `;
+    }
+}
+
+function resetADBState() {
+    state.adb = {
+        ip: '',
+        port: 5555,
+        phoneReachable: false,
+        phoneEnabled: false,
+        phoneListening: false,
+        hostConnected: false,
+        hostState: '',
+        autoDisableAtMs: 0,
+        message: 'ADB: connect to a phone first',
+    };
+}
+
+function updateADBUI() {
+    if (elements.adbConnectBtn) {
+        elements.adbConnectBtn.disabled = !state.connected;
+    }
+    if (elements.adbDisconnectBtn) {
+        elements.adbDisconnectBtn.disabled = !state.connected;
+    }
+    if (elements.adbStatusText) {
+        elements.adbStatusText.textContent = formatADBStatusText();
+    }
+    if (elements.adbIndicator) {
+        elements.adbIndicator.className = 'adb-indicator ' + getADBIndicatorClass();
+    }
+}
+
+function getADBIndicatorClass() {
+    if (!state.connected) return 'adb-idle';
+    if (state.adb.hostState === 'device') return 'adb-connected';
+    if (state.adb.hostState === 'unauthorized') return 'adb-unauthorized';
+    if (state.adb.phoneEnabled && state.adb.phoneListening) return 'adb-disconnected';
+    return 'adb-idle';
+}
+
+function formatADBStatusText() {
+    if (!state.connected) {
+        return 'ADB: connect to a phone first';
+    }
+    const parts = [];
+    if (state.adb.hostState === 'device') {
+        parts.push(`Host connected to ${state.adb.ip || state.currentPhone?.ip}:${state.adb.port || 5555}`);
+    } else if (state.adb.hostState === 'unauthorized') {
+        parts.push('Host authorization required on phone');
+    } else if (state.adb.phoneEnabled && state.adb.phoneListening) {
+        parts.push(`Phone ADB listening on port ${state.adb.port || 5555} · host not connected`);
+    } else if (state.adb.phoneEnabled) {
+        parts.push('Phone ADB enabling...');
+    } else {
+        parts.push(state.adb.message || 'ADB disabled');
+    }
+
+    if (state.adb.autoDisableAtMs) {
+        const seconds = Math.max(0, Math.round((state.adb.autoDisableAtMs - Date.now()) / 1000));
+        if (seconds > 0) {
+            const minutes = Math.ceil(seconds / 60);
+            parts.push(`auto-off in ~${minutes} min`);
+        }
+    }
+
+    return parts.join(' · ');
+}
+
+async function handleADBConnect() {
+    if (!state.connected) {
+        showError('Connect to a phone first');
+        return;
+    }
+    if (elements.adbConnectBtn) elements.adbConnectBtn.disabled = true;
+    try {
+        const status = await apiCall(API.adbConnect, 'POST');
+        state.adb = { ...state.adb, ...status };
+        updateADBUI();
+        showSuccess(state.adb.hostState === 'device' ? 'ADB connected' : (state.adb.message || 'ADB state updated'));
+    } catch (error) {
+        if (error.responsePayload && typeof error.responsePayload === 'object') {
+            state.adb = { ...state.adb, ...error.responsePayload };
+            updateADBUI();
+        }
+        showError(error.message || 'ADB connect failed');
+    } finally {
+        updateADBUI();
+    }
+}
+
+async function handleADBDisconnect() {
+    if (!state.connected) {
+        showError('Connect to a phone first');
+        return;
+    }
+    if (elements.adbDisconnectBtn) elements.adbDisconnectBtn.disabled = true;
+    try {
+        const status = await apiCall(API.adbDisconnect, 'POST');
+        state.adb = { ...state.adb, ...status };
+        updateADBUI();
+        showSuccess('ADB disconnected');
+    } catch (error) {
+        if (error.responsePayload && typeof error.responsePayload === 'object') {
+            state.adb = { ...state.adb, ...error.responsePayload };
+            updateADBUI();
+        }
+        showError(error.message || 'ADB disconnect failed');
+    } finally {
+        updateADBUI();
     }
 }
 
@@ -579,20 +725,36 @@ function updateConnectionUI() {
         }
     }
 
+    updateADBUI();
+
     // Re-render phone list to update button states
     renderPhoneList();
 }
 
 function updateConnectionStatus(status) {
-    if (status.connected !== state.connected) {
-        state.connected = status.connected;
-        state.currentPhone = status.phone;
+    const connectionChanged = status.connected !== state.connected;
+    state.connected = status.connected;
+    state.currentPhone = status.phone || null;
+    if (status.adb) {
+        state.adb = {
+            ...state.adb,
+            ...status.adb,
+            message: status.adb.message || state.adb.message,
+        };
+    } else if (!state.connected) {
+        resetADBState();
+    }
+
+    if (connectionChanged) {
         if (!state.connected) {
             resetRemotePowerState();
             resetClipboardState();
             closeRemotePopup();
+            resetADBState();
         }
         updateConnectionUI();
+    } else {
+        updateADBUI();
     }
 
     if (status.streams) {

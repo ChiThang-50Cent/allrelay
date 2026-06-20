@@ -56,6 +56,24 @@
                             <p class="text-muted">Click "Scan Network" to find phones on your network</p>
                         </div>
                     </div>
+
+                    <div class="feature-block">
+                        <div class="feature-block-header">
+                            <div>
+                                <h3>Wireless ADB</h3>
+                                <p class="panel-subtitle">Legacy ADB-over-Wi‑Fi on trusted local networks only</p>
+                            </div>
+                            <div class="feature-actions">
+                                <button class="btn btn-secondary" id="adbDisconnectBtn">ADB Disconnect</button>
+                                <button class="btn btn-primary" id="adbConnectBtn">ADB Connect</button>
+                            </div>
+                        </div>
+                        <div class="feature-status">
+                            <span class="adb-indicator" id="adbIndicator"></span>
+                            <span id="adbStatusText">ADB: connect to a phone first</span>
+                        </div>
+                        <div class="feature-note">Auto-disables after 15 minutes. First-time host authorization may still require approval on the phone.</div>
+                    </div>
                 </div>
             </section>
 

@@ -59,6 +59,7 @@ type ConnectionStatus struct {
 	Phone     *PhoneDevice   `json:"phone"`
 	Streams   []StreamStatus `json:"streams"`
 	Connected bool           `json:"connected"`
+	ADB       ADBStatus      `json:"adb"`
 }
 
 // WebServer manages the web UI and API
@@ -111,6 +112,9 @@ func (ws *WebServer) Start() error {
 	mux.HandleFunc("/api/status", ws.handleStatus)
 	mux.HandleFunc("/api/streams/toggle", ws.handleToggleStream)
 	mux.HandleFunc("/api/streams/metrics", ws.handleStreamMetrics)
+	mux.HandleFunc("/api/adb/connect", ws.handleADBConnect)
+	mux.HandleFunc("/api/adb/disconnect", ws.handleADBDisconnect)
+	mux.HandleFunc("/api/adb/status", ws.handleADBStatus)
 
 	// WebSocket endpoint
 	mux.HandleFunc("/ws", ws.HandleWebSocket)
@@ -331,11 +335,22 @@ func (ws *WebServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 		ws.controller.SyncStreamStatus(ws.currentConn.Streams)
 	}
 
+	adbStatus := ws.queryADBStatus()
+
 	ws.mu.RLock()
-	defer ws.mu.RUnlock()
+	status := ConnectionStatus{
+		Connected: ws.currentConn.Connected,
+		ADB:       adbStatus,
+	}
+	if ws.currentConn.Phone != nil {
+		phone := *ws.currentConn.Phone
+		status.Phone = &phone
+	}
+	status.Streams = append([]StreamStatus(nil), ws.currentConn.Streams...)
+	ws.mu.RUnlock()
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(ws.currentConn)
+	json.NewEncoder(w).Encode(status)
 }
 
 // handleToggleStream toggles a stream on/off

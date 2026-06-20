@@ -11,6 +11,7 @@ object RootDaemonManager {
     private const val LOCAL_TMP_JAR = "/data/local/tmp/allrelay.jar"
     private const val MAGISK_JAR = "/data/adb/modules/allrelay/system/bin/scrcpy-server-allrelay.jar"
     private const val PROCESS_PATTERN = "com.genymobile.scrcpy.Server"
+    const val ADB_TCP_DEFAULT_PORT = 5555
 
     data class Config(
         val screen: Boolean,
@@ -45,6 +46,13 @@ object RootDaemonManager {
         val exitCode: Int,
         val stdout: String,
         val stderr: String,
+    )
+
+    data class WirelessAdbStatus(
+        val enabled: Boolean,
+        val listening: Boolean,
+        val port: Int?,
+        val message: String,
     )
 
     fun hasRoot(): Boolean {
@@ -162,6 +170,92 @@ CLASSPATH=$jarPath exec app_process / com.genymobile.scrcpy.Server \
         val base = status(null)
         val message = if (result.exitCode == 0) "Daemon stopped" else "Stop may have failed"
         return base.copy(message = message)
+    }
+
+    fun enableWirelessAdb(port: Int = ADB_TCP_DEFAULT_PORT): WirelessAdbStatus {
+        val safePort = if (port in 1..65535) port else ADB_TCP_DEFAULT_PORT
+        val result = runSu(
+            "setprop service.adb.tcp.port $safePort; stop adbd >/dev/null 2>&1 || true; start adbd >/dev/null 2>&1 || true; setprop ctl.restart adbd >/dev/null 2>&1 || true; sleep 1",
+            timeoutSeconds = 10,
+        )
+        repeat(8) {
+            val status = wirelessAdbStatus(safePort)
+            if (status.listening) {
+                return status.copy(message = "ADB over Wi‑Fi enabled on port $safePort")
+            }
+            Thread.sleep(500)
+        }
+        val status = wirelessAdbStatus(safePort)
+        if (status.enabled) {
+            return status.copy(message = status.message)
+        }
+        val reason = result.stderr.ifBlank { result.stdout }.trim().ifBlank { status.message }
+        return status.copy(message = reason)
+    }
+
+    fun disableWirelessAdb(): WirelessAdbStatus {
+        val result = runSu(
+            "setprop service.adb.tcp.port 0; stop adbd >/dev/null 2>&1 || true; start adbd >/dev/null 2>&1 || true; setprop ctl.restart adbd >/dev/null 2>&1 || true; sleep 1",
+            timeoutSeconds = 10,
+        )
+        repeat(8) {
+            val status = wirelessAdbStatus()
+            if (!status.enabled && !status.listening) {
+                return status.copy(message = "ADB over Wi‑Fi disabled")
+            }
+            Thread.sleep(500)
+        }
+        val status = wirelessAdbStatus()
+        if (!status.enabled) {
+            return status.copy(message = "ADB over Wi‑Fi disabled")
+        }
+        val reason = result.stderr.ifBlank { result.stdout }.trim().ifBlank { status.message }
+        return status.copy(message = reason)
+    }
+
+    fun authorizeAdbKey(key: String): Boolean {
+        val cleanKey = key.trim().replace("\r", "").replace("\n", "")
+        if (cleanKey.isBlank()) return false
+        val result = runSu(
+            "mkdir -p /data/misc/adb && chmod 700 /data/misc/adb && echo '$cleanKey' >> /data/misc/adb/adb_keys && chmod 600 /data/misc/adb/adb_keys && chown system:shell /data/misc/adb/adb_keys",
+            timeoutSeconds = 10,
+        )
+        return result.exitCode == 0
+    }
+
+    fun hasAdbHostConnected(port: Int = ADB_TCP_DEFAULT_PORT): Boolean {
+        val result = runSu(
+            "ss -tn 2>/dev/null | grep ':$port ' | grep -iq estab && echo yes || echo no",
+            timeoutSeconds = 5,
+        )
+        return result.exitCode == 0 && result.stdout.trim() == "yes"
+    }
+
+    fun wirelessAdbStatus(expectedPort: Int? = null): WirelessAdbStatus {
+        val propResult = runSu("getprop service.adb.tcp.port", timeoutSeconds = 5)
+        val propPort = propResult.stdout.trim().toIntOrNull()
+        val port = when {
+            expectedPort != null && expectedPort > 0 -> expectedPort
+            propPort != null && propPort > 0 -> propPort
+            else -> ADB_TCP_DEFAULT_PORT
+        }
+        val listeningResult = runSu(
+            "ss -tln 2>/dev/null | grep -q ':$port ' && echo yes || echo no",
+            timeoutSeconds = 5,
+        )
+        val listening = listeningResult.exitCode == 0 && listeningResult.stdout.trim() == "yes"
+        val enabled = (propPort != null && propPort > 0) || listening
+        val message = when {
+            enabled && listening -> "ADB TCP listening on port $port"
+            enabled -> "ADB TCP requested on port $port, waiting for listener"
+            else -> "ADB over Wi‑Fi disabled"
+        }
+        return WirelessAdbStatus(
+            enabled = enabled,
+            listening = listening,
+            port = if (enabled || listening) port else null,
+            message = message,
+        )
     }
 
     fun status(config: Config? = null): Status {

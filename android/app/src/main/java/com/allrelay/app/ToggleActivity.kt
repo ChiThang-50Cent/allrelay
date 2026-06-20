@@ -34,20 +34,27 @@ class ToggleActivity : Activity() {
     private lateinit var restartButton: Button
     private lateinit var stopButton: Button
     private lateinit var refreshButton: Button
+    private lateinit var adbStatusText: TextView
+    private lateinit var adbEnableButton: Button
+    private lateinit var adbDisableButton: Button
+    private lateinit var adbRefreshButton: Button
 
     private val refreshRunnable = object : Runnable {
         override fun run() {
             refreshStatus(showBusy = false)
+            refreshAdbStatus(showBusy = false)
             mainHandler.postDelayed(this, 2500)
         }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        AllRelayService.ensureRunning(this)
         setContentView(createLayout())
         updateIp()
         rootText.text = "Root: checking..."
         refreshStatus(showBusy = false)
+        refreshAdbStatus(showBusy = false)
     }
 
     override fun onResume() {
@@ -139,6 +146,21 @@ class ToggleActivity : Activity() {
             text = "<loading>"
         }
         layout.addView(logText)
+
+        layout.addView(sectionTitle("Wireless ADB"))
+        adbStatusText = infoLine(layout, "ADB", "Checking...")
+        val adbRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            setPadding(0, 12, 0, 12)
+        }
+        adbEnableButton = actionButton("Enable ADB") { enableAdb() }
+        adbDisableButton = actionButton("Disable ADB") { disableAdb() }
+        adbRefreshButton = actionButton("Refresh") { refreshAdbStatus() }
+        adbRow.addView(adbEnableButton)
+        adbRow.addView(adbDisableButton)
+        adbRow.addView(adbRefreshButton)
+        layout.addView(adbRow)
 
         return scroll
     }
@@ -276,6 +298,56 @@ class ToggleActivity : Activity() {
         restartButton.isEnabled = enabled
         refreshButton.isEnabled = enabled
         stopButton.isEnabled = enabled
+        adbEnableButton.isEnabled = enabled
+        adbDisableButton.isEnabled = enabled
+        adbRefreshButton.isEnabled = enabled
+    }
+
+    private fun enableAdb() {
+        adbEnableButton.isEnabled = false
+        adbDisableButton.isEnabled = false
+        adbStatusText.text = "ADB: Enabling..."
+        executor.execute {
+            val status = RootDaemonManager.enableWirelessAdb()
+            mainHandler.post {
+                renderAdbStatus(status)
+                adbEnableButton.isEnabled = true
+                adbDisableButton.isEnabled = true
+            }
+        }
+    }
+
+    private fun disableAdb() {
+        adbEnableButton.isEnabled = false
+        adbDisableButton.isEnabled = false
+        adbStatusText.text = "ADB: Disabling..."
+        executor.execute {
+            val status = RootDaemonManager.disableWirelessAdb()
+            mainHandler.post {
+                renderAdbStatus(status)
+                adbEnableButton.isEnabled = true
+                adbDisableButton.isEnabled = true
+            }
+        }
+    }
+
+    private fun refreshAdbStatus(showBusy: Boolean = true) {
+        if (showBusy) adbStatusText.text = "ADB: Checking..."
+        executor.execute {
+            val status = RootDaemonManager.wirelessAdbStatus()
+            mainHandler.post {
+                renderAdbStatus(status)
+            }
+        }
+    }
+
+    private fun renderAdbStatus(status: RootDaemonManager.WirelessAdbStatus) {
+        val state = when {
+            status.listening -> "LISTENING on port ${status.port}"
+            status.enabled -> "ENABLED (not listening)"
+            else -> "DISABLED"
+        }
+        adbStatusText.text = "ADB: $state — ${status.message}"
     }
 
     private fun updateIp() {
@@ -289,7 +361,7 @@ class ToggleActivity : Activity() {
                 ip shr 16 and 0xff,
                 ip shr 24 and 0xff,
             )
-            "Phone: $ipString (base port 5000, discovery UDP 5009)"
+            "Phone: $ipString (base port 5000, control API 5008, discovery UDP 5009)"
         } catch (e: Exception) {
             "Phone: Wi‑Fi IP unavailable"
         }
