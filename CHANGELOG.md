@@ -7,11 +7,12 @@
 - Phone app now runs a foreground service on port `5008` with HTTP control endpoints: `/health`, `/adb/status`, `/adb/enable`, `/adb/disable`, `/adb/authorize`.
 - Phone app UI (ToggleActivity) now shows a **Wireless ADB** block with Enable / Disable / Refresh buttons and live status.
 - Dashboard Wireless ADB section shows a colored indicator dot: 🟢 connected, 🟡 unauthorized, 🔴 disconnected/listening but no host, ⚪ idle.
-- Host key auto-authorize: when `adb connect` returns `unauthorized`, the backend automatically sends the local `~/.android/adbkey.pub` to the phone via `/adb/authorize` and retries the connection.
+- Host key auto-authorize: handles the spec failure mode where `adb connect` returns `unauthorized` by sending the local `~/.android/adbkey.pub` to the phone via `/adb/authorize` and retrying the connection.
 
 ### Changed
 - ADB auto-off now checks **host connection health** every 30 seconds instead of using a fixed 15-minute countdown. ADB TCP stays alive as long as at least one host remains connected; it only disables after 15 minutes of idle (no established host connections).
 - Backend `callPhoneADB` timeout increased from 3s to 10s to accommodate the phone-side `adbd` startup delay.
+- Backend preflights the host `adb` binary and reports a clear error if it is missing, per the spec failure mode.
 
 ### Fixed
 - Android lint: added `<uses-feature android:required="false">` for camera hardware so the app no longer implies a required camera.
