@@ -12,6 +12,7 @@ import android.media.AudioTrack;
 import android.media.MediaCodec;
 import android.media.MediaFormat;
 import android.os.Build;
+import android.os.Process;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -92,6 +93,7 @@ public final class AudioReversePlayback implements AsyncProcessor {
         thread = new Thread(() -> {
             boolean fatalError = false;
             try {
+                Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO);
                 play();
             } catch (IOException e) {
                 Ln.e("Audio reverse playback error", e);
@@ -309,7 +311,7 @@ public final class AudioReversePlayback implements AsyncProcessor {
                             .setSampleRate(SAMPLE_RATE)
                             .setChannelMask(CHANNEL_CONFIG)
                             .build())
-                    .setBufferSizeInBytes(Math.max(minBufferSize, 2 * minBufferSize))
+                    .setBufferSizeInBytes(minBufferSize)
                     .setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
                     .build();
         }
@@ -320,7 +322,7 @@ public final class AudioReversePlayback implements AsyncProcessor {
                 SAMPLE_RATE,
                 CHANNEL_CONFIG,
                 ENCODING,
-                Math.max(minBufferSize, 2 * minBufferSize),
+                minBufferSize,
                 AudioTrack.MODE_STREAM);
         return track;
     }

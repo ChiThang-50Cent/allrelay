@@ -15,6 +15,7 @@
 - Backend preflights the host `adb` binary and reports a clear error if it is missing, per the spec failure mode.
 - Dashboard `apiCall()` now parses the server error response body and surfaces the actual message instead of a generic HTTP status error.
 - Dashboard `updateConnectionStatus()` now safely handles a missing `phone` field and refreshes ADB state without requiring a connection change event.
+- Speaker (PC → phone) latency reduced by capturing raw PCM with ffmpeg, encoding to Opus in Go via libopus, and sending raw Opus packets (no Ogg container). Frame size reduced from 10 ms to 5 ms, AudioTrack buffer lowered to `minBufferSize`, speaker TCP write buffer set to 8 KiB, and playback thread set to `THREAD_PRIORITY_URGENT_AUDIO`.
 
 ### Fixed
 - Android lint: added `<uses-feature android:required="false">` for camera hardware so the app no longer implies a required camera.

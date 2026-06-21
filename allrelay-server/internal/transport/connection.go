@@ -177,7 +177,11 @@ func connectPort(host string, port uint16, name string) (net.Conn, error) {
 
 	if tcpConn, ok := conn.(*net.TCPConn); ok {
 		tcpConn.SetNoDelay(true)
-		tcpConn.SetReadBuffer(256 * 1024)
+		if name == "speaker" {
+			tcpConn.SetWriteBuffer(8 * 1024)
+		} else {
+			tcpConn.SetReadBuffer(256 * 1024)
+		}
 	}
 
 	conn.SetReadDeadline(time.Now().Add(15 * time.Second))

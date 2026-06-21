@@ -27,41 +27,25 @@ type CapturePipeline struct {
 	done   chan error
 }
 
-// SpeakerCapturePipeline creates a pipeline that captures system audio
-// from the default audio monitor, encodes to Opus (Ogg-wrapped),
-// and outputs on stdout.
+// SpeakerPCMCapturePipeline creates a pipeline that captures system audio
+// from the default audio monitor and outputs raw PCM (s16le, 48 kHz, stereo)
+// on stdout.
 //
 // Uses ffmpeg instead of GStreamer because GStreamer's pulsesrc has
 // compatibility issues with PipeWire (produces 0 bytes on some systems).
 // ffmpeg's native PulseAudio input works reliably.
 //
-// The caller reads Ogg pages from the returned CapturePipeline and extracts
-// raw Opus packets to send to the phone via the speaker stream.
-func SpeakerCapturePipeline() (*CapturePipeline, error) {
-	// ffmpeg pipeline: capture default audio monitor → Opus encode → Ogg mux → stdout
-	// -f pulse: PulseAudio input (works with PipeWire via pipewire-pulse)
-	// -i @DEFAULT_MONITOR@: captures from the default sink's monitor
-	// -c:a libopus: Opus audio encoder
-	// -b:a 96k: 96 Kbps bitrate (good quality for stereo music)
-	// -ar 48000: 48 kHz sample rate (matches Android AudioTrack)
-	// -ac 2: stereo (matches AudioTrack CHANNEL_OUT_STEREO)
-	// -frame_duration 20: 20ms frames (standard Opus frame size)
-	// -application audio: optimized for music (vs voip for speech)
-	// -f ogg: Ogg container format (demuxed by OggDemuxer on the Go side)
-	// pipe:1: stdout
+// The caller encodes the PCM to Opus in Go and sends raw Opus packets to the
+// phone via the speaker stream. This avoids the Ogg mux/demux latency.
+func SpeakerPCMCapturePipeline() (*CapturePipeline, error) {
 	args := []string{
 		"-loglevel", "error",
 		"-f", "pulse",
 		"-fragment_size", "240",
 		"-i", "@DEFAULT_MONITOR@",
-		"-c:a", "libopus",
-		"-b:a", "96k",
+		"-f", "s16le",
 		"-ar", "48000",
 		"-ac", "2",
-		"-frame_duration", "20",
-		"-application", "lowdelay",
-		"-f", "ogg",
-		"-page_duration", "20000",
 		"pipe:1",
 	}
 	return NewCapturePipeline("speaker-capture", "ffmpeg", args)

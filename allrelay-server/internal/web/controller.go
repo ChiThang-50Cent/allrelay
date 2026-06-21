@@ -602,31 +602,41 @@ func (sc *ServerController) GetStreamStatus() []StreamStatus {
 	return statuses
 }
 
-// runSpeakerCapture captures audio from PC and sends to phone
+// runSpeakerCapture captures audio from PC and sends to phone.
+//
+// The pipeline now captures raw PCM and encodes to Opus in Go, avoiding the
+// Ogg mux/demux latency and giving direct control over frame size and bitrate.
 func runSpeakerCapture(ctx context.Context, w io.Writer, onMetrics func(fps, bitrate, latency int, bytes, frames int64)) error {
-	pipeline, err := audio.SpeakerCapturePipeline()
+	const (
+		sampleRate = 48000
+		channels   = 2
+		bitrate    = 96000
+		frameMs    = 5
+	)
+	frameSamples := sampleRate * frameMs / 1000 * channels // int16 samples per frame
+	pcmBytes := frameSamples * 2                           // s16le
+
+	pipeline, err := audio.SpeakerPCMCapturePipeline()
 	if err != nil {
 		return fmt.Errorf("failed to start capture pipeline: %w", err)
 	}
 	defer pipeline.Close()
 
-	demux := audio.NewOggDemuxer(pipeline)
-
-	// Read and send OpusHead (codec config)
-	opusHead, err := demux.NextPacket()
+	enc, err := audio.NewOpusEncoder(sampleRate, channels, bitrate)
 	if err != nil {
-		return fmt.Errorf("failed to read OpusHead: %w", err)
+		pipeline.Close()
+		return fmt.Errorf("failed to create opus encoder: %w", err)
 	}
+	defer enc.Close()
+
+	// Send OpusHead and OpusTags config packets (same format the Android decoder expects)
+	opusHead := audio.OpusHeadPacket(sampleRate, channels, 0)
 	if err := audio.WritePacket(w, protocol.StreamSpeaker, protocol.FlagConfig, 0, opusHead); err != nil {
 		return fmt.Errorf("failed to send OpusHead: %w", err)
 	}
 	slog.Info("Speaker: sent OpusHead config", "bytes", len(opusHead))
 
-	// Read and send OpusTags (comment header)
-	opusTags, err := demux.NextPacket()
-	if err != nil {
-		return fmt.Errorf("no OpusTags packet: %w", err)
-	}
+	opusTags := audio.OpusTagsPacket("AllRelay")
 	if err := audio.WritePacket(w, protocol.StreamSpeaker, protocol.FlagConfig, 0, opusTags); err != nil {
 		return fmt.Errorf("failed to send OpusTags: %w", err)
 	}
@@ -639,7 +649,9 @@ func runSpeakerCapture(ctx context.Context, w io.Writer, onMetrics func(fps, bit
 		pipeline.Close()
 	}()
 
-	// Main loop: read Opus audio packets and forward to phone
+	// Main loop: read PCM, encode to Opus, forward to phone
+	pcmBuf := make([]int16, frameSamples)
+	rawBuf := make([]byte, pcmBytes)
 	var frameCount uint64
 	var byteCount uint64
 	var lastMetricsTime = time.Now()
@@ -647,9 +659,8 @@ func runSpeakerCapture(ctx context.Context, w io.Writer, onMetrics func(fps, bit
 	var bytesSinceMetrics uint64
 
 	for {
-		packet, err := demux.NextPacket()
+		_, err := io.ReadFull(pipeline, rawBuf)
 		if err != nil {
-			// Check if this was a clean cancellation
 			if ctx.Err() != nil {
 				slog.Info("Speaker: stopped by context", "frames", frameCount)
 				return ctx.Err()
@@ -662,8 +673,19 @@ func runSpeakerCapture(ctx context.Context, w io.Writer, onMetrics func(fps, bit
 			return err
 		}
 
+		// Convert s16le bytes to int16 samples (native endian is little on x86/ARM)
+		for i := 0; i < frameSamples; i++ {
+			pcmBuf[i] = int16(rawBuf[i*2]) | int16(rawBuf[i*2+1])<<8
+		}
+
+		packet, err := enc.Encode(pcmBuf)
+		if err != nil {
+			slog.Error("Speaker: encode error", "error", err)
+			return err
+		}
+
 		sendStart := time.Now()
-		pts := frameCount * 20000 // 20ms per frame
+		pts := frameCount * uint64(frameMs*1000) // microseconds
 		if err := audio.WritePacket(w, protocol.StreamSpeaker, 0, pts, packet); err != nil {
 			slog.Error("Speaker: write error", "error", err)
 			return err
@@ -679,8 +701,7 @@ func runSpeakerCapture(ctx context.Context, w io.Writer, onMetrics func(fps, bit
 		if time.Since(lastMetricsTime) >= time.Second {
 			fps := int(float64(framesSinceMetrics) / time.Since(lastMetricsTime).Seconds())
 			bitrate := int(float64(bytesSinceMetrics*8) / time.Since(lastMetricsTime).Seconds())
-			// Pipeline latency: Go send time + estimated TCP + AudioTrack buffer
-			latencyMs := int(sendLatency/1000) + 5 + 150
+			latencyMs := int(sendLatency/1000) + 5 + 60
 			if onMetrics != nil {
 				onMetrics(fps, bitrate, latencyMs, int64(byteCount), int64(frameCount))
 			}
