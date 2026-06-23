@@ -658,8 +658,9 @@ func runSpeakerCapture(ctx context.Context, w io.Writer, onMetrics func(fps, bit
 	}()
 
 	const (
-		sendSlowThreshold = 20 * time.Millisecond
-		loopSlowThreshold = 20 * time.Millisecond
+		sendSlowThreshold        = 20 * time.Millisecond // send-side tracking bucket
+		loopSlowThreshold        = 20 * time.Millisecond // loop-side tracking bucket
+		sendStallNoticeThreshold = 100 * time.Millisecond // log INFO when a send stall this large is absorbed
 	)
 
 	// Decouple capture/encode from TCP send via a bounded, drop-oldest queue.
@@ -828,13 +829,20 @@ func runSpeakerCapture(ctx context.Context, w io.Writer, onMetrics func(fps, bit
 				"slow_loop", slowLoopCount,
 				"dropped", dropped,
 				"iters", loopCount)
-			if loopMaxMs >= loopSlowThreshold || sendMax >= sendSlowThreshold.Milliseconds() {
-				slog.Warn("Speaker: loop fell behind realtime (potential backlog)",
+			// Only warn when the capture loop genuinely fell behind realtime
+			// (backlog > 0): that is the condition the drop-oldest queue cannot
+			// fully absorb and which could still affect latency. TCP send stalls
+			// that the queue already absorbed via drops are expected behavior
+			// and only warrant a heavy-stall notice at sendStallNoticeThreshold.
+			if backlogMs > 0 {
+				slog.Warn("Speaker: capture loop fell behind realtime",
 					"loop_max_ms", loopMaxMs.Milliseconds(),
-					"send_max_ms", sendMax,
 					"backlog_ms", backlogMs,
+					"slow_loop", slowLoopCount)
+			} else if sendMax >= sendStallNoticeThreshold.Milliseconds() {
+				slog.Info("Speaker: TCP send stall absorbed by drop-oldest queue",
+					"send_max_ms", sendMax,
 					"slow_send", slowSend,
-					"slow_loop", slowLoopCount,
 					"dropped", dropped)
 			}
 			sendMaxMs.Store(0)
