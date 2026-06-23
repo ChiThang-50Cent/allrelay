@@ -658,6 +658,19 @@ func runSpeakerCapture(ctx context.Context, w io.Writer, onMetrics func(fps, bit
 	var framesSinceMetrics uint64
 	var bytesSinceMetrics uint64
 
+	// Backlog diagnostics: track per-iteration timing to detect send-side
+	// stalls that cause PulseAudio capture buffer to accumulate stale samples.
+	// loopMs above frameMs means the loop can't keep up with realtime; the
+	// difference is an estimate of growing backlog (latency drift).
+	var sendMaxMs time.Duration
+	var loopMaxMs time.Duration
+	var loopCount uint64
+	var slowSendCount uint64
+	var slowLoopCount uint64
+	const sendSlowThreshold = 20 * time.Millisecond
+	const loopSlowThreshold = 20 * time.Millisecond
+	iterStart := time.Now()
+
 	for {
 		_, err := io.ReadFull(pipeline, rawBuf)
 		if err != nil {
@@ -690,7 +703,24 @@ func runSpeakerCapture(ctx context.Context, w io.Writer, onMetrics func(fps, bit
 			slog.Error("Speaker: write error", "error", err)
 			return err
 		}
-		sendLatency := time.Since(sendStart).Microseconds()
+		sendDur := time.Since(sendStart)
+		sendLatency := sendDur.Microseconds()
+
+		// Per-iteration timing for backlog diagnostics.
+		loopDur := time.Since(iterStart)
+		loopCount++
+		if sendDur > sendMaxMs {
+			sendMaxMs = sendDur
+		}
+		if loopDur > loopMaxMs {
+			loopMaxMs = loopDur
+		}
+		if sendDur >= sendSlowThreshold {
+			slowSendCount++
+		}
+		if loopDur >= loopSlowThreshold {
+			slowLoopCount++
+		}
 
 		frameCount++
 		byteCount += uint64(len(packet))
@@ -699,12 +729,41 @@ func runSpeakerCapture(ctx context.Context, w io.Writer, onMetrics func(fps, bit
 
 		// Update metrics every second
 		if time.Since(lastMetricsTime) >= time.Second {
-			fps := int(float64(framesSinceMetrics) / time.Since(lastMetricsTime).Seconds())
-			bitrate := int(float64(bytesSinceMetrics*8) / time.Since(lastMetricsTime).Seconds())
+			metricsElapsed := time.Since(lastMetricsTime)
+			fps := int(float64(framesSinceMetrics) / metricsElapsed.Seconds())
+			bitrate := int(float64(bytesSinceMetrics*8) / metricsElapsed.Seconds())
 			latencyMs := int(sendLatency/1000) + 5 + 60
 			if onMetrics != nil {
 				onMetrics(fps, bitrate, latencyMs, int64(byteCount), int64(frameCount))
 			}
+
+			// Backlog diagnostics: report per-loop timing once per second.
+			// frameMs=5ms is the realtime budget per iteration. If loopMaxMs
+			// exceeds it, the loop fell behind and PulseAudio capture buffer
+			// likely accumulated stale samples (growing speaker latency).
+			backlogMs := 0
+			if loopMaxMs > time.Duration(frameMs)*time.Millisecond {
+				backlogMs = int(loopMaxMs/(time.Millisecond) - frameMs)
+			}
+			slog.Debug("Speaker timing",
+				"loop_max_ms", loopMaxMs.Milliseconds(),
+				"send_max_ms", sendMaxMs.Milliseconds(),
+				"backlog_ms", backlogMs,
+				"slow_send", slowSendCount,
+				"slow_loop", slowLoopCount,
+				"iters", loopCount)
+			if loopMaxMs >= loopSlowThreshold || sendMaxMs >= sendSlowThreshold {
+				slog.Warn("Speaker: loop fell behind realtime (potential backlog)",
+					"loop_max_ms", loopMaxMs.Milliseconds(),
+					"send_max_ms", sendMaxMs.Milliseconds(),
+					"backlog_ms", backlogMs,
+					"slow_send", slowSendCount,
+					"slow_loop", slowLoopCount)
+			}
+			sendMaxMs = 0
+			loopMaxMs = 0
+			slowSendCount = 0
+			slowLoopCount = 0
 
 			framesSinceMetrics = 0
 			bytesSinceMetrics = 0
@@ -717,6 +776,8 @@ func runSpeakerCapture(ctx context.Context, w io.Writer, onMetrics func(fps, bit
 				"total_bytes", byteCount,
 				"packet_bytes", len(packet))
 		}
+
+		iterStart = time.Now()
 	}
 }
 

@@ -23,6 +23,8 @@ type Client struct {
 	userAgent  string
 	send       chan []byte // text messages (JSON status, events)
 	sendBin    chan []byte // binary messages (H.264 NAL units for screen)
+	writeMu    sync.Mutex  // serializes concurrent WriteMessage calls
+	wg         sync.WaitGroup
 }
 
 // Hub maintains the set of active clients and broadcasts messages
@@ -260,29 +262,49 @@ func (c *Client) logClientEvent(data interface{}) {
 	}
 }
 
-// writePump writes messages to the WebSocket connection
+// writePump writes messages to the WebSocket connection.
+//
+// Text (status/events) and binary (H.264 screen frames) are written by two
+// independent goroutines so that a slow text write can never block binary
+// frame delivery — otherwise periodic BroadcastStatus messages could stall
+// screen frames and cause the remote viewer to freeze on the "connecting"
+// state while other streams (e.g. speaker) are active.
 func (c *Client) writePump() {
-	defer c.conn.Close()
+	c.wg.Add(2)
+	go c.writeTextPump()
+	go c.writeBinaryPump()
+	c.wg.Wait()
+	c.conn.Close()
+}
 
-	for {
-		select {
-		case message, ok := <-c.send:
-			if !ok {
-				c.conn.WriteMessage(websocket.CloseMessage, []byte{})
-				return
-			}
-			if err := c.conn.WriteMessage(websocket.TextMessage, message); err != nil {
-				return
-			}
-
-		case data, ok := <-c.sendBin:
-			if !ok {
-				c.conn.WriteMessage(websocket.CloseMessage, []byte{})
-				return
-			}
-			if err := c.conn.WriteMessage(websocket.BinaryMessage, data); err != nil {
-				return
-			}
+// writeTextPump writes text (JSON) messages from c.send.
+func (c *Client) writeTextPump() {
+	defer c.wg.Done()
+	for message := range c.send {
+		c.writeMu.Lock()
+		err := c.conn.WriteMessage(websocket.TextMessage, message)
+		c.writeMu.Unlock()
+		if err != nil {
+			return
 		}
 	}
+	c.writeMu.Lock()
+	c.conn.WriteMessage(websocket.CloseMessage, []byte{})
+	c.writeMu.Unlock()
+}
+
+// writeBinaryPump writes binary (H.264) messages from c.sendBin.
+func (c *Client) writeBinaryPump() {
+	defer c.wg.Done()
+	for data := range c.sendBin {
+		c.writeMu.Lock()
+		err := c.conn.WriteMessage(websocket.BinaryMessage, data)
+		c.writeMu.Unlock()
+		if err != nil {
+			return
+		}
+	}
+	c.writeMu.Lock()
+	c.conn.WriteMessage(websocket.CloseMessage, []byte{})
+	c.writeMu.Unlock()
 }
