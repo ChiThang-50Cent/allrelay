@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/allrelay/allrelay-server/internal/audio"
@@ -612,6 +613,13 @@ func runSpeakerCapture(ctx context.Context, w io.Writer, onMetrics func(fps, bit
 		channels   = 2
 		bitrate    = 96000
 		frameMs    = 5
+		// queueFrames caps sender-side buffering between the capture/encode
+		// loop and the TCP send goroutine. When the phone or Wi-Fi stalls the
+		// write, the queue fills and the capture loop drops the oldest encoded
+		// frame instead of blocking. This caps sender latency at
+		// queueFrames*frameMs and prevents PulseAudio capture backlog from
+		// accumulating (the latency-drifts-up-until-toggle symptom).
+		queueFrames = 4 // 4 * 5ms = 20ms max sender buffer
 	)
 	frameSamples := sampleRate * frameMs / 1000 * channels // int16 samples per frame
 	pcmBytes := frameSamples * 2                           // s16le
@@ -642,48 +650,105 @@ func runSpeakerCapture(ctx context.Context, w io.Writer, onMetrics func(fps, bit
 	}
 	slog.Debug("Speaker: sent OpusTags", "bytes", len(opusTags))
 
-	// Monitor context cancellation — kill pipeline to unblock reads
+	// Monitor context cancellation — kill pipeline to unblock reads.
 	go func() {
 		<-ctx.Done()
 		slog.Info("Speaker: context cancelled, closing pipeline")
 		pipeline.Close()
 	}()
 
-	// Main loop: read PCM, encode to Opus, forward to phone
+	const (
+		sendSlowThreshold = 20 * time.Millisecond
+		loopSlowThreshold = 20 * time.Millisecond
+	)
+
+	// Decouple capture/encode from TCP send via a bounded, drop-oldest queue.
+	// The send goroutine blocks on WritePacket when the phone/Wi-Fi stalls;
+	// the capture loop never blocks on send, so PulseAudio capture never
+	// accumulates a stale backlog. When the queue is full the oldest encoded
+	// frame is discarded, capping sender latency at queueFrames*frameMs.
+	type opusPacket struct {
+		pts  uint64
+		data []byte
+	}
+	queue := make(chan opusPacket, queueFrames)
+
+	var sendMaxMs atomic.Int64    // milliseconds
+	var slowSendCount atomic.Uint64
+	var droppedFrames atomic.Uint64
+	var sentFrames atomic.Uint64
+	var sentBytes atomic.Uint64
+	var lastSendLatencyUs atomic.Int64
+
+	// sendFatal is closed by the send goroutine on an unrecoverable write
+	// error so the capture loop stops feeding a dead connection.
+	sendFatal := make(chan struct{})
+
+	sendDone := make(chan struct{})
+	go func() {
+		defer close(sendDone)
+		for pkt := range queue {
+			sendStart := time.Now()
+			if err := audio.WritePacket(w, protocol.StreamSpeaker, 0, pkt.pts, pkt.data); err != nil {
+				slog.Error("Speaker: write error", "error", err)
+				close(sendFatal)
+				// Drain remaining queued frames then exit.
+				for range queue {
+				}
+				return
+			}
+			sendDur := time.Since(sendStart)
+			lastSendLatencyUs.Store(sendDur.Microseconds())
+			if ms := sendDur.Milliseconds(); ms > sendMaxMs.Load() {
+				sendMaxMs.Store(ms)
+			}
+			if sendDur >= sendSlowThreshold {
+				slowSendCount.Add(1)
+			}
+			sentFrames.Add(1)
+			sentBytes.Add(uint64(len(pkt.data)))
+		}
+	}()
+
+	// If the send goroutine dies (TCP write error), stop capture too so we
+	// don't keep feeding a dead connection.
+	go func() {
+		<-sendFatal
+		slog.Info("Speaker: send goroutine failed, closing capture pipeline")
+		pipeline.Close()
+	}()
+
+	// Capture + encode loop.
 	pcmBuf := make([]int16, frameSamples)
 	rawBuf := make([]byte, pcmBytes)
 	var frameCount uint64
-	var byteCount uint64
 	var lastMetricsTime = time.Now()
 	var framesSinceMetrics uint64
 	var bytesSinceMetrics uint64
 
-	// Backlog diagnostics: track per-iteration timing to detect send-side
-	// stalls that cause PulseAudio capture buffer to accumulate stale samples.
-	// loopMs above frameMs means the loop can't keep up with realtime; the
-	// difference is an estimate of growing backlog (latency drift).
-	var sendMaxMs time.Duration
+	// Loop-side timing (read+encode+enqueue). Send-side timing is tracked
+	// atomically by the send goroutine above.
 	var loopMaxMs time.Duration
 	var loopCount uint64
-	var slowSendCount uint64
 	var slowLoopCount uint64
-	const sendSlowThreshold = 20 * time.Millisecond
-	const loopSlowThreshold = 20 * time.Millisecond
 	iterStart := time.Now()
 
+	var loopErr error
 	for {
 		_, err := io.ReadFull(pipeline, rawBuf)
 		if err != nil {
 			if ctx.Err() != nil {
-				slog.Info("Speaker: stopped by context", "frames", frameCount)
-				return ctx.Err()
+				slog.Info("Speaker: stopped by context", "frames", frameCount, "dropped", droppedFrames.Load())
+				loopErr = ctx.Err()
+				break
 			}
 			if err == io.EOF {
 				slog.Info("Speaker: capture pipeline ended", "frames", frameCount)
 			} else {
 				slog.Error("Speaker: read error", "error", err)
 			}
-			return err
+			loopErr = err
+			break
 		}
 
 		// Convert s16le bytes to int16 samples (native endian is little on x86/ARM)
@@ -694,75 +759,87 @@ func runSpeakerCapture(ctx context.Context, w io.Writer, onMetrics func(fps, bit
 		packet, err := enc.Encode(pcmBuf)
 		if err != nil {
 			slog.Error("Speaker: encode error", "error", err)
-			return err
+			loopErr = err
+			break
 		}
 
-		sendStart := time.Now()
+		frameCount++
 		pts := frameCount * uint64(frameMs*1000) // microseconds
-		if err := audio.WritePacket(w, protocol.StreamSpeaker, 0, pts, packet); err != nil {
-			slog.Error("Speaker: write error", "error", err)
-			return err
-		}
-		sendDur := time.Since(sendStart)
-		sendLatency := sendDur.Microseconds()
+		pkt := opusPacket{pts: pts, data: packet}
 
-		// Per-iteration timing for backlog diagnostics.
+		// Drop-oldest enqueue: if the send queue is full (TCP write stalled),
+		// discard the oldest queued frame to make room. This bounds sender
+		// latency instead of letting it drift upward.
+		select {
+		case queue <- pkt:
+		default:
+			select {
+			case <-queue:
+				droppedFrames.Add(1)
+				queue <- pkt
+			default:
+				// Extremely unlikely: queue drained between checks; try once more.
+				select {
+				case queue <- pkt:
+				default:
+					droppedFrames.Add(1)
+				}
+			}
+		}
+
+		bytesSinceMetrics += uint64(len(packet))
+		framesSinceMetrics++
+
 		loopDur := time.Since(iterStart)
 		loopCount++
-		if sendDur > sendMaxMs {
-			sendMaxMs = sendDur
-		}
 		if loopDur > loopMaxMs {
 			loopMaxMs = loopDur
-		}
-		if sendDur >= sendSlowThreshold {
-			slowSendCount++
 		}
 		if loopDur >= loopSlowThreshold {
 			slowLoopCount++
 		}
 
-		frameCount++
-		byteCount += uint64(len(packet))
-		framesSinceMetrics++
-		bytesSinceMetrics += uint64(len(packet))
-
-		// Update metrics every second
+		// Update metrics every second.
 		if time.Since(lastMetricsTime) >= time.Second {
 			metricsElapsed := time.Since(lastMetricsTime)
 			fps := int(float64(framesSinceMetrics) / metricsElapsed.Seconds())
 			bitrate := int(float64(bytesSinceMetrics*8) / metricsElapsed.Seconds())
-			latencyMs := int(sendLatency/1000) + 5 + 60
+			sentF := sentFrames.Load()
+			sentB := sentBytes.Load()
+			latencyMs := int(lastSendLatencyUs.Load()/1000) + 5 + 60
 			if onMetrics != nil {
-				onMetrics(fps, bitrate, latencyMs, int64(byteCount), int64(frameCount))
+				onMetrics(fps, bitrate, latencyMs, int64(sentB), int64(sentF))
 			}
 
-			// Backlog diagnostics: report per-loop timing once per second.
-			// frameMs=5ms is the realtime budget per iteration. If loopMaxMs
-			// exceeds it, the loop fell behind and PulseAudio capture buffer
-			// likely accumulated stale samples (growing speaker latency).
+			// Backlog diagnostics: report per-loop + send timing once per second.
+			// frameMs=5ms is the realtime budget per capture iteration.
 			backlogMs := 0
 			if loopMaxMs > time.Duration(frameMs)*time.Millisecond {
 				backlogMs = int(loopMaxMs/(time.Millisecond) - frameMs)
 			}
+			sendMax := sendMaxMs.Load()
+			slowSend := slowSendCount.Load()
+			dropped := droppedFrames.Swap(0)
 			slog.Debug("Speaker timing",
 				"loop_max_ms", loopMaxMs.Milliseconds(),
-				"send_max_ms", sendMaxMs.Milliseconds(),
+				"send_max_ms", sendMax,
 				"backlog_ms", backlogMs,
-				"slow_send", slowSendCount,
+				"slow_send", slowSend,
 				"slow_loop", slowLoopCount,
+				"dropped", dropped,
 				"iters", loopCount)
-			if loopMaxMs >= loopSlowThreshold || sendMaxMs >= sendSlowThreshold {
+			if loopMaxMs >= loopSlowThreshold || sendMax >= sendSlowThreshold.Milliseconds() {
 				slog.Warn("Speaker: loop fell behind realtime (potential backlog)",
 					"loop_max_ms", loopMaxMs.Milliseconds(),
-					"send_max_ms", sendMaxMs.Milliseconds(),
+					"send_max_ms", sendMax,
 					"backlog_ms", backlogMs,
-					"slow_send", slowSendCount,
-					"slow_loop", slowLoopCount)
+					"slow_send", slowSend,
+					"slow_loop", slowLoopCount,
+					"dropped", dropped)
 			}
-			sendMaxMs = 0
+			sendMaxMs.Store(0)
+			slowSendCount.Store(0)
 			loopMaxMs = 0
-			slowSendCount = 0
 			slowLoopCount = 0
 
 			framesSinceMetrics = 0
@@ -773,12 +850,19 @@ func runSpeakerCapture(ctx context.Context, w io.Writer, onMetrics func(fps, bit
 		if frameCount%250 == 0 {
 			slog.Debug("Speaker stream",
 				"frames", frameCount,
-				"total_bytes", byteCount,
+				"sent", sentFrames.Load(),
+				"dropped", droppedFrames.Load(),
 				"packet_bytes", len(packet))
 		}
 
 		iterStart = time.Now()
 	}
+
+	// Stop the send goroutine and wait for it to finish so deferred Close()
+	// calls don't race with in-flight writes.
+	close(queue)
+	<-sendDone
+	return loopErr
 }
 
 type opusConfig struct {
