@@ -638,27 +638,43 @@ public final class Server {
         startUdpResponder(port);
     }
 
+    private static final String DISCOVERY_QUERY = "\"query\":\"allrelay\"";
+
     /** UDP discovery responder — listens for queries, responds with phone info. */
     private static void startUdpResponder(int port) {
         new Thread(() -> {
+            java.net.DatagramSocket socket = null;
             try {
-                java.net.DatagramSocket socket = new java.net.DatagramSocket(5009);
+                socket = new java.net.DatagramSocket(null);
+                socket.setReuseAddress(true);
                 socket.setBroadcast(true);
+                socket.bind(new java.net.InetSocketAddress(5009));
                 byte[] buf = new byte[256];
-                String response = "{\"name\":\"AllRelay\",\"port\":" + port + "}";
+                byte[] data = ("{\"name\":\"AllRelay\",\"port\":" + port + "}").getBytes(java.nio.charset.StandardCharsets.UTF_8);
                 Ln.i("Discovery: UDP responder on port 5009");
                 while (true) {
                     try {
                         java.net.DatagramPacket packet = new java.net.DatagramPacket(buf, buf.length);
                         socket.receive(packet);
-                        byte[] data = response.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                        // Validate that this is an AllRelay discovery query before
+                        // replying, so random port scanners don't trigger beacons.
+                        String req = new String(packet.getData(), 0, packet.getLength(), java.nio.charset.StandardCharsets.UTF_8);
+                        if (req.indexOf(DISCOVERY_QUERY) < 0) {
+                            continue;
+                        }
                         java.net.DatagramPacket reply = new java.net.DatagramPacket(
                             data, data.length, packet.getAddress(), packet.getPort());
                         socket.send(reply);
-                    } catch (Exception ignored) {}
+                    } catch (java.io.IOException e) {
+                        Ln.w("Discovery: UDP receive/send error", e);
+                    }
                 }
             } catch (Exception e) {
                 Ln.w("Discovery: UDP failed", e);
+            } finally {
+                if (socket != null) {
+                    socket.close();
+                }
             }
         }, "udp-responder").start();
     }

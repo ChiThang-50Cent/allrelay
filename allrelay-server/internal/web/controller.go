@@ -88,13 +88,14 @@ func (sc *ServerController) Connect(host string, port int) error {
 
 	slog.Info("Connecting to phone", "host", host, "port", port)
 
-	// Connect camera + mic + speaker immediately.
-	// Screen + control are opened lazily on toggle ON to avoid consuming
-	// screen data before the UI actively reads it.
+	// Only open the speaker TCP stream at connect time (PC → phone audio is
+	// the default thing the user wants right away). Camera, mic, screen and
+	// control are opened lazily via ReconnectStream when the UI toggles them
+	// ON, so we don't pay for streams the user never uses.
 	conn, err := transport.Connect(host, uint16(port),
 		false, // video (screen)
-		true,  // camera
-		true,  // mic
+		false, // camera
+		false, // mic
 		true,  // speaker
 		false) // control
 	if err != nil {
@@ -119,16 +120,6 @@ func (sc *ServerController) Connect(host string, port int) error {
 	// Start speaker stream by default (PC → phone audio)
 	if conn.HasStream(protocol.StreamSpeaker) {
 		sc.startSpeakerStream()
-	}
-
-	// Start camera stream by default (phone camera → PC → v4l2loopback)
-	if conn.HasStream(protocol.StreamCamera) {
-		sc.startCameraStream()
-	}
-
-	// Start mic stream by default (phone mic → PC virtual microphone)
-	if conn.HasStream(protocol.StreamMic) {
-		sc.startMicStreamLocked()
 	}
 
 	slog.Info("Connected to phone", "host", host)
@@ -1102,12 +1093,12 @@ func isNetTimeout(err error) bool {
 func runCameraCapture(ctx context.Context, reader io.Reader) error {
 	device := video.GetCameraDevice()
 
-	// If the Android side stops sending frames but leaves TCP ESTAB,
-	// blocking reads would otherwise keep the stream falsely active forever.
-	// Enforce an idle read timeout so the camera stream tears down cleanly.
-	if conn, ok := reader.(net.Conn); ok {
-		reader = &readDeadlineReader{conn: conn, timeout: 5 * time.Second}
-	}
+	// Do NOT apply an idle read timeout for the camera (same policy as screen).
+	// The Android H.264 encoder can legitimately pause for several seconds
+	// (GOP buffering, GC pause, Wi-Fi power-save). A 5s deadline kept
+	// tearing down healthy streams — the so-called "camera hay bị ngắt ngang"
+	// symptom. The stream ends on real conditions: context cancellation, a
+	// natural demuxer EOF, or a TCP RST/FIN (socket closed on either side).
 
 	// Ensure v4l2loopback device exists (module should be loaded at boot)
 	if err := video.EnsureV4L2Device(device); err != nil {

@@ -420,23 +420,58 @@ async function handleDisconnect() {
     }
 }
 
+// scanLock prevents overlapping scans when the user spams the button.
+// UDP discovery is fragile on Wi-Fi, so subsequent clicks during an in-flight
+// scan would just collide on the socket and worsen the "must retry" symptom.
+let scanInProgress = false;
+
 async function handleScan() {
+    if (scanInProgress) return;
+    scanInProgress = true;
     elements.scanBtn.disabled = true;
     elements.scanBtn.innerHTML = '<span class="loading">Scanning...</span>';
 
+    // UDP discovery is lossy (Wi-Fi power-save, doze, ARP misses). One server-side
+    // scan already retransmits, but a single empty/in-error result can still be a
+    // transient miss. Retry up to SCAN_MAX_RETRIES times server-side; stop early
+    // as soon as we get at least one phone.
+    const SCAN_MAX_RETRIES = 3;
+    let lastError = null;
+    let phones = null;
+
     try {
-        const phones = await apiCall(API.scan);
-        state.phones = phones;
-        renderPhoneList();
-        
-        if (phones.length === 0) {
-            showInfo('No phones found. Make sure AllRelay server is running on your phone.');
-        } else {
-            showSuccess(`Found ${phones.length} phone(s)`);
+        for (let attempt = 1; attempt <= SCAN_MAX_RETRIES; attempt++) {
+            try {
+                phones = await apiCall(API.scan);
+                lastError = null;
+                if (Array.isArray(phones) && phones.length > 0) {
+                    break; // found something — no need to retry
+                }
+            } catch (err) {
+                lastError = err;
+                // Hard infra failure (e.g. server can't detect subnet / can't
+                // bind UDP) — no point retrying the exact same thing 2 more
+                // times. Surface immediately.
+                break;
+            }
+            if (attempt < SCAN_MAX_RETRIES) {
+                await new Promise(r => setTimeout(r, 400));
+            }
         }
-    } catch (error) {
-        showError('Failed to scan network');
+
+        if (lastError || phones === null) {
+            showError('Failed to scan network' + (lastError ? ': ' + (lastError.message || lastError) : ''));
+        } else {
+            state.phones = phones;
+            renderPhoneList();
+            if (phones.length === 0) {
+                showInfo('No phones found. Make sure AllRelay server is running on your phone.');
+            } else {
+                showSuccess(`Found ${phones.length} phone(s)`);
+            }
+        }
     } finally {
+        scanInProgress = false;
         elements.scanBtn.disabled = false;
         elements.scanBtn.innerHTML = `
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">

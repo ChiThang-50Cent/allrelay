@@ -11,6 +11,9 @@ object RootDaemonManager {
     private const val LOCAL_TMP_JAR = "/data/local/tmp/allrelay.jar"
     private const val MAGISK_JAR = "/data/adb/modules/allrelay/system/bin/scrcpy-server-allrelay.jar"
     private const val PROCESS_PATTERN = "com.genymobile.scrcpy.Server"
+    private const val CAMERA_SAFE_SIZE = "1280x720"
+    private const val CAMERA_SAFE_FPS = 15
+    private const val CAMERA_SAFE_VIDEO_BIT_RATE = 3_000_000
     const val ADB_TCP_DEFAULT_PORT = 5555
 
     data class Config(
@@ -69,6 +72,7 @@ object RootDaemonManager {
         }
 
         val jarPath = resolveJarPath(context)
+        val cameraTuningArgs = buildCameraTuningArgs(config)
 
         val startScript = "/data/local/tmp/allrelay-start.sh"
         val script = """
@@ -100,7 +104,7 @@ CLASSPATH=$jarPath exec app_process / com.genymobile.scrcpy.Server \
   wifi_port=5000 \
   speaker_enabled=${config.speaker} \
   camera_enabled=${config.camera} \
-  daemon=true \
+${cameraTuningArgs}  daemon=true \
   control=${config.screen} \
   power_on=false \
   keep_active=${config.screen} \
@@ -286,6 +290,33 @@ CLASSPATH=$jarPath exec app_process / com.genymobile.scrcpy.Server \
             message = message,
             logTail = readLogTail(),
         )
+    }
+
+    private fun buildCameraTuningArgs(config: Config): String {
+        if (!config.camera) {
+            return ""
+        }
+
+        // Camera profile tuned for stability on thermally constrained phones.
+        // camera_size/camera_fps only affect the camera path.
+        // video_bit_rate/max_fps are global scrcpy options, so only apply them
+        // in camera-only mode to avoid unexpectedly degrading screen mirroring.
+        return buildString {
+            append("  camera_size=")
+            append(CAMERA_SAFE_SIZE)
+            append(" \\\n")
+            append("  camera_fps=")
+            append(CAMERA_SAFE_FPS)
+            append(" \\\n")
+            if (!config.screen) {
+                append("  video_bit_rate=")
+                append(CAMERA_SAFE_VIDEO_BIT_RATE)
+                append(" \\\n")
+                append("  max_fps=")
+                append(CAMERA_SAFE_FPS)
+                append(" \\\n")
+            }
+        }
     }
 
     private fun resolveJarPath(context: Context): String {

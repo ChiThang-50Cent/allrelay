@@ -252,7 +252,12 @@ func (ws *WebServer) handlePhones(w http.ResponseWriter, r *http.Request) {
 // Android phones listen for discovery queries on UDP port 5009 and reply
 // with their name/base TCP port.
 func (ws *WebServer) handleScanPhones(w http.ResponseWriter, r *http.Request) {
-	results := ws.scanner.Scan()
+	results, err := ws.scanner.Scan()
+	if err != nil {
+		slog.Warn("scan failed", "error", err)
+		http.Error(w, fmt.Sprintf("scan failed: %v", err), http.StatusInternalServerError)
+		return
+	}
 
 	phones := make([]PhoneDevice, 0, len(results))
 	ws.mu.Lock()
