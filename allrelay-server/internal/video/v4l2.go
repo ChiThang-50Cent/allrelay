@@ -39,15 +39,17 @@ func EnsureV4L2Device(device string) error {
 // output format between sessions if keep_format=1 is enabled. This makes
 // camera OFF→ON restarts reliable without requiring sudo/module reloads.
 func SetupV4L2Output(device string, width, height int, pixelformat string) error {
-	// Persist the last good format across writer restarts.
-	if err := setV4L2Ctrl(device, "keep_format=1"); err != nil {
-		slog.Warn("v4l2: failed to enable keep_format", "error", err)
+	// Unlock a format left by a prior session before checking or changing it.
+	// A kernel/module reload resets the device to its default (usually BGR4),
+	// and keep_format=1 would otherwise reject the required YUYV configuration.
+	if err := setV4L2Ctrl(device, "keep_format=0"); err != nil {
+		return fmt.Errorf("v4l2 disable keep_format: %w", err)
 	}
 
 	if current, err := getV4L2Format(device, "--get-fmt-video-out"); err == nil {
 		if v4l2FormatMatches(current, width, height, pixelformat) {
 			slog.Debug("v4l2: output format already configured", "device", device)
-			return nil
+			return enableV4L2KeepFormat(device)
 		}
 		slog.Info("v4l2: output format differs, reconfiguring", "device", device)
 	}
@@ -74,6 +76,13 @@ func SetupV4L2Output(device string, width, height int, pixelformat string) error
 	}
 	if !v4l2FormatMatches(current, width, height, pixelformat) {
 		return fmt.Errorf("v4l2 output format mismatch after setup: %s", strings.TrimSpace(current))
+	}
+	return enableV4L2KeepFormat(device)
+}
+
+func enableV4L2KeepFormat(device string) error {
+	if err := setV4L2Ctrl(device, "keep_format=1"); err != nil {
+		return fmt.Errorf("v4l2 enable keep_format: %w", err)
 	}
 	return nil
 }
