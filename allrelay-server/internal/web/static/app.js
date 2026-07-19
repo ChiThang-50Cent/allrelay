@@ -43,6 +43,7 @@ const state = {
     ],
     ws: null,
     wsReconnectTimer: null,
+    screenInitRequested: false,
     remotePowerOffAutoTried: false,
     remotePowerOffSent: false,
     remoteModeLogEmitted: false,
@@ -179,6 +180,7 @@ function connectWebSocket() {
     const wsUrl = `${protocol}//${window.location.host}/ws`;
     
     try {
+        state.screenInitRequested = false;
         state.ws = new WebSocket(wsUrl);
         
         state.ws.onopen = () => {
@@ -226,6 +228,13 @@ function handleWebSocketMessage(msg) {
     switch (msg.type) {
         case 'status':
             updateConnectionStatus(msg.data);
+            // Request cached decoder state once, after the initial status has
+            // made the remote canvas active. Periodic metrics also use status
+            // messages and must never reset the decoder.
+            if (pageMode === 'remote' && !state.screenInitRequested) {
+                state.screenInitRequested = true;
+                sendWebSocketMessage('screen_init');
+            }
             break;
             
         case 'stream_update':
@@ -242,6 +251,10 @@ function handleWebSocketMessage(msg) {
 
         case 'screen_session':
             handleScreenSession(msg.data);
+            break;
+
+        case 'screen_init':
+            handleScreenInit(msg.data);
             break;
             
         default:
@@ -1583,6 +1596,34 @@ function resetScreenDecoderForReconfigure() {
         screenDecoder = null;
     }
     screenConfigured = false;
+}
+
+function handleScreenInit(data) {
+    if (!screenActive || !data) return;
+
+    // This is one text WebSocket message so session metadata is processed
+    // before its cached SPS/PPS and IDR frame, regardless of the separate
+    // live text/binary WebSocket writers.
+    if (data.session) {
+        handleScreenSession(data.session);
+    }
+    const cachedFrames = [
+        ...(Array.isArray(data.configs) ? data.configs : []),
+        data.keyFrame,
+    ];
+    for (const encoded of cachedFrames) {
+        if (typeof encoded !== 'string' || !encoded) continue;
+        try {
+            const raw = atob(encoded);
+            const frame = new Uint8Array(raw.length);
+            for (let i = 0; i < raw.length; i++) {
+                frame[i] = raw.charCodeAt(i);
+            }
+            handleBinaryFrame(frame);
+        } catch (err) {
+            console.warn('Invalid cached screen initialization frame:', err);
+        }
+    }
 }
 
 function handleScreenSession(data) {

@@ -13,11 +13,15 @@ go build -o "$BIN_DIR/allrelay-server" ./cmd/allrelay-server/
 echo "   Binary: $BIN_DIR/allrelay-server ($(du -h "$BIN_DIR/allrelay-server" | cut -f1))"
 
 echo "=== [2/4] Copy files to package ==="
-mkdir -p "$DEB_DIR/usr/bin"
+mkdir -p "$DEB_DIR/usr/bin" "$DEB_DIR/usr/share/applications" "$DEB_DIR/usr/share/icons/hicolor/scalable/apps"
 cp "$BIN_DIR/allrelay-server" "$DEB_DIR/usr/bin/"
 cp "$ROOT/scripts/allrelay-helper.sh" "$DEB_DIR/usr/bin/allrelay"
+cp "$ROOT/scripts/allrelay-tray.py" "$DEB_DIR/usr/bin/allrelay-tray"
 chmod 755 "$DEB_DIR/usr/bin/allrelay-server"
 chmod 755 "$DEB_DIR/usr/bin/allrelay"
+chmod 755 "$DEB_DIR/usr/bin/allrelay-tray"
+cp "$ROOT/assets/allrelay.desktop" "$DEB_DIR/usr/share/applications/allrelay.desktop"
+cp "$ROOT/assets/allrelay.svg" "$DEB_DIR/usr/share/icons/hicolor/scalable/apps/allrelay.svg"
 
 rm -rf "$DEB_DIR/usr/share/allrelay"
 mkdir -p "$DEB_DIR/usr/share/allrelay/static" "$DEB_DIR/usr/share/allrelay/templates"
@@ -30,8 +34,9 @@ chmod 755 "$DEB_DIR/DEBIAN/postinst"
 chmod 755 "$DEB_DIR/DEBIAN/prerm"
 
 echo "   Files:"
-find "$DEB_DIR" -not -path "*/DEBIAN/*" -type f | sort | while read f; do
-    echo "   $(echo $f | sed "s|$DEB_DIR||") ($(du -h "$f" | cut -f1))"
+find "$DEB_DIR" -not -path "*/DEBIAN/*" -type f | sort | while IFS= read -r f; do
+    relative_path=${f#"$DEB_DIR"}
+    echo "   $relative_path ($(du -h "$f" | cut -f1))"
 done
 
 echo "=== [3/4] Build Android APK + Magisk module ==="

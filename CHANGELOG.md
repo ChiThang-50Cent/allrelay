@@ -1,5 +1,36 @@
 # Changelog
 
+## 2026-07-20
+
+### Added
+- Ubuntu App Grid launcher for **AllRelay**. It starts the server and tray controls without opening the dashboard.
+- GTK/Ayatana tray controls with automatic phone discovery, connection controls, stream toggles, and a link to detailed web settings.
+- A dedicated `allrelay-tray.service`, installed and enabled with the existing user service.
+- Route-aware, subnet-aware phone discovery that uses the active network interface and retransmits UDP queries to handle Wi-Fi packet loss.
+
+### Changed
+- The tray **Screen** action opens the existing remote viewer in the default browser before enabling the stream.
+- App icon now uses a dark tile, blue circle, and centered phone glyph.
+- Camera and microphone connections are opened only when enabled; speaker starts by default after connecting.
+- Android camera mode uses a conservative 1280×720 / 15 FPS profile for stability without reducing screen mirroring quality.
+- Debian package version advanced to `0.2.13` and declares the tray and URL-launcher dependencies.
+
+### Fixed
+- A remote viewer that opens after Screen has started now receives the current screen session, H.264 codec configuration, and a key frame required to decode.
+- Decoder bootstrap occurs once per WebSocket connection instead of on periodic stream metrics, preventing repeated decoder resets.
+- WebSocket control forwarding and client cleanup are synchronized to avoid concurrent access races.
+- Discovery no longer binds the phone beacon port locally, returns actionable scan failures, and ignores malformed/unrelated UDP replies.
+- Camera capture no longer shuts down healthy streams after a short idle period.
+- V4L2 unlocks, configures, verifies, then relocks YUYV output so the virtual camera recovers after a module/kernel reload.
+- Tray leaves Screen disabled when the system browser cannot be launched.
+
+### Cleanup
+- Fixed the multi-stream integration test's data race and listener leak.
+- Ignored generated Debian application/icon install paths; tracked source assets remain under `assets/`.
+
+### Packaging
+- Rebuilt and verified `allrelay_0.2.13_amd64.deb`, including launcher, icon, tray script, and user service.
+
 ## 2026-06-20
 
 ### Added

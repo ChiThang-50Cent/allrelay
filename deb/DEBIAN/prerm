@@ -1,9 +1,9 @@
 #!/bin/bash
 set -e
 
-systemctl --global disable allrelay.service || true
+systemctl --global disable allrelay.service allrelay-tray.service || true
 
 # Stop for all logged-in users
 for uid in $(loginctl list-users --no-legend 2>/dev/null | awk '{print $1}' || true); do
-    su - "$(id -nu "$uid" 2>/dev/null || echo "")" -c "XDG_RUNTIME_DIR=/run/user/$uid systemctl --user stop allrelay 2>/dev/null" || true
+    su - "$(id -nu "$uid" 2>/dev/null || echo "")" -c "XDG_RUNTIME_DIR=/run/user/$uid systemctl --user stop allrelay allrelay-tray 2>/dev/null" || true
 done

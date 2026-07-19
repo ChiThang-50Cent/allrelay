@@ -1,9 +1,9 @@
 Package: allrelay
-Version: 0.2.3
+Version: 0.2.13
 Section: net
 Priority: optional
 Architecture: amd64
-Depends: v4l2loopback-dkms, ffmpeg, pulseaudio-utils
+Depends: v4l2loopback-dkms, ffmpeg, pulseaudio-utils, xdg-utils, python3-gi, gir1.2-gtk-3.0, gir1.2-ayatanaappindicator3-0.1
 Maintainer: AllRelay <allrelay@localhost>
 Description: Stream Android phone media to PC over Wi-Fi
  AllRelay streams camera, screen, microphone, and speaker between
@@ -13,5 +13,6 @@ Description: Stream Android phone media to PC over Wi-Fi
  Features:
   * Camera as virtual webcam (v4l2loopback /dev/video10)
   * Speaker audio (PC -> phone) with low-latency Opus
-  * Web dashboard via the `allrelay open` helper command
+  * Desktop launcher and tray controls for phones and media streams
+  * Web dashboard for detailed settings via `allrelay open`
   * Independent streams — each can be toggled separately

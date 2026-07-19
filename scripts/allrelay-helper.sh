@@ -23,7 +23,7 @@ wait_for_url() {
 
 usage() {
     cat <<EOF
-Usage: allrelay [open|url|status|start|stop|restart|logs]
+Usage: allrelay [open|tray|url|status|start|stop|restart|logs]
 EOF
 }
 
@@ -38,6 +38,10 @@ case "$cmd" in
         else
             echo "$url"
         fi
+        ;;
+    tray)
+        systemctl --user start allrelay.service allrelay-tray.service
+        echo "AllRelay started with tray controls"
         ;;
     url)
         wait_for_url

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=AllRelay
+Comment=Start AllRelay tray controls
+Exec=allrelay tray
+Icon=allrelay
+Terminal=false
+Categories=Network;
+Keywords=Android;Phone;Camera;Stream;Remote;
+StartupNotify=false

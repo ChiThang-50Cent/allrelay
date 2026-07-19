@@ -1,0 +1,14 @@
+[Unit]
+Description=AllRelay tray controls
+Wants=allrelay.service
+After=allrelay.service graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/allrelay-tray
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

@@ -34,10 +34,31 @@ type Hub struct {
 	register   chan *Client
 	unregister chan *Client
 	mu         sync.RWMutex
+	controlMu  sync.RWMutex
 
-	// OnControl is called when a client sends a control message (touch, key, etc.)
-	OnControl func(data []byte)
+	// Latest decoder setup for a viewer that joins after screen streaming began.
+	// Access units are immutable once published, so their slices are safe to retain.
+	screenSession      *screenSession
+	screenConfigFrames [][]byte
+	screenKeyFrame     []byte
+
+	// onControl forwards touch and key events to the active control connection.
+	onControl func(data []byte)
 }
+
+type screenSession struct {
+	Width  uint32 `json:"width"`
+	Height uint32 `json:"height"`
+}
+
+type screenInit struct {
+	Session  *screenSession `json:"session,omitempty"`
+	Configs  [][]byte       `json:"configs,omitempty"`
+	KeyFrame []byte         `json:"keyFrame,omitempty"`
+}
+
+const maxScreenReplayFrameBytes = 2 * 1024 * 1024
+const maxScreenReplayConfigFrames = 4
 
 // NewHub creates a new WebSocket hub
 func NewHub() *Hub {
@@ -72,7 +93,9 @@ func (h *Hub) Run() {
 			slog.Debug("WebSocket client disconnected", "total", total, "remote_addr", client.remoteAddr)
 
 		case message := <-h.broadcast:
-			h.mu.RLock()
+			// A full client queue removes that client, so this must be an
+			// exclusive lock rather than an RLock.
+			h.mu.Lock()
 			for client := range h.clients {
 				select {
 				case client.send <- message:
@@ -81,15 +104,48 @@ func (h *Hub) Run() {
 					delete(h.clients, client)
 				}
 			}
-			h.mu.RUnlock()
+			h.mu.Unlock()
 		}
 	}
 }
 
-// BroadcastBinary sends raw binary data (e.g., H.264 NAL units) to all clients.
-func (h *Hub) BroadcastBinary(data []byte) {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
+// SetScreenSession records and broadcasts the active screen dimensions. A new
+// session invalidates codec configuration and keyframes from the old encoder.
+func (h *Hub) SetScreenSession(width, height uint32) {
+	session := &screenSession{Width: width, Height: height}
+	h.mu.Lock()
+	h.screenSession = session
+	h.screenConfigFrames = nil
+	h.screenKeyFrame = nil
+	h.mu.Unlock()
+	h.BroadcastEvent("screen_session", session)
+}
+
+// ClearScreenReplay removes cached decoder state when screen streaming stops.
+func (h *Hub) ClearScreenReplay() {
+	h.mu.Lock()
+	h.screenSession = nil
+	h.screenConfigFrames = nil
+	h.screenKeyFrame = nil
+	h.mu.Unlock()
+}
+
+// BroadcastScreenFrame sends one H.264 access unit and retains the small set of
+// decoder inputs needed to start a remote viewer that connects late.
+func (h *Hub) BroadcastScreenFrame(data []byte) {
+	h.mu.Lock()
+	if len(data) > 1 {
+		flags := data[0]
+		if flags&1 != 0 {
+			h.screenConfigFrames = append(h.screenConfigFrames, data)
+			if len(h.screenConfigFrames) > maxScreenReplayConfigFrames {
+				h.screenConfigFrames = h.screenConfigFrames[len(h.screenConfigFrames)-maxScreenReplayConfigFrames:]
+			}
+		}
+		if flags&2 != 0 && len(data) <= maxScreenReplayFrameBytes {
+			h.screenKeyFrame = data
+		}
+	}
 	for client := range h.clients {
 		select {
 		case client.sendBin <- data:
@@ -97,6 +153,40 @@ func (h *Hub) BroadcastBinary(data []byte) {
 			// Client buffer full, drop this frame
 		}
 	}
+	h.mu.Unlock()
+}
+
+// SetControlHandler updates the active control forwarding target.
+func (h *Hub) SetControlHandler(handler func([]byte)) {
+	h.controlMu.Lock()
+	h.onControl = handler
+	h.controlMu.Unlock()
+}
+
+func (h *Hub) forwardControl(data []byte) {
+	h.controlMu.RLock()
+	handler := h.onControl
+	h.controlMu.RUnlock()
+	if handler != nil {
+		handler(data)
+	}
+}
+
+func (h *Hub) screenInitMessage() []byte {
+	h.mu.RLock()
+	init := screenInit{
+		Session:  h.screenSession,
+		Configs:  append([][]byte(nil), h.screenConfigFrames...),
+		KeyFrame: h.screenKeyFrame,
+	}
+	h.mu.RUnlock()
+
+	message, err := json.Marshal(WSMessage{Type: "screen_init", Data: init})
+	if err != nil {
+		slog.Error("Failed to marshal cached screen initialization", "error", err)
+		return nil
+	}
+	return message
 }
 
 // BroadcastStatus sends status update to all connected clients
@@ -196,9 +286,7 @@ func (c *Client) readPump() {
 		}
 
 		if messageType == websocket.BinaryMessage {
-			if c.hub.OnControl != nil {
-				c.hub.OnControl(message)
-			}
+			c.hub.forwardControl(message)
 			continue
 		}
 
@@ -213,12 +301,16 @@ func (c *Client) readPump() {
 		switch msg.Type {
 		case "ping":
 			c.send <- []byte(`{"type":"pong"}`)
+		case "screen_init":
+			// The client requests this after applying its initial status update, so
+			// its screen canvas is ready before replayed config/keyframe data arrives.
+			if init := c.hub.screenInitMessage(); init != nil {
+				c.send <- init
+			}
 		case "control":
 			// Backward-compatible fallback for older clients.
-			if c.hub.OnControl != nil {
-				data, _ := json.Marshal(msg.Data)
-				c.hub.OnControl(data)
-			}
+			data, _ := json.Marshal(msg.Data)
+			c.hub.forwardControl(data)
 		case "client_log":
 			c.logClientEvent(msg.Data)
 		}

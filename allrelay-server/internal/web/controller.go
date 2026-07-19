@@ -468,6 +468,8 @@ func (sc *ServerController) startScreenStreamLocked() {
 
 	// Scrcpy-like lifecycle: every Screen ON starts a fresh TCP session.
 	// Never reuse old screen/control sockets across toggles.
+	hub := sc.webServer.Hub()
+	hub.ClearScreenReplay()
 	sc.conn.CloseStream(protocol.StreamScreen)
 	sc.conn.CloseStream(protocol.StreamControl)
 
@@ -492,20 +494,19 @@ func (sc *ServerController) startScreenStreamLocked() {
 	videoConn := sc.conn.VideoConn()
 
 	// Wire control forwarding best-effort. Control must never block screen.
-	hub := sc.webServer.Hub()
-	hub.OnControl = nil
+	hub.SetControlHandler(nil)
 	setControlForwarding := func(controlConn net.Conn) {
 		if controlConn == nil {
 			return
 		}
-		hub.OnControl = func(data []byte) {
+		hub.SetControlHandler(func(data []byte) {
 			if len(data) == 0 {
 				return
 			}
 			if _, err := controlConn.Write(data); err != nil {
 				slog.Debug("Control write error", "error", err)
 			}
-		}
+		})
 	}
 	go func(expectedGen int) {
 		slog.Info("Control: opening fresh TCP session (best-effort)")
@@ -528,8 +529,9 @@ func (sc *ServerController) startScreenStreamLocked() {
 	go func() {
 		defer close(stream.done)
 		defer func() {
-			// Clear control forwarding when screen stream stops
-			hub.OnControl = nil
+			// Clear control forwarding and stale decoder data when screen stops.
+			hub.SetControlHandler(nil)
+			hub.ClearScreenReplay()
 		}()
 		if err := runScreenCapture(ctx, videoConn, hub,
 			func(fps, bitrate, latency int, bytes, frames int64) {
@@ -1265,10 +1267,7 @@ func runScreenCapture(ctx context.Context, reader io.Reader, hub *Hub,
 		// before frames for the new orientation arrive.
 		if len(payload) == 0 {
 			if header.SessionWidth > 0 && header.SessionHeight > 0 {
-				hub.BroadcastEvent("screen_session", map[string]uint32{
-					"width":  header.SessionWidth,
-					"height": header.SessionHeight,
-				})
+				hub.SetScreenSession(header.SessionWidth, header.SessionHeight)
 			}
 			return nil
 		}
@@ -1291,7 +1290,7 @@ func runScreenCapture(ctx context.Context, reader io.Reader, hub *Hub,
 		msg := make([]byte, 1+len(payload))
 		msg[0] = flags
 		copy(msg[1:], payload)
-		hub.BroadcastBinary(msg)
+		hub.BroadcastScreenFrame(msg)
 
 		frameCount++
 		byteCount += uint64(len(payload))

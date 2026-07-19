@@ -21,7 +21,6 @@ func TestE2EMultiStream(t *testing.T) {
 	const basePort uint16 = 15500
 
 	// Start mock servers
-	listeners := make([]net.Listener, 4)
 	streamNames := []string{"screen", "camera", "mic", "speaker"}
 	streamIDs := []uint32{0x01, 0x02, 0x03, 0x04}
 
@@ -33,7 +32,7 @@ func TestE2EMultiStream(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Listen %s: %v", streamNames[i], err)
 		}
-		listeners[i] = listener
+		defer listener.Close()
 
 		wg.Add(1)
 		go func(idx int, name string, streamID uint32) {
@@ -88,18 +87,23 @@ func TestE2EMultiStream(t *testing.T) {
 	// Collect received data
 	received := make(map[uint32]string)
 	var mu sync.Mutex
+	var doneOnce sync.Once
 	done := make(chan struct{})
+	recordReceived := func(streamID uint32, payload []byte) {
+		mu.Lock()
+		received[streamID] = string(payload)
+		complete := len(received) >= 3 // screen, camera, and mic
+		mu.Unlock()
+		if complete {
+			doneOnce.Do(func() { close(done) })
+		}
+	}
 
 	// Screen handler
 	go func() {
 		demuxer := protocol.NewDemuxer(conn.VideoStream())
 		demuxer.RegisterHandler(0x01, func(h *protocol.Header, payload []byte) error {
-			mu.Lock()
-			received[0x01] = string(payload)
-			mu.Unlock()
-			if len(received) >= 3 { // expect 3 streams (screen+camera+mic, speaker is PC→phone)
-				close(done)
-			}
+			recordReceived(0x01, payload)
 			return nil
 		})
 		demuxer.Run()
@@ -109,16 +113,7 @@ func TestE2EMultiStream(t *testing.T) {
 	go func() {
 		demuxer := protocol.NewDemuxer(conn.CameraStream())
 		demuxer.RegisterHandler(0x02, func(h *protocol.Header, payload []byte) error {
-			mu.Lock()
-			received[0x02] = string(payload)
-			mu.Unlock()
-			if len(received) >= 3 {
-				select {
-				case <-done:
-				default:
-					close(done)
-				}
-			}
+			recordReceived(0x02, payload)
 			return nil
 		})
 		demuxer.Run()
@@ -128,16 +123,7 @@ func TestE2EMultiStream(t *testing.T) {
 	go func() {
 		demuxer := protocol.NewDemuxer(conn.MicStream())
 		demuxer.RegisterHandler(0x03, func(h *protocol.Header, payload []byte) error {
-			mu.Lock()
-			received[0x03] = string(payload)
-			mu.Unlock()
-			if len(received) >= 3 {
-				select {
-				case <-done:
-				default:
-					close(done)
-				}
-			}
+			recordReceived(0x03, payload)
 			return nil
 		})
 		demuxer.Run()
