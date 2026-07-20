@@ -28,6 +28,7 @@
 ### Cleanup
 - Fixed the multi-stream integration test's data race and listener leak.
 - Ignored generated Debian application/icon install paths; tracked source assets remain under `assets/`.
+- Updated README build, install, release-artifact, and on-demand tray/backend instructions.
 
 ### Packaging
 - Rebuilt and verified `allrelay_0.2.15_amd64.deb`, including launcher, icon, tray script, and user service.

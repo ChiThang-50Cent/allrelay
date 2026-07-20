@@ -2,7 +2,7 @@
 
 > Turn a rooted Android phone into wireless screen, camera, mic, and speaker for Ubuntu.
 
-AllRelay streams media directly over Wi‑Fi between Android and Ubuntu, with a web dashboard to discover the phone, connect, and toggle streams independently.
+AllRelay streams media directly over Wi‑Fi between Android and Ubuntu. The Ubuntu App Grid launcher and tray are the primary controls; the local web dashboard is available for detailed settings.
 
 ## What it does
 
@@ -11,7 +11,8 @@ AllRelay streams media directly over Wi‑Fi between Android and Ubuntu, with a 
 - **Microphone**: Android mic exposed as a Linux audio input
 - **Speaker**: PC audio played on the phone speaker
 - **Independent toggles**: each stream can be turned on/off without killing the others
-- **Phone discovery from PC**: web UI uses a UDP subnet scan; no phone-initiated session required
+- **Tray controls**: scan, connect, and toggle streams directly from Ubuntu's system tray
+- **Phone discovery from PC**: route-aware UDP subnet scan; no phone-initiated session required
 
 ## Current architecture
 
@@ -30,12 +31,13 @@ AllRelay streams media directly over Wi‑Fi between Android and Ubuntu, with a 
   - `:5009/udp` discovery responder
 
 ### Ubuntu
-- `allrelay-server` Go backend
-- Web dashboard on `http://localhost:9090`
-- Browser popup uses **WebSocket + WebCodecs** for screen mirroring
+- App Grid launcher and GTK/Ayatana tray client for everyday controls
+- `allrelay-server` Go backend, started on demand with the tray
+- Local web dashboard on a dynamic `127.0.0.1` port (`allrelay open`)
+- Browser remote viewer uses **WebSocket + WebCodecs** for screen mirroring
 - Camera uses **ffmpeg → v4l2loopback**
 - Audio integrates with **PipeWire/PulseAudio**
-- Packaged as a **user systemd service** so audio works in the user session
+- Backend and tray are user services, but neither auto-starts at login
 
 ## Requirements
 
@@ -59,34 +61,43 @@ AllRelay streams media directly over Wi‑Fi between Android and Ubuntu, with a 
 ```
 
 Outputs:
-- `bin/allrelay_0.2.0_amd64.deb`
-- `bin/scrcpy-server-allrelay`
-- `bin/allrelay-magisk.zip`
+- `bin/allrelay_<version>_amd64.deb` — Ubuntu package
+- `bin/allrelay-magisk.zip` — flashable Android Magisk module
+- `bin/scrcpy-server-allrelay` — Android server artifact for Magisk or manual ADB use
 
-### Android-only build
+### Android controller app build
+
+Build the Android server first, then build the controller APK:
 
 ```bash
 ./scripts/build-magisk.sh
+(cd android && ./gradlew :app:assembleDebug)
+cp android/app/build/outputs/apk/debug/app-debug.apk bin/allrelay-app-debug.apk
 ```
 
-This also refreshes:
-- `bin/scrcpy-server-allrelay`
-- `bin/allrelay-magisk.zip`
+The debug APK is suitable for local testing. Create and sign a release APK before distributing it publicly.
 
 ## Install
 
 ### Ubuntu
 
 ```bash
-sudo dpkg -i bin/allrelay_0.2.0_amd64.deb
-systemctl --user enable --now allrelay
+sudo dpkg -i bin/allrelay_<version>_amd64.deb
 ```
+
+Neither Ubuntu service starts automatically at boot/login. Open **AllRelay** from the App Grid to start the backend and tray together, or run:
+
+```bash
+allrelay tray
+```
+
+For advanced settings, run `allrelay open`; it starts the backend if needed and opens the local dashboard.
 
 ### Android
 
 #### Option 1: AllRelay app (recommended)
 
-Install the APK, open it, and tap **Start** to launch the daemon.
+Install `allrelay-app-debug.apk` for local testing (or a signed release APK when available), open it, and tap **Start** to launch the daemon.
 
 The app is the primary control surface — it can start, stop, and restart the daemon regardless of whether it was originally launched by Magisk or ADB.
 
@@ -121,11 +132,11 @@ adb shell "su -c 'CLASSPATH=/data/local/tmp/allrelay.jar app_process / \
 
 ## Use
 
-1. Open `http://localhost:9090`
-2. Click **Scan** to find the phone via UDP subnet scan
-3. Click **Connect**
-4. Toggle streams independently
-5. Turning on **Screen** opens the dedicated remote popup automatically
+1. Open **AllRelay** from the Ubuntu App Grid (or run `allrelay tray`).
+2. From the tray, choose **Scan now**, then select a phone under **Devices**.
+3. Toggle Camera, Microphone, Speaker, or Screen from the tray.
+4. Turning on **Screen** opens the remote viewer in the default browser.
+5. Use **Open detailed settings** in the tray or `allrelay open` for dashboard-only options.
 
 ## Repository layout
 
@@ -141,10 +152,10 @@ allrelay/
 
 ## Notes
 
-- The web UI is the primary control surface.
-- Discovery in the dashboard uses **UDP subnet scan**.
+- The App Grid launcher/tray is the primary Ubuntu control surface; the web UI is for detailed settings.
+- Discovery uses a route-aware **UDP subnet scan**.
 - Screen/control use the **raw binary scrcpy control protocol**, not JSON.
-- The packaged Linux service is a **user service**, not a system service.
+- The packaged Linux services are on-demand **user services**, not system services.
 
 ## Related docs
 
