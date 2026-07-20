@@ -11,7 +11,7 @@ AllRelay streams media directly over Wi‑Fi between Android and Ubuntu. The Ubu
 - **Microphone**: Android mic exposed as a Linux audio input
 - **Speaker**: PC audio played on the phone speaker
 - **Independent toggles**: each stream can be turned on/off without killing the others
-- **Tray controls**: scan, connect, and toggle streams directly from Ubuntu's system tray
+- **Tray controls**: scan, connect, and toggle streams directly from Ubuntu's system tray; discovery retries automatically and a direct IPv4 fallback is available
 - **Phone discovery from PC**: route-aware UDP subnet scan; no phone-initiated session required
 
 ## Current architecture
@@ -133,7 +133,7 @@ adb shell "su -c 'CLASSPATH=/data/local/tmp/allrelay.jar app_process / \
 ## Use
 
 1. Open **AllRelay** from the Ubuntu App Grid (or run `allrelay tray`).
-2. From the tray, choose **Scan now**, then select a phone under **Devices**.
+2. From the tray, choose **Scan now**, then select a phone under **Devices**. Discovery retries automatically; use **Devices → Connect by IP…** (port `5000`) when needed.
 3. Toggle Camera, Microphone, Speaker, or Screen from the tray.
 4. Turning on **Screen** opens the remote viewer in the default browser.
 5. Use **Open detailed settings** in the tray or `allrelay open` for dashboard-only options.
