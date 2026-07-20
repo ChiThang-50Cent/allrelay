@@ -6,6 +6,7 @@ API. The media server remains headless and can still be used without a desktop
 session or through the web dashboard.
 """
 
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -32,6 +33,8 @@ except (ImportError, ValueError) as exc:
     sys.exit(1)
 
 SCAN_INTERVAL_SECONDS = 30
+SCAN_MAX_RETRIES = 3
+SCAN_RETRY_DELAY_SECONDS = 0.4
 STREAMS = (
     ("screen", "Screen"),
     ("camera", "Camera"),
@@ -59,20 +62,33 @@ class AllRelayClient:
         return url.rstrip("/")
 
     def get_status(self) -> dict[str, Any]:
+        # Match the dashboard: do not turn a slow controller operation into a
+        # client-side timeout. refresh() allows only one status request at once.
         return self._request("/api/status")
 
     def scan(self) -> list[dict[str, Any]]:
-        # Discovery probes an entire subnet and has a 3-second server window.
-        result = self._request("/api/phones/scan", method="POST", timeout=10)
-        if not isinstance(result, list):
-            raise APIError("AllRelay returned an invalid phone list")
-        return result
+        # Match the dashboard's three-attempt discovery flow. Wi-Fi UDP
+        # discovery can legitimately miss one complete scan window.
+        for attempt in range(SCAN_MAX_RETRIES):
+            result = self._request("/api/phones/scan", method="POST")
+            if not isinstance(result, list):
+                raise APIError("AllRelay returned an invalid phone list")
+            if result or attempt == SCAN_MAX_RETRIES - 1:
+                return result
+            time.sleep(SCAN_RETRY_DELAY_SECONDS)
+        return []
 
     def connect(self, phone: dict[str, Any]) -> None:
         ports = phone.get("ports") or []
         if not ports:
             raise APIError("The selected phone did not provide a connection port")
-        self._request("/api/connect", method="POST", body={"ip": phone["ip"], "port": ports[0]})
+        self.connect_address(str(phone["ip"]), int(ports[0]))
+
+    def connect_address(self, ip: str, port: int = 5000) -> None:
+        # The dashboard deliberately waits for /api/connect rather than
+        # imposing a short client deadline. The operation runs in a tray
+        # worker, so this never blocks GTK while Android starts its sockets.
+        self._request("/api/connect", method="POST", body={"ip": ip, "port": port})
 
     def disconnect(self) -> None:
         self._request("/api/disconnect", method="POST")
@@ -89,7 +105,7 @@ class AllRelayClient:
         path: str,
         method: str = "GET",
         body: dict[str, Any] | None = None,
-        timeout: int = 3,
+        timeout: float | None = None,
     ) -> Any:
         data = None
         headers: dict[str, str] = {}
@@ -113,6 +129,8 @@ class AllRelayTray:
         self.refreshing = False
         self.updating_menu = False
         self.scanning = False
+        self.action_in_progress = False
+        self.have_status = False
         self.connected = False
         self.last_scan_started = 0.0
         self.phones: list[dict[str, Any]] = []
@@ -196,6 +214,13 @@ class AllRelayTray:
                 item = Gtk.MenuItem.new_with_label(f"{name} ({ip})")
                 item.connect("activate", self.on_connect, phone)
                 self.phone_menu.append(item)
+
+        if self.phones or self.scanning:
+            self.phone_menu.append(Gtk.SeparatorMenuItem())
+        manual_connect = Gtk.MenuItem.new_with_label("Connect by IP…")
+        manual_connect.connect("activate", self.on_connect_by_ip)
+        self.phone_menu.append(manual_connect)
+
         if self.scanning:
             self.connect_item.set_label("Devices (scanning…)")
         elif self.phones:
@@ -205,7 +230,10 @@ class AllRelayTray:
         self.phone_menu.show_all()
 
     def refresh(self) -> bool:
-        if self.refreshing:
+        # /api/connect holds the controller lock while Android brings up its
+        # TCP streams. Dashboard fetches simply wait; do the same here instead
+        # of racing it with a short /api/status request that says "offline".
+        if self.refreshing or self.action_in_progress:
             return True
         self.refreshing = True
         self.run_background(self.client.get_status, self.apply_status)
@@ -226,16 +254,15 @@ class AllRelayTray:
     def apply_status(self, status: Any, failure: str | None) -> None:
         self.refreshing = False
         if failure:
-            self.connected = False
-            self.status_item.set_label("AllRelay: offline")
-            self.connect_item.set_sensitive(False)
-            self.scan_item.set_sensitive(False)
-            self.disconnect_item.set_sensitive(False)
-            for item in self.stream_items.values():
-                item.set_sensitive(False)
+            # The dashboard leaves its last known state untouched when a
+            # background status fetch fails. In particular, a slow connection
+            # attempt must not make the tray look disconnected.
+            if not self.have_status:
+                self.status_item.set_label("AllRelay: waiting for service…")
             return
 
         assert isinstance(status, dict)
+        self.have_status = True
         connected = bool(status.get("connected"))
         self.connected = connected
         phone = status.get("phone") or {}
@@ -291,12 +318,29 @@ class AllRelayTray:
         self.maybe_scan()
         return True
 
+    def restore_connection_controls(self) -> None:
+        self.connect_item.set_sensitive(not self.connected)
+        self.scan_item.set_sensitive(not self.connected)
+        self.disconnect_item.set_sensitive(self.connected)
+        for item in self.stream_items.values():
+            item.set_sensitive(self.connected)
+
     def report_action(self, action: str, operation: Callable[[], Any]) -> None:
+        self.action_in_progress = True
         self.status_item.set_label(f"AllRelay: {action}…")
+        self.connect_item.set_sensitive(False)
+        self.scan_item.set_sensitive(False)
+        self.disconnect_item.set_sensitive(False)
+        for item in self.stream_items.values():
+            item.set_sensitive(False)
 
         def done(_result: Any, failure: str | None) -> None:
+            self.action_in_progress = False
             if failure:
                 self.status_item.set_label(f"AllRelay: {failure}")
+                # Like the dashboard's finally block, a failed operation must
+                # leave the user able to retry instead of a disabled tray.
+                self.restore_connection_controls()
             self.refresh()
 
         self.run_background(operation, done)
@@ -310,6 +354,36 @@ class AllRelayTray:
 
     def on_disconnect(self, _item: Gtk.MenuItem) -> None:
         self.report_action("disconnecting", self.client.disconnect)
+
+    def on_connect_by_ip(self, _item: Gtk.MenuItem) -> None:
+        dialog = Gtk.Dialog(title="Connect to phone")
+        dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        dialog.add_button("Connect", Gtk.ResponseType.OK)
+        dialog.set_default_response(Gtk.ResponseType.OK)
+
+        content = dialog.get_content_area()
+        content.set_border_width(12)
+        content.set_spacing(8)
+        content.add(Gtk.Label(label="Phone IPv4 address:"))
+        entry = Gtk.Entry()
+        entry.set_placeholder_text("192.168.1.24")
+        entry.set_activates_default(True)
+        content.add(entry)
+        dialog.show_all()
+        response = dialog.run()
+        ip = entry.get_text().strip()
+        dialog.destroy()
+
+        if response != Gtk.ResponseType.OK:
+            return
+        try:
+            parsed = ipaddress.ip_address(ip)
+            if parsed.version != 4:
+                raise ValueError
+        except ValueError:
+            self.status_item.set_label("AllRelay: enter a valid IPv4 address")
+            return
+        self.report_action(f"connecting to {ip}", lambda: self.client.connect_address(ip))
 
     def on_stream_toggled(self, item: Gtk.CheckMenuItem, stream: str) -> None:
         if self.updating_menu:

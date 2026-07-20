@@ -24,6 +24,7 @@
 - Camera capture no longer shuts down healthy streams after a short idle period.
 - V4L2 unlocks, configures, verifies, then relocks YUYV output so the virtual camera recovers after a module/kernel reload.
 - Tray leaves Screen disabled when the system browser cannot be launched.
+- Tray now follows dashboard connection behavior: it waits for slow phone connections, retries discovery up to three times, avoids transient offline state while an action is pending, and supports direct IPv4 connection.
 
 ### Cleanup
 - Fixed the multi-stream integration test's data race and listener leak.
