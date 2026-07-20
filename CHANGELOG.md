@@ -9,11 +9,12 @@
 - Route-aware, subnet-aware phone discovery that uses the active network interface and retransmits UDP queries to handle Wi-Fi packet loss.
 
 ### Changed
+- Both backend and tray are now on-demand: neither starts at boot/login, while the App Grid launcher or `allrelay tray` starts them together. Package upgrades disable and stop any prior auto-started services.
 - The tray **Screen** action opens the existing remote viewer in the default browser before enabling the stream.
 - App icon now uses a dark tile, blue circle, and centered phone glyph.
 - Camera and microphone connections are opened only when enabled; speaker starts by default after connecting.
 - Android camera mode uses a conservative 1280×720 / 15 FPS profile for stability without reducing screen mirroring quality.
-- Debian package version advanced to `0.2.13` and declares the tray and URL-launcher dependencies.
+- Debian package version advanced to `0.2.15` and declares the tray and URL-launcher dependencies.
 
 ### Fixed
 - A remote viewer that opens after Screen has started now receives the current screen session, H.264 codec configuration, and a key frame required to decode.
@@ -29,7 +30,7 @@
 - Ignored generated Debian application/icon install paths; tracked source assets remain under `assets/`.
 
 ### Packaging
-- Rebuilt and verified `allrelay_0.2.13_amd64.deb`, including launcher, icon, tray script, and user service.
+- Rebuilt and verified `allrelay_0.2.15_amd64.deb`, including launcher, icon, tray script, and user service.
 
 ## 2026-06-20
 
