@@ -245,7 +245,7 @@ public final class Server {
 
                     List<AsyncProcessor> asyncProcessors = new ArrayList<>();
 
-                    // === MIC STREAM ===
+                    // === PHONE AUDIO STREAM ===
                     if (micEnabled) {
                         try {
                             OutputStream audioOutputStream = wifiConn.getAudioOutputStream();
@@ -262,10 +262,10 @@ public final class Server {
                                 WifiAudioEncoder audioEncoder = new WifiAudioEncoder(
                                         audioCapture, audioStreamer, options);
                                 asyncProcessors.add(audioEncoder);
-                                Ln.i("Wi-Fi mic stream enabled on port " + (wifiPort + 2));
+                                Ln.i("Wi-Fi phone audio stream enabled on port " + (wifiPort + 2));
                             }
                         } catch (Exception e) {
-                            Ln.e("Failed to start mic stream: " + e.getMessage());
+                            Ln.e("Failed to start phone audio stream: " + e.getMessage());
                         }
                     }
 
@@ -429,7 +429,7 @@ public final class Server {
                 AudioSource audioSource = options.getAudioSource();
                 AudioCapture audioCapture = createAudioCapture(audioSource, options);
 
-                // MIC-family sources → StreamId.MIC, OUTPUT/PLAYBACK → StreamId.SPEAKER
+                // Direct sources (including output/REMOTE_SUBMIX) use StreamId.MIC.
                 StreamId audioStreamId = audioSource.isDirect() ? StreamId.MIC : StreamId.SPEAKER;
                 Streamer audioStreamer = new Streamer(connection.getAudioFd(), audioCodec, audioStreamId,
                         options.getSendStreamMeta(), options.getSendFrameMeta());

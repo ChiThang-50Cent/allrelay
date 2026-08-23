@@ -1,6 +1,6 @@
 # AllRelay
 
-> Turn a rooted Android phone into wireless screen, camera, mic, and speaker for Ubuntu.
+> Turn a rooted Android phone into wireless screen, camera, playback audio, and speaker for Ubuntu.
 
 AllRelay streams media directly over Wi‑Fi between Android and Ubuntu. The Ubuntu App Grid launcher and tray are the primary controls; the local web dashboard is available for detailed settings.
 
@@ -8,7 +8,7 @@ AllRelay streams media directly over Wi‑Fi between Android and Ubuntu. The Ubu
 
 - **Screen + control**: Android screen in a dedicated browser popup with touch/keyboard control
 - **Camera**: Android camera exposed to Linux apps via `v4l2loopback`
-- **Microphone**: Android mic exposed as a Linux audio input
+- **Phone audio**: Android playback audio exposed as a Linux audio input for Discord and other calling apps
 - **Speaker**: PC audio played on the phone speaker
 - **Independent toggles**: each stream can be turned on/off without killing the others
 - **Tray controls**: scan, connect, and toggle streams directly from Ubuntu's system tray; discovery retries automatically and a direct IPv4 fallback is available
@@ -25,7 +25,7 @@ AllRelay streams media directly over Wi‑Fi between Android and Ubuntu. The Ubu
 - Streams:
   - `:5000` screen
   - `:5001` camera
-  - `:5002` mic
+  - `:5002` phone playback audio
   - `:5003` speaker
   - `:5004` control
   - `:5009/udp` discovery responder
@@ -121,8 +121,9 @@ adb shell "su -c 'CLASSPATH=/data/local/tmp/allrelay.jar app_process / \
   wifi_mode=true \
   wifi_port=5000 \
   video=true \
+  screen_video_bit_rate=16000000 \
   audio=true \
-  audio_source=mic \
+  audio_source=output \
   speaker_enabled=true \
   camera_enabled=true \
   daemon=true \
@@ -134,7 +135,7 @@ adb shell "su -c 'CLASSPATH=/data/local/tmp/allrelay.jar app_process / \
 
 1. Open **AllRelay** from the Ubuntu App Grid (or run `allrelay tray`).
 2. From the tray, choose **Scan now**, then select a phone under **Devices**. Discovery retries automatically; use **Devices → Connect by IP…** (port `5000`) when needed.
-3. Toggle Camera, Microphone, Speaker, or Screen from the tray.
+3. Toggle Camera, Phone audio, Speaker, or Screen from the tray. Select **AllRelay Phone Audio** as Discord's input device to send Android playback audio to participants.
 4. Turning on **Screen** opens the remote viewer in the default browser.
 5. Use **Open detailed settings** in the tray or `allrelay open` for dashboard-only options.
 

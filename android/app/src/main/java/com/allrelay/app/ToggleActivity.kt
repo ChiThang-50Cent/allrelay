@@ -108,7 +108,7 @@ class ToggleActivity : Activity() {
         layout.addView(sectionTitle("Streams"))
         screenSwitch = createStreamToggle("Screen + control daemons (:5000, :5004)", true)
         cameraSwitch = createStreamToggle("Camera daemon (:5001)", true)
-        micSwitch = createStreamToggle("Mic daemon (:5002)", true)
+        micSwitch = createStreamToggle("Phone playback audio daemon (:5002)", true)
         speakerSwitch = createStreamToggle("Speaker daemon (:5003)", true)
         layout.addView(screenSwitch)
         layout.addView(cameraSwitch)

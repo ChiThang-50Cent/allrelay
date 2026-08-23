@@ -14,6 +14,7 @@ object RootDaemonManager {
     private const val CAMERA_SAFE_SIZE = "1280x720"
     private const val CAMERA_SAFE_FPS = 15
     private const val CAMERA_SAFE_VIDEO_BIT_RATE = 3_000_000
+    private const val SCREEN_VIDEO_BIT_RATE = 16_000_000
     const val ADB_TCP_DEFAULT_PORT = 5555
 
     data class Config(
@@ -72,6 +73,7 @@ object RootDaemonManager {
         }
 
         val jarPath = resolveJarPath(context)
+        val screenTuningArgs = buildScreenTuningArgs(config)
         val cameraTuningArgs = buildCameraTuningArgs(config)
 
         val startScript = "/data/local/tmp/allrelay-start.sh"
@@ -99,12 +101,12 @@ CLASSPATH=$jarPath exec app_process / com.genymobile.scrcpy.Server \
   log_level=info \
   video=${config.screen} \
   audio=${config.mic} \
-  audio_source=mic \
+  audio_source=output \
   wifi_mode=true \
   wifi_port=5000 \
   speaker_enabled=${config.speaker} \
   camera_enabled=${config.camera} \
-${cameraTuningArgs}  daemon=true \
+${screenTuningArgs}${cameraTuningArgs}  daemon=true \
   control=${config.screen} \
   power_on=false \
   keep_active=${config.screen} \
@@ -290,6 +292,18 @@ ${cameraTuningArgs}  daemon=true \
             message = message,
             logTail = readLogTail(),
         )
+    }
+
+    private fun buildScreenTuningArgs(config: Config): String {
+        if (!config.screen) {
+            return ""
+        }
+
+        return buildString {
+            append("  screen_video_bit_rate=")
+            append(SCREEN_VIDEO_BIT_RATE)
+            append(" \\\n")
+        }
     }
 
     private fun buildCameraTuningArgs(config: Config): String {

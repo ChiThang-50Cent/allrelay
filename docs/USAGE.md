@@ -48,8 +48,9 @@ adb shell "su -c 'CLASSPATH=/data/local/tmp/allrelay.jar app_process / \
   wifi_mode=true \
   wifi_port=5000 \
   video=true \
+  screen_video_bit_rate=16000000 \
   audio=true \
-  audio_source=mic \
+  audio_source=output \
   speaker_enabled=true \
   camera_enabled=true \
   daemon=true \
@@ -96,7 +97,7 @@ http://localhost:9090
 4. Toggle streams independently:
    - **Screen** → opens the remote popup
    - **Camera** → exposes the phone camera on Linux via `v4l2loopback`
-   - **Mic** → exposes the phone mic as a Linux audio input
+   - **Phone audio** → exposes Android playback audio as the **AllRelay Phone Audio** input device for Discord and other calling apps
    - **Speaker** → plays PC audio on the phone
 
 ### Camera tips for Meet / Zoom / Chrome

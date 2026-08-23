@@ -87,7 +87,7 @@ start_server() {
     # screen/control enabled: remote popup uses ports 5000 + 5004
     # speaker_enabled=true: PC→phone audio on port 5003
     # camera_enabled=true: phone camera→PC on port 5001
-    # audio=true + audio_source=mic: phone mic daemon on port 5002
+    # audio=true + audio_source=output: phone playback audio on port 5002
     # power_on=false: do not wake the phone when the control channel attaches
     # keep_active=true: keep the device awake while remote screen mode is in use
     nohup sh -c "
@@ -98,8 +98,9 @@ start_server() {
             wifi_mode=true \
             wifi_port=5000 \
             video=true \
+            screen_video_bit_rate=16000000 \
             audio=true \
-            audio_source=mic \
+            audio_source=output \
             speaker_enabled=true \
             camera_enabled=true \
             daemon=true \

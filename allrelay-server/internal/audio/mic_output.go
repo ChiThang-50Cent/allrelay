@@ -14,14 +14,14 @@ import (
 const (
 	VirtualMicSinkName   = "allrelay-mic-sink"
 	VirtualMicSourceName = "allrelay-phone-mic"
-	virtualMicSinkDesc   = "AllRelay-Mic-Sink"
-	virtualMicSourceDesc = "AllRelay-Phone-Mic"
+	virtualMicSinkDesc   = "AllRelay-Phone-Audio-Sink"
+	virtualMicSourceDesc = "AllRelay Phone Audio"
 )
 
 var virtualMicMu sync.Mutex
 
 // EnsureVirtualMicDevices creates a PulseAudio/pipewire-pulse sink+source pair
-// for the phone microphone if it does not already exist.
+// for phone playback audio if it does not already exist.
 //
 // Audio flow:
 //
@@ -150,7 +150,7 @@ type VirtualMicWriter struct {
 	mu    sync.Mutex
 }
 
-// StartVirtualMicWriter starts a pacat writer feeding PCM into the virtual mic sink.
+// StartVirtualMicWriter starts a pacat writer feeding PCM into the phone audio sink.
 func StartVirtualMicWriter(sampleRate, channels int) (*VirtualMicWriter, error) {
 	if err := EnsureVirtualMicDevices(); err != nil {
 		return nil, err

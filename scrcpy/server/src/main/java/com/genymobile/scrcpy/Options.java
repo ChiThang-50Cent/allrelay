@@ -34,6 +34,7 @@ public class Options {
     private AudioSource audioSource = AudioSource.OUTPUT;
     private boolean audioDup;
     private int videoBitRate = 8000000;
+    private int screenVideoBitRate = 8000000;
     private int audioBitRate = 128000;
     private float maxFps;
     private float angle;
@@ -140,6 +141,10 @@ public class Options {
 
     public int getVideoBitRate() {
         return videoBitRate;
+    }
+
+    public int getScreenVideoBitRate() {
+        return screenVideoBitRate;
     }
 
     public int getAudioBitRate() {
@@ -429,6 +434,9 @@ public class Options {
                     break;
                 case "video_bit_rate":
                     options.videoBitRate = Integer.parseInt(value);
+                    break;
+                case "screen_video_bit_rate":
+                    options.screenVideoBitRate = Integer.parseInt(value);
                     break;
                 case "audio_bit_rate":
                     options.audioBitRate = Integer.parseInt(value);

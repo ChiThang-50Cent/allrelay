@@ -64,7 +64,9 @@ public class WifiSurfaceEncoder implements AsyncProcessor {
     public WifiSurfaceEncoder(SurfaceCapture capture, WifiStreamer streamer, Options options) {
         this.capture = capture;
         this.streamer = streamer;
-        this.videoBitRate = options.getVideoBitRate();
+        this.videoBitRate = capture instanceof CameraCapture
+                ? options.getVideoBitRate()
+                : options.getScreenVideoBitRate();
         this.maxSize = options.getMaxSize();
         this.maxFps = options.getMaxFps();
         this.codecOptions = options.getVideoCodecOptions();

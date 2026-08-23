@@ -38,7 +38,7 @@ SCAN_RETRY_DELAY_SECONDS = 0.4
 STREAMS = (
     ("screen", "Screen"),
     ("camera", "Camera"),
-    ("mic", "Microphone"),
+    ("mic", "Phone audio"),
     ("speaker", "Speaker"),
 )
 
