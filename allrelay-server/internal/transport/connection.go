@@ -384,6 +384,18 @@ func (c *Connection) ReconnectStream(host string, basePort uint16, id uint32) er
 		c.mic = newConn
 		slog.Info("Mic reconnected", "host", host, "port", basePort+2)
 		return nil
+	case protocol.StreamSpeaker:
+		if c.speaker != nil {
+			c.speaker.Close()
+			c.speaker = nil
+		}
+		newConn := connectPortWithRetry(host, basePort+3, "speaker", 5)
+		if newConn == nil {
+			return fmt.Errorf("speaker reconnect failed: %s:%d", host, basePort+3)
+		}
+		c.speaker = newConn
+		slog.Info("Speaker reconnected", "host", host, "port", basePort+3)
+		return nil
 	case protocol.StreamControl:
 		if c.control != nil {
 			c.control.Close()

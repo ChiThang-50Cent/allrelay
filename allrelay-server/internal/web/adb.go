@@ -8,10 +8,12 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -19,6 +21,7 @@ import (
 const (
 	adbDashboardPort           = 5555
 	adbDashboardTimeoutSeconds = 15 * 60
+	adbHeartbeatInterval       = 30 * time.Second
 	phoneControlPort           = 5008
 )
 
@@ -52,10 +55,12 @@ func (ws *WebServer) handleADBConnect(w http.ResponseWriter, r *http.Request) {
 	}
 
 	status, err := ws.connectADB()
+	ws.setADBStatus(status)
 	if err != nil {
 		ws.writeADBResponse(w, status, err)
 		return
 	}
+	ws.startADBMonitor()
 	ws.writeADBResponse(w, status, nil)
 }
 
@@ -65,7 +70,9 @@ func (ws *WebServer) handleADBDisconnect(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	ws.stopADBMonitor()
 	status, err := ws.disconnectADB()
+	ws.setADBStatus(status)
 	if err != nil {
 		ws.writeADBResponse(w, status, err)
 		return
@@ -75,7 +82,116 @@ func (ws *WebServer) handleADBDisconnect(w http.ResponseWriter, r *http.Request)
 
 func (ws *WebServer) handleADBStatus(w http.ResponseWriter, r *http.Request) {
 	status := ws.queryADBStatus()
+	ws.setADBStatus(status)
+	if shouldHeartbeatADB(status) {
+		ws.startADBMonitor()
+	} else {
+		ws.stopADBMonitor()
+	}
 	ws.writeADBResponse(w, status, nil)
+}
+
+func (ws *WebServer) startADBMonitor() {
+	ws.mu.Lock()
+	if ws.adbMonitorCancel != nil {
+		ws.mu.Unlock()
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	ws.adbMonitorID++
+	monitorID := ws.adbMonitorID
+	ws.adbMonitorCancel = cancel
+	ws.mu.Unlock()
+
+	go func() {
+		ticker := time.NewTicker(adbHeartbeatInterval)
+		defer ticker.Stop()
+		for {
+			if !ws.refreshADBLease(ctx, monitorID) {
+				ws.finishADBMonitor(monitorID)
+				return
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+		}
+	}()
+}
+
+func (ws *WebServer) stopADBMonitor() {
+	ws.mu.Lock()
+	cancel := ws.adbMonitorCancel
+	ws.adbMonitorCancel = nil
+	ws.adbMonitorID++
+	ws.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+func (ws *WebServer) finishADBMonitor(monitorID uint64) {
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+	if ws.adbMonitorID == monitorID {
+		ws.adbMonitorCancel = nil
+	}
+}
+
+func (ws *WebServer) adbMonitorOwnsPhone(monitorID uint64, phoneIP string) bool {
+	ws.mu.RLock()
+	defer ws.mu.RUnlock()
+	return ws.adbMonitorID == monitorID &&
+		ws.adbMonitorCancel != nil &&
+		ws.currentConn != nil &&
+		ws.currentConn.Phone != nil &&
+		ws.currentConn.Phone.IP == phoneIP
+}
+
+func (ws *WebServer) setADBStatusForMonitor(monitorID uint64, phoneIP string, status ADBStatus) bool {
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+	if ws.adbMonitorID != monitorID ||
+		ws.adbMonitorCancel == nil ||
+		ws.currentConn == nil ||
+		ws.currentConn.Phone == nil ||
+		ws.currentConn.Phone.IP != phoneIP {
+		return false
+	}
+	ws.currentConn.ADB = status
+	return true
+}
+
+func shouldHeartbeatADB(status ADBStatus) bool {
+	return status.HostState == "device" && status.PhoneEnabled
+}
+
+func (ws *WebServer) refreshADBLease(ctx context.Context, monitorID uint64) bool {
+	status := ws.queryADBStatus()
+	if !ws.adbMonitorOwnsPhone(monitorID, status.IP) {
+		return false
+	}
+
+	if shouldHeartbeatADB(status) {
+		phoneStatus, err := ws.callPhoneADBContext(ctx, status.IP, http.MethodPost, "/adb/heartbeat", map[string]any{
+			"timeoutSeconds": adbDashboardTimeoutSeconds,
+		})
+		if ctx.Err() != nil || !ws.adbMonitorOwnsPhone(monitorID, status.IP) {
+			return false
+		}
+		if err == nil {
+			status = ws.buildADBStatus(status.IP, phoneStatus)
+			status.HostConnected = true
+			status.HostState = "device"
+			status.Message = defaultADBMessage(status)
+		}
+	}
+
+	if !ws.setADBStatusForMonitor(monitorID, status.IP, status) {
+		return false
+	}
+	return shouldHeartbeatADB(status)
 }
 
 func (ws *WebServer) connectADB() (ADBStatus, error) {
@@ -102,11 +218,14 @@ func (ws *WebServer) connectADB() (ADBStatus, error) {
 		}
 	}
 
-	out, cmdErr := ws.runADBCommand("connect", fmt.Sprintf("%s:%d", phone.IP, adbDashboardPort))
+	out, cmdErr := ws.runADBCommand("connect", net.JoinHostPort(phone.IP, strconv.Itoa(adbDashboardPort)))
 	slog.Info("ADB connect attempted", "ip", phone.IP, "port", adbDashboardPort, "output", strings.TrimSpace(out))
-	status := ws.buildADBStatus(phone.IP, phoneStatus)
+	status := ws.queryADBStatus()
 
-	if cmdErr != nil {
+	// adb may return a non-zero exit status while still listing the device as
+	// unauthorized. Inspect the authoritative device list before deciding
+	// whether to send the explicit authorization request.
+	if cmdErr != nil && status.HostState != "unauthorized" {
 		status.Message = strings.TrimSpace(out)
 		if status.Message == "" {
 			status.Message = cmdErr.Error()
@@ -114,17 +233,17 @@ func (ws *WebServer) connectADB() (ADBStatus, error) {
 		return status, errors.New(status.Message)
 	}
 
-	status = ws.queryADBStatus()
 	if status.HostState == "unauthorized" {
 		authStatus, authErr := ws.authorizeHostKey(phone.IP)
 		if authErr != nil {
 			status.Message = authStatus.Message
 			return status, authErr
 		}
-		_, _ = ws.runADBCommand("disconnect", fmt.Sprintf("%s:%d", phone.IP, adbDashboardPort))
-		out2, _ := ws.runADBCommand("connect", fmt.Sprintf("%s:%d", phone.IP, adbDashboardPort))
-		slog.Info("ADB connect retry after authorize", "ip", phone.IP, "port", adbDashboardPort, "output", strings.TrimSpace(out2))
-		status = ws.queryADBStatus()
+		_, _ = ws.runADBCommand("disconnect", net.JoinHostPort(phone.IP, strconv.Itoa(adbDashboardPort)))
+		status, authErr = ws.reconnectADBAfterAuthorize(phone.IP, 12*time.Second)
+		if authErr != nil {
+			return status, authErr
+		}
 	}
 
 	if status.HostState == "unauthorized" {
@@ -155,11 +274,39 @@ func (ws *WebServer) authorizeHostKey(phoneIP string) (ADBStatus, error) {
 		return ADBStatus{IP: phoneIP, Port: adbDashboardPort, Message: "Host adb key not found. Run 'adb keygen ~/.android/adbkey' first."}, err
 	}
 	key := strings.TrimSpace(string(keyBytes))
-	_, phoneErr := ws.callPhoneADB(phoneIP, http.MethodPost, "/adb/authorize", map[string]any{"key": key})
-	if phoneErr != nil {
-		return ADBStatus{IP: phoneIP, Port: adbDashboardPort, Message: "Phone failed to authorize host key"}, phoneErr
+	if key == "" || strings.ContainsAny(key, "\r\n") {
+		return ADBStatus{IP: phoneIP, Port: adbDashboardPort, Message: "Host adb key is malformed"}, errors.New("host adb key is malformed")
+	}
+	if _, err := ws.callPhoneADB(phoneIP, http.MethodPost, "/adb/authorize", map[string]any{"key": key}); err != nil {
+		return ADBStatus{IP: phoneIP, Port: adbDashboardPort, Message: "Phone failed to authorize host key"}, err
 	}
 	return ADBStatus{IP: phoneIP, Port: adbDashboardPort, Message: "Host key authorized on phone"}, nil
+}
+
+func (ws *WebServer) reconnectADBAfterAuthorize(phoneIP string, timeout time.Duration) (ADBStatus, error) {
+	target := net.JoinHostPort(phoneIP, strconv.Itoa(adbDashboardPort))
+	deadline := time.Now().Add(timeout)
+	var status ADBStatus
+	var lastOutput string
+	for {
+		out, _ := ws.runADBCommand("connect", target)
+		lastOutput = strings.TrimSpace(out)
+		slog.Info("ADB connect retry after authorize", "ip", phoneIP, "port", adbDashboardPort, "output", lastOutput)
+
+		status = ws.queryADBStatus()
+		if status.HostConnected {
+			return status, nil
+		}
+		if !time.Now().Before(deadline) {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	status.Message = "ADB did not reconnect after host authorization"
+	if lastOutput != "" {
+		status.Message += ": " + lastOutput
+	}
+	return status, errors.New(status.Message)
 }
 
 func (ws *WebServer) disconnectADB() (ADBStatus, error) {
@@ -171,7 +318,7 @@ func (ws *WebServer) disconnectADB() (ADBStatus, error) {
 		return ADBStatus{IP: phone.IP, Port: adbDashboardPort, Message: "adb not found on Ubuntu host"}, fmt.Errorf("adb not found on Ubuntu host")
 	}
 
-	out, cmdErr := ws.runADBCommand("disconnect", fmt.Sprintf("%s:%d", phone.IP, adbDashboardPort))
+	out, cmdErr := ws.runADBCommand("disconnect", net.JoinHostPort(phone.IP, strconv.Itoa(adbDashboardPort)))
 	slog.Info("ADB disconnect attempted", "ip", phone.IP, "port", adbDashboardPort, "output", strings.TrimSpace(out))
 
 	phoneStatus, phoneErr := ws.callPhoneADB(phone.IP, http.MethodPost, "/adb/disable", nil)
@@ -292,6 +439,10 @@ func (ws *WebServer) waitForPhoneADB(phoneIP string, timeout time.Duration) (pho
 }
 
 func (ws *WebServer) callPhoneADB(phoneIP, method, path string, payload map[string]any) (phoneADBStatus, error) {
+	return ws.callPhoneADBContext(context.Background(), phoneIP, method, path, payload)
+}
+
+func (ws *WebServer) callPhoneADBContext(parent context.Context, phoneIP, method, path string, payload map[string]any) (phoneADBStatus, error) {
 	var reqBody io.Reader
 	if payload != nil {
 		buf := &bytes.Buffer{}
@@ -301,10 +452,10 @@ func (ws *WebServer) callPhoneADB(phoneIP, method, path string, payload map[stri
 		reqBody = buf
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
 	defer cancel()
 
-	url := fmt.Sprintf("http://%s:%d%s", phoneIP, phoneControlPort, path)
+	url := "http://" + net.JoinHostPort(phoneIP, strconv.Itoa(phoneControlPort)) + path
 	req, err := http.NewRequestWithContext(ctx, method, url, reqBody)
 	if err != nil {
 		return phoneADBStatus{}, err
@@ -337,20 +488,23 @@ func (ws *WebServer) lookupADBDeviceState(ip string, port int) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	serial := fmt.Sprintf("%s:%d", ip, port)
-	for _, line := range strings.Split(out, "\n") {
+	return parseADBDeviceState(out, ip, port), nil
+}
+
+func parseADBDeviceState(output, ip string, port int) string {
+	serial := net.JoinHostPort(ip, strconv.Itoa(port))
+	for _, line := range strings.Split(output, "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "List of devices attached") {
 			continue
 		}
 		fields := strings.Fields(line)
 		if len(fields) >= 2 && fields[0] == serial {
-			return fields[1], nil
+			return fields[1]
 		}
 	}
-	return "disconnected", nil
+	return "disconnected"
 }
-
 func (ws *WebServer) runADBCommand(args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()

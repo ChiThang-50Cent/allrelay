@@ -4,6 +4,8 @@ import (
 	"net"
 	"testing"
 	"time"
+
+	"github.com/allrelay/allrelay-server/internal/protocol"
 )
 
 // TestConnectAndDummyByte verifies that connectPort reads the dummy byte correctly
@@ -141,5 +143,47 @@ func TestHasStream(t *testing.T) {
 
 	if conn == nil {
 		t.Fatal("Connection is nil")
+	}
+}
+
+func TestReconnectSpeaker(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Failed to listen: %v", err)
+	}
+	defer listener.Close()
+
+	port := listener.Addr().(*net.TCPAddr).Port
+	if port <= 3 {
+		t.Skip("ephemeral port too low for speaker offset")
+	}
+
+	oldSpeaker, oldPeer := net.Pipe()
+	defer oldPeer.Close()
+	conn := &Connection{speaker: oldSpeaker}
+
+	accepted := make(chan struct{})
+	go func() {
+		client, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		defer client.Close()
+		client.Write([]byte{dummyByte})
+		close(accepted)
+	}()
+
+	if err := conn.ReconnectStream("127.0.0.1", uint16(port-3), protocol.StreamSpeaker); err != nil {
+		t.Fatalf("ReconnectStream speaker failed: %v", err)
+	}
+	defer conn.CloseStream(protocol.StreamSpeaker)
+
+	if conn.speaker == oldSpeaker {
+		t.Fatal("speaker connection was not replaced")
+	}
+	select {
+	case <-accepted:
+	case <-time.After(time.Second):
+		t.Fatal("speaker reconnect did not reach listener")
 	}
 }

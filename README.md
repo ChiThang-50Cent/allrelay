@@ -1,6 +1,6 @@
 # AllRelay
 
-> Turn a rooted Android phone into wireless screen, camera, playback audio, and speaker for Ubuntu.
+> Turn a rooted Android phone into wireless screen, camera, mic, and speaker for Ubuntu.
 
 AllRelay streams media directly over Wi‑Fi between Android and Ubuntu. The Ubuntu App Grid launcher and tray are the primary controls; the local web dashboard is available for detailed settings.
 
@@ -8,7 +8,7 @@ AllRelay streams media directly over Wi‑Fi between Android and Ubuntu. The Ubu
 
 - **Screen + control**: Android screen in a dedicated browser popup with touch/keyboard control
 - **Camera**: Android camera exposed to Linux apps via `v4l2loopback`
-- **Phone audio**: Android playback audio exposed as a Linux audio input for Discord and other calling apps
+- **Microphone**: Android mic exposed as a Linux audio input
 - **Speaker**: PC audio played on the phone speaker
 - **Independent toggles**: each stream can be turned on/off without killing the others
 - **Tray controls**: scan, connect, and toggle streams directly from Ubuntu's system tray; discovery retries automatically and a direct IPv4 fallback is available
@@ -17,15 +17,12 @@ AllRelay streams media directly over Wi‑Fi between Android and Ubuntu. The Ubu
 ## Current architecture
 
 ### Android
-- Forked scrcpy server running as a root daemon
-- Can be launched by:
-  - **AllRelay Android app** (recommended — one-tap daemon control)
-  - **Magisk module** (auto-starts at boot; does NOT self-restart when killed)
-  - **ADB** (manual testing)
+- Forked scrcpy server, launched only by the **AllRelay Android app**
+- After reboot, open the app and tap **Start** to launch the daemon
 - Streams:
   - `:5000` screen
   - `:5001` camera
-  - `:5002` phone playback audio
+  - `:5002` mic
   - `:5003` speaker
   - `:5004` control
   - `:5009/udp` discovery responder
@@ -43,7 +40,7 @@ AllRelay streams media directly over Wi‑Fi between Android and Ubuntu. The Ubu
 
 ### Android
 - Android 12+
-- Rooted with Magisk
+- Root access for app-controlled daemon lifecycle and wireless ADB
 - ARM64
 
 ### Ubuntu
@@ -60,20 +57,17 @@ AllRelay streams media directly over Wi‑Fi between Android and Ubuntu. The Ubu
 ./scripts/build-deb.sh
 ```
 
-Outputs:
+Output:
 - `bin/allrelay_<version>_amd64.deb` — Ubuntu package
-- `bin/allrelay-magisk.zip` — flashable Android Magisk module
-- `bin/scrcpy-server-allrelay` — Android server artifact for Magisk or manual ADB use
 
 ### Android controller app build
 
-Build the Android server first, then build the controller APK:
-
 ```bash
-./scripts/build-magisk.sh
-(cd android && ./gradlew :app:assembleDebug)
-cp android/app/build/outputs/apk/debug/app-debug.apk bin/allrelay-app-debug.apk
+./scripts/build-apk.sh
 ```
+
+Output:
+- `bin/allrelay-app-debug.apk` — debug APK with the bundled Android server
 
 The debug APK is suitable for local testing. Create and sign a release APK before distributing it publicly.
 
@@ -95,47 +89,16 @@ For advanced settings, run `allrelay open`; it starts the backend if needed and 
 
 ### Android
 
-#### Option 1: AllRelay app (recommended)
+Install `bin/allrelay-app-debug.apk` for local testing (or a signed release APK when available), open it, and tap **Start** to launch the daemon with the selected streams.
+If an older AllRelay Magisk module is installed, remove it in **Magisk → Modules** and reboot before starting the APK daemon. This removes the former boot-time daemon; after reboot, open the APK and tap **Start**.
 
-Install `allrelay-app-debug.apk` for local testing (or a signed release APK when available), open it, and tap **Start** to launch the daemon.
-
-The app is the primary control surface — it can start, stop, and restart the daemon regardless of whether it was originally launched by Magisk or ADB.
-
-#### Option 2: Magisk module
-
-```bash
-adb push bin/allrelay-magisk.zip /sdcard/
-```
-
-Flash it from Magisk, then reboot.
-
-The module auto-starts the daemon once at boot. It does **not** self-restart when the daemon is killed — use the app to control it.
-
-#### Option 3: Manual ADB test
-
-```bash
-adb push bin/scrcpy-server-allrelay /data/local/tmp/allrelay.jar
-adb shell "su -c 'CLASSPATH=/data/local/tmp/allrelay.jar app_process / \
-  com.genymobile.scrcpy.Server 4.0 \
-  log_level=info \
-  wifi_mode=true \
-  wifi_port=5000 \
-  video=true \
-  screen_video_bit_rate=16000000 \
-  audio=true \
-  audio_source=output \
-  speaker_enabled=true \
-  camera_enabled=true \
-  daemon=true \
-  control=true \
-  >/data/local/tmp/allrelay-unified.log 2>&1 &'"
-```
+Root access is required only while the app starts or stops the `app_process` daemon, or when it changes wireless ADB settings. After reboot, open the app and tap **Start** again; the daemon does not auto-start.
 
 ## Use
 
 1. Open **AllRelay** from the Ubuntu App Grid (or run `allrelay tray`).
 2. From the tray, choose **Scan now**, then select a phone under **Devices**. Discovery retries automatically; use **Devices → Connect by IP…** (port `5000`) when needed.
-3. Toggle Camera, Phone audio, Speaker, or Screen from the tray. Select **AllRelay Phone Audio** as Discord's input device to send Android playback audio to participants.
+3. Toggle Camera, Microphone, Speaker, or Screen from the tray.
 4. Turning on **Screen** opens the remote viewer in the default browser.
 5. Use **Open detailed settings** in the tray or `allrelay open` for dashboard-only options.
 
@@ -146,7 +109,6 @@ allrelay/
 ├── allrelay-server/   # Go backend + web UI
 ├── android/           # Android controller app
 ├── scrcpy/            # Forked scrcpy server/client sources
-├── magisk/            # Magisk module
 ├── scripts/           # Build helpers / dev utilities
 └── docs/              # Project notes and protocol docs
 ```

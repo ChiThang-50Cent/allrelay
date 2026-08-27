@@ -1,8 +1,8 @@
 # AllRelay Wi-Fi Protocol
 
 > Protocol version: 1  
-> Date: 2026-06-11  
-> Scope: current Wi‑Fi transport (multi-stream over raw TCP with 16-byte header, browser screen viewer, camera/mic/speaker streams)
+> Date: 2026-08-23
+> Scope: current Wi‑Fi transport (multi-stream over raw TCP with 16-byte header, browser screen viewer, camera, mic, and speaker streams)
 
 ---
 
@@ -20,7 +20,7 @@ audio, and control.
 | Camera  | +1         | 5001           | 0x00000002 (CAMERA) | Android → PC  |
 | Mic     | +2         | 5002           | 0x00000003 (MIC)    | Android → PC  |
 | Speaker | +3         | 5003           | 0x00000004 (SPEAKER)| PC → Android  |
-| Control | +4         | 5004           | —          | Bidirectional |
+| Control | +4         | 5004           | —                    | Bidirectional |
 
 ---
 

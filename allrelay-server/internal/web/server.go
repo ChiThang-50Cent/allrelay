@@ -1,6 +1,7 @@
 package web
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -64,14 +65,16 @@ type ConnectionStatus struct {
 
 // WebServer manages the web UI and API
 type WebServer struct {
-	config      ServerConfig
-	phones      map[string]*PhoneDevice
-	currentConn *ConnectionStatus
-	hub         *Hub
-	controller  *ServerController
-	scanner     *discovery.Scanner
-	mu          sync.RWMutex
-	httpServer  *http.Server
+	config           ServerConfig
+	phones           map[string]*PhoneDevice
+	currentConn      *ConnectionStatus
+	hub              *Hub
+	controller       *ServerController
+	scanner          *discovery.Scanner
+	mu               sync.RWMutex
+	httpServer       *http.Server
+	adbMonitorCancel context.CancelFunc
+	adbMonitorID     uint64
 }
 
 // NewWebServer creates a new web server instance
@@ -98,6 +101,16 @@ func NewWebServer(config ServerConfig) *WebServer {
 	ws.controller = NewServerController(ws)
 
 	return ws
+}
+
+func (ws *WebServer) setADBStatus(status ADBStatus) {
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+	ws.currentConn.ADB = status
+}
+
+func (ws *WebServer) resetADBStatus() {
+	ws.setADBStatus(ADBStatus{})
 }
 
 // Start begins serving the web UI
@@ -308,12 +321,18 @@ func (ws *WebServer) handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	ws.stopADBMonitor()
 	// Use controller to actually connect
 	if ws.controller != nil {
 		if err := ws.controller.Connect(req.IP, req.Port); err != nil {
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
 		}
+	}
+	status := ws.queryADBStatus()
+	ws.setADBStatus(status)
+	if shouldHeartbeatADB(status) {
+		ws.startADBMonitor()
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -322,12 +341,14 @@ func (ws *WebServer) handleConnect(w http.ResponseWriter, r *http.Request) {
 
 // handleDisconnect disconnects from current phone
 func (ws *WebServer) handleDisconnect(w http.ResponseWriter, r *http.Request) {
+	ws.stopADBMonitor()
 	// Use controller to actually disconnect
 	if ws.controller != nil {
 		if err := ws.controller.Disconnect(); err != nil {
 			slog.Error("Disconnect error", "error", err)
 		}
 	}
+	ws.resetADBStatus()
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "disconnected"})
@@ -340,12 +361,10 @@ func (ws *WebServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 		ws.controller.SyncStreamStatus(ws.currentConn.Streams)
 	}
 
-	adbStatus := ws.queryADBStatus()
-
 	ws.mu.RLock()
 	status := ConnectionStatus{
 		Connected: ws.currentConn.Connected,
-		ADB:       adbStatus,
+		ADB:       ws.currentConn.ADB,
 	}
 	if ws.currentConn.Phone != nil {
 		phone := *ws.currentConn.Phone

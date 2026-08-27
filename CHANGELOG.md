@@ -1,5 +1,26 @@
 # Changelog
 
+## 2026-08-28
+
+### Added
+- `scripts/build-apk.sh` builds the Android server, bundles it into the debug APK, and emits `bin/allrelay-app-debug.apk`.
+
+### Changed
+- Android daemon lifecycle is APK-only: the app is the sole server source and Start/Restart control surface. After reboot, open the app and tap **Start**.
+- Removed the Magisk module/runtime, boot daemon, packaging flow, and raw-server fallback paths.
+- Desktop Debian packaging now builds desktop components only.
+- Wireless ADB now renews its lease only while the desktop sees the device connected; cached phone status avoids periodic root polling.
+
+### Fixed
+- Phone speaker playback now configures Android Opus `MediaCodec` with `OpusHead` as `csd-0` and native-order delay/preroll CSD buffers; decoded PCM reaches the Android output mixer.
+- Speaker stale-packet timing now starts with the first audio packet, preventing cold decoder startup from dropping an entire stream.
+- APK-generated daemon scripts now emit valid shell command substitution when clearing stale stream ports.
+- ADB key authorization now validates, deduplicates, and atomically replaces `adb_keys`; legacy active leases survive app upgrade.
+- Phone UI ADB actions and the dashboard lease monitor now synchronize state across reconnects without stale monitor updates.
+
+### Packaging
+- Verified APK-only build, Android unit tests, installed APK daemon lifecycle, active listeners, and the absence of the legacy Magisk module.
+
 ## 2026-07-20
 
 ### Added

@@ -2,7 +2,7 @@ plugins {
     id("com.android.application")
 }
 
-val bundledServerSource = rootProject.layout.projectDirectory.file("../bin/scrcpy-server-allrelay")
+val bundledServerSource = rootProject.layout.projectDirectory.file("../scrcpy/server/build/outputs/apk/release/server-release-unsigned.apk")
 val bundledServerAssetDir = layout.buildDirectory.dir("generated/allrelay-assets")
 
 val prepareBundledServer by tasks.registering(Copy::class) {
@@ -11,7 +11,7 @@ val prepareBundledServer by tasks.registering(Copy::class) {
     rename { "allrelay.jar" }
     doFirst {
         if (!bundledServerSource.asFile.exists()) {
-            throw GradleException("Missing ../bin/scrcpy-server-allrelay. Build scrcpy server first.")
+            throw GradleException("Missing Android server artifact. Run ./scripts/build-apk.sh.")
         }
     }
 }
@@ -55,4 +55,6 @@ dependencies {
     implementation("androidx.core:core-ktx:1.12.0")
     implementation("androidx.appcompat:appcompat:1.6.1")
     implementation("com.google.android.material:material:1.11.0")
+
+    testImplementation("junit:junit:4.13.2")
 }

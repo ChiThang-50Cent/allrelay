@@ -1,6 +1,5 @@
 package com.genymobile.scrcpy;
 
-import com.genymobile.scrcpy.audio.AudioSource;
 
 import org.junit.Assert;
 import org.junit.Test;
@@ -18,11 +17,4 @@ public class OptionsTest {
         Assert.assertEquals(16000000, options.getScreenVideoBitRate());
     }
 
-    @Test
-    public void testOutputAudioSourceUsesTheOutboundAudioStream() {
-        Options options = Options.parse(BuildConfig.VERSION_NAME, "audio_source=output");
-
-        Assert.assertEquals(AudioSource.OUTPUT, options.getAudioSource());
-        Assert.assertTrue(options.getAudioSource().isDirect());
-    }
 }

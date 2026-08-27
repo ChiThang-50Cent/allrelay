@@ -38,7 +38,7 @@ const state = {
     streams: [
         { name: 'screen', port: 5000, active: false, icon: '📺', fps: 0, bitrate: 0, latency: 0, bytes: 0, frames: 0 },
         { name: 'camera', port: 5001, active: false, icon: '📷', fps: 0, bitrate: 0, latency: 0, bytes: 0, frames: 0 },
-        { name: 'mic', label: 'Phone audio', port: 5002, active: false, icon: '🔊', fps: 0, bitrate: 0, latency: 0, bytes: 0, frames: 0 },
+        { name: 'mic', port: 5002, active: false, icon: '🎤', fps: 0, bitrate: 0, latency: 0, bytes: 0, frames: 0 },
         { name: 'speaker', port: 5003, active: false, icon: '🔊', fps: 0, bitrate: 0, latency: 0, bytes: 0, frames: 0 }
     ],
     ws: null,
@@ -155,7 +155,7 @@ function init() {
     renderPhoneList();
 
     // Load initial status
-    loadStatus();
+    loadStatus().then(loadADBStatus);
 
     // Connect WebSocket
     connectWebSocket();
@@ -388,6 +388,17 @@ async function loadStatus() {
     }
 }
 
+async function loadADBStatus() {
+    if (!state.connected) return;
+    try {
+        const status = await apiCall(API.adbStatus);
+        state.adb = { ...state.adb, ...status };
+        updateADBUI();
+    } catch (error) {
+        console.error('Failed to load ADB status:', error);
+    }
+}
+
 async function handleConnect() {
     const ip = elements.phoneIP.value.trim();
     
@@ -411,6 +422,7 @@ async function handleConnect() {
         state.connected = true;
         state.currentPhone = { ip, name: `Phone (${ip})` };
         updateConnectionUI();
+        void loadADBStatus();
         showSuccess(`Connected to ${ip}`);
     } catch (error) {
         showError('Failed to connect. Is the phone running AllRelay server?');
@@ -677,7 +689,7 @@ function renderStreams() {
                     <span class="toggle-slider"></span>
                 </label>
             </div>
-            <div class="stream-name">${stream.label || stream.name.charAt(0).toUpperCase() + stream.name.slice(1)}</div>
+            <div class="stream-name">${stream.name.charAt(0).toUpperCase() + stream.name.slice(1)}</div>
             <div class="stream-port">${stream.name === 'screen' ? 'Opens popup remote window' : `Port ${stream.port}`}</div>
             ${stream.active ? renderStreamMetrics(stream) : ''}
         </div>

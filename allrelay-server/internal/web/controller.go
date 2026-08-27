@@ -272,12 +272,21 @@ func (sc *ServerController) startSpeakerStream() {
 
 // startSpeakerStreamLocked starts the speaker stream (must hold lock)
 func (sc *ServerController) startSpeakerStreamLocked() {
-	if sc.conn == nil || !sc.conn.HasStream(protocol.StreamSpeaker) {
+	stream := sc.streams["speaker"]
+	conn := sc.conn
+	if conn == nil {
 		slog.Warn("Speaker stream not available (no connection)")
+		stream.Active = false
 		return
 	}
-
-	stream := sc.streams["speaker"]
+	if !conn.HasStream(protocol.StreamSpeaker) {
+		slog.Info("Speaker: reconnecting TCP")
+		if err := conn.ReconnectStream(sc.host, uint16(sc.port), protocol.StreamSpeaker); err != nil {
+			slog.Error("Speaker: reconnect failed", "error", err)
+			stream.Active = false
+			return
+		}
+	}
 
 	// Cancel old goroutine (caller already waited for it via done channel)
 	// Cancel and done are set to new values below
@@ -305,7 +314,7 @@ func (sc *ServerController) startSpeakerStreamLocked() {
 	stream.done = make(chan struct{})
 	go func() {
 		defer close(stream.done)
-		writer := sc.conn.SpeakerWriter()
+		writer := conn.SpeakerWriter()
 		if err := runSpeakerCapture(ctx, writer, onMetrics); err != nil {
 			if err == context.Canceled {
 				slog.Info("Speaker: stopped by toggle")
@@ -313,6 +322,9 @@ func (sc *ServerController) startSpeakerStreamLocked() {
 				slog.Error("Speaker capture error", "error", err)
 			}
 		}
+		// A failed or stopped speaker stream must not leave a dead TCP
+		// connection marked available for the next toggle.
+		conn.CloseStream(protocol.StreamSpeaker)
 		sc.mu.Lock()
 		if stream.Running && stream.gen == gen {
 			stream.Running = false

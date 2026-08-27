@@ -39,37 +39,38 @@ class ToggleActivity : Activity() {
     private lateinit var adbDisableButton: Button
     private lateinit var adbRefreshButton: Button
 
-    private val refreshRunnable = object : Runnable {
+    private val rootFreeStatusRefresh = object : Runnable {
         override fun run() {
-            refreshStatus(showBusy = false)
-            refreshAdbStatus(showBusy = false)
-            mainHandler.postDelayed(this, 2500)
+            updateIp()
+            refreshStatusWithoutRoot()
+            mainHandler.postDelayed(this, 2_500)
         }
     }
+
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         AllRelayService.ensureRunning(this)
         setContentView(createLayout())
         updateIp()
-        rootText.text = "Root: checking..."
-        refreshStatus(showBusy = false)
-        refreshAdbStatus(showBusy = false)
+        rootText.text = "Root: Tap Refresh to check"
     }
 
     override fun onResume() {
         super.onResume()
-        mainHandler.post(refreshRunnable)
+        mainHandler.post(rootFreeStatusRefresh)
     }
 
     override fun onPause() {
+        mainHandler.removeCallbacks(rootFreeStatusRefresh)
         super.onPause()
-        mainHandler.removeCallbacks(refreshRunnable)
     }
+
 
     override fun onDestroy() {
         super.onDestroy()
         executor.shutdownNow()
+        mainHandler.removeCallbacks(rootFreeStatusRefresh)
     }
 
     private fun createLayout(): ScrollView {
@@ -108,7 +109,7 @@ class ToggleActivity : Activity() {
         layout.addView(sectionTitle("Streams"))
         screenSwitch = createStreamToggle("Screen + control daemons (:5000, :5004)", true)
         cameraSwitch = createStreamToggle("Camera daemon (:5001)", true)
-        micSwitch = createStreamToggle("Phone playback audio daemon (:5002)", true)
+        micSwitch = createStreamToggle("Mic daemon (:5002)", true)
         speakerSwitch = createStreamToggle("Speaker daemon (:5003)", true)
         layout.addView(screenSwitch)
         layout.addView(cameraSwitch)
@@ -148,7 +149,7 @@ class ToggleActivity : Activity() {
         layout.addView(logText)
 
         layout.addView(sectionTitle("Wireless ADB"))
-        adbStatusText = infoLine(layout, "ADB", "Checking...")
+        adbStatusText = infoLine(layout, "ADB", "Tap Refresh to check")
         val adbRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_HORIZONTAL
@@ -251,11 +252,25 @@ class ToggleActivity : Activity() {
         }
         executor.execute {
             val rooted = RootDaemonManager.hasRoot()
-            val status = RootDaemonManager.status(currentConfig())
+            val status = RootDaemonManager.status(currentConfig(), rooted)
             mainHandler.post {
                 if (isTransitioning) return@post
                 rootText.text = "Root: ${if (rooted) "OK" else "Unavailable"}"
                 renderStatus(status)
+            }
+        }
+    }
+
+    private fun refreshStatusWithoutRoot() {
+        if (isTransitioning) {
+            return
+        }
+        executor.execute {
+            val status = RootDaemonManager.statusWithoutRoot()
+            mainHandler.post {
+                if (!isTransitioning) {
+                    renderRootFreeStatus(status)
+                }
             }
         }
     }
@@ -293,6 +308,17 @@ class ToggleActivity : Activity() {
         stopButton.isEnabled = status.running
     }
 
+    private fun renderRootFreeStatus(status: RootDaemonManager.Status) {
+        val state = if (status.running) "REACHABLE" else "UNKNOWN"
+        statusText.text = "Status: $state — ${status.message}"
+        portsText.text = if (status.running) {
+            "Ports: unavailable without root; Tap Refresh"
+        } else {
+            "Ports: unknown; Tap Refresh"
+        }
+        stopButton.isEnabled = status.running
+    }
+
     private fun setButtonsEnabled(enabled: Boolean) {
         startButton.isEnabled = enabled
         restartButton.isEnabled = enabled
@@ -309,6 +335,7 @@ class ToggleActivity : Activity() {
         adbStatusText.text = "ADB: Enabling..."
         executor.execute {
             val status = RootDaemonManager.enableWirelessAdb()
+            AllRelayService.syncAdbStatus(this, status)
             mainHandler.post {
                 renderAdbStatus(status)
                 adbEnableButton.isEnabled = true
@@ -323,6 +350,7 @@ class ToggleActivity : Activity() {
         adbStatusText.text = "ADB: Disabling..."
         executor.execute {
             val status = RootDaemonManager.disableWirelessAdb()
+            AllRelayService.syncAdbStatus(this, status)
             mainHandler.post {
                 renderAdbStatus(status)
                 adbEnableButton.isEnabled = true
@@ -335,6 +363,7 @@ class ToggleActivity : Activity() {
         if (showBusy) adbStatusText.text = "ADB: Checking..."
         executor.execute {
             val status = RootDaemonManager.wirelessAdbStatus()
+            AllRelayService.syncAdbStatus(this, status)
             mainHandler.post {
                 renderAdbStatus(status)
             }

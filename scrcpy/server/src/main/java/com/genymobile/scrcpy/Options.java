@@ -31,7 +31,7 @@ public class Options {
     private VideoCodec videoCodec = VideoCodec.H264;
     private AudioCodec audioCodec = AudioCodec.OPUS;
     private VideoSource videoSource = VideoSource.DISPLAY;
-    private AudioSource audioSource = AudioSource.OUTPUT;
+    private AudioSource audioSource = AudioSource.MIC;
     private boolean audioDup;
     private int videoBitRate = 8000000;
     private int screenVideoBitRate = 8000000;
@@ -347,6 +347,7 @@ public class Options {
     public boolean isCameraEnabled() {
         return cameraEnabled;
     }
+
 
     public boolean isDaemon() {
         return daemon;

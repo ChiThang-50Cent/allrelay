@@ -2,68 +2,36 @@
 
 ## Build artifacts
 
+### Ubuntu package
+
 ```bash
 ./scripts/build-deb.sh
 ```
 
-Outputs:
+Output:
 - `bin/allrelay_0.2.0_amd64.deb`
-- `bin/scrcpy-server-allrelay`
-- `bin/allrelay-magisk.zip`
+
+### Android APK
+
+```bash
+./scripts/build-apk.sh
+```
+
+Output:
+- `bin/allrelay-app-debug.apk`
 
 ---
 
 ## Android (Phone)
 
-### Option 1: AllRelay app (recommended)
-
-Install the APK, open it, and tap **Start**. The app launches the daemon with your chosen stream toggles.
+Install `bin/allrelay-app-debug.apk`, open it, and tap **Start**. The app launches the daemon with the selected stream toggles.
+If an older AllRelay Magisk module is installed, remove it in **Magisk → Modules** and reboot before using the APK. This removes the former boot-time daemon; after reboot, open the APK and tap **Start**.
 
 - **Start** — launches the daemon if not running
-- **Stop** — kills the daemon (works even if it was started by Magisk or ADB)
+- **Stop** — kills the daemon
 - **Restart** — stop then start
 
-The app is the master control. If you use both the app and Magisk, the app takes precedence.
-
-### Option 2: Magisk module
-
-```bash
-adb push bin/allrelay-magisk.zip /sdcard/
-```
-
-Then open **Magisk → Modules → Install from storage**, choose `allrelay-magisk.zip`, and reboot.
-
-The module auto-starts the daemon **once** at boot. It does **not** self-restart when killed — use the app to restart it.
-
-> **Tip:** Even if you use Magisk, install the AllRelay app so you can stop/start the daemon manually.
-
-### Option 3: Manual ADB run for testing
-
-```bash
-adb push bin/scrcpy-server-allrelay /data/local/tmp/allrelay.jar
-
-adb shell "su -c 'CLASSPATH=/data/local/tmp/allrelay.jar app_process / \
-  com.genymobile.scrcpy.Server 4.0 \
-  log_level=info \
-  wifi_mode=true \
-  wifi_port=5000 \
-  video=true \
-  screen_video_bit_rate=16000000 \
-  audio=true \
-  audio_source=output \
-  speaker_enabled=true \
-  camera_enabled=true \
-  daemon=true \
-  control=true \
-  >/data/local/tmp/allrelay-unified.log 2>&1 &'"
-```
-
-Useful checks:
-
-```bash
-adb shell "su -c 'ss -tlnp | grep -E \"5000|5001|5002|5003|5004|5009\"'"
-adb shell "su -c 'head -40 /data/local/tmp/allrelay-unified.log'"
-```
+Root access is required only while the app starts or stops the `app_process` daemon, or when it changes wireless ADB settings. After reboot, open the app and tap **Start** again; the daemon does not auto-start.
 
 ---
 
@@ -97,7 +65,7 @@ http://localhost:9090
 4. Toggle streams independently:
    - **Screen** → opens the remote popup
    - **Camera** → exposes the phone camera on Linux via `v4l2loopback`
-   - **Phone audio** → exposes Android playback audio as the **AllRelay Phone Audio** input device for Discord and other calling apps
+   - **Mic** → exposes the phone mic as a Linux audio input
    - **Speaker** → plays PC audio on the phone
 
 ### Camera tips for Meet / Zoom / Chrome
@@ -113,6 +81,4 @@ http://localhost:9090
 | File | Purpose |
 |------|---------|
 | `bin/allrelay_0.2.0_amd64.deb` | Ubuntu package |
-| `bin/allrelay-magisk.zip` | Magisk module |
-| `bin/allrelay-server` | Built Go server binary |
-| `bin/scrcpy-server-allrelay` | Android server artifact used by ADB/app/Magisk |
+| `bin/allrelay-app-debug.apk` | Android APK with bundled server |
