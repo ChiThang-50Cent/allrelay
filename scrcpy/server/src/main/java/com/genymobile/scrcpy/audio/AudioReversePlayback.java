@@ -14,7 +14,6 @@ import android.media.MediaFormat;
 import android.os.Build;
 import android.os.Process;
 
-import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.ByteBuffer;
@@ -37,6 +36,9 @@ public final class AudioReversePlayback implements AsyncProcessor {
 
     private static final int HEADER_SIZE = 16;
     private static final long PACKET_FLAG_CONFIG = 1L << 62;
+    private static final long MAX_PLAYBACK_LAG_US = 100_000L;
+    private static final byte[] OPUS_HEAD_MAGIC = {'O', 'p', 'u', 's', 'H', 'e', 'a', 'd'};
+
 
     // Shared decoder — created once, flushed on reconnect.
     private static MediaCodec sharedDecoder;
@@ -56,6 +58,31 @@ public final class AudioReversePlayback implements AsyncProcessor {
 
     public static boolean isPlaybackActive() {
         return playbackActive.get();
+    }
+
+    // Keep transport/codec backlogs from becoming audible latency.
+    static boolean isStalePlaybackPacket(long packetPtsUs, long firstPacketPtsUs, long elapsedUs) {
+
+        return elapsedUs - (packetPtsUs - firstPacketPtsUs) > MAX_PLAYBACK_LAG_US;
+    }
+
+    static boolean isValidOpusHead(byte[] data) {
+        if (data == null || data.length < 19 || data[8] != 1 || data[9] == 0) {
+            return false;
+        }
+        for (int i = 0; i < OPUS_HEAD_MAGIC.length; ++i) {
+            if (data[i] != OPUS_HEAD_MAGIC[i]) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static ByteBuffer createNativeOrderLongCsd(long value) {
+        ByteBuffer csd = ByteBuffer.allocate(8).order(ByteOrder.nativeOrder());
+        csd.putLong(value);
+        csd.flip();
+        return csd;
     }
 
     /**
@@ -127,9 +154,8 @@ public final class AudioReversePlayback implements AsyncProcessor {
         try {
             byte[] headerBuf = new byte[HEADER_SIZE];
 
-            // Read OpusHead and OpusTags from the stream
-            ByteArrayOutputStream csdBuffer = new ByteArrayOutputStream();
-
+            // Read OpusHead and OpusTags from the stream.
+            byte[] opusHead = null;
             for (int i = 0; i < 2; i++) {
                 int read = readFully(inputStream, headerBuf, 0, HEADER_SIZE);
                 if (read < HEADER_SIZE) {
@@ -144,14 +170,25 @@ public final class AudioReversePlayback implements AsyncProcessor {
                 }
 
                 int size = ByteBuffer.wrap(headerBuf, 12, 4).order(ByteOrder.BIG_ENDIAN).getInt();
-                if (size > 0) {
-                    byte[] data = new byte[size];
-                    readFully(inputStream, data, 0, size);
-                    csdBuffer.write(data, 0, size);
+                if (size <= 0 || size > 65536) {
+                    Ln.e("Speaker: invalid config packet size: " + size);
+                    return;
+                }
+                byte[] data = new byte[size];
+                if (readFully(inputStream, data, 0, size) < size) {
+                    Ln.w("Speaker: connection closed in config packet " + i);
+                    return;
+                }
+                if (i == 0) {
+                    if (!isValidOpusHead(data)) {
+                        Ln.e("Speaker: invalid OpusHead");
+                        return;
+                    }
+                    opusHead = data;
                 }
             }
 
-            Ln.i("Speaker stream connected, csd=" + csdBuffer.size() + " bytes");
+            Ln.i("Speaker stream connected, OpusHead=" + opusHead.length + " bytes");
 
             // Create a fresh decoder per speaker session (avoids stale state from old goroutines)
             MediaCodec decoder = getFreshDecoder();
@@ -160,36 +197,16 @@ public final class AudioReversePlayback implements AsyncProcessor {
                 return;
             }
 
-            // Feed CSD-0 for this stream
-            byte[] csdBytes = csdBuffer.toByteArray();
+            // Android's Opus decoder consumes all codec-specific data at start.
             MediaFormat format = MediaFormat.createAudioFormat(
                     AudioCodec.OPUS.getMimeType(), SAMPLE_RATE, CHANNELS);
-            ByteBuffer csd0 = ByteBuffer.allocateDirect(csdBytes.length);
-            csd0.put(csdBytes);
-            csd0.flip();
-            format.setByteBuffer("csd-0", csd0);
+            format.setByteBuffer("csd-0", ByteBuffer.wrap(opusHead));
+            format.setByteBuffer("csd-1", createNativeOrderLongCsd(6_500_000L));
+            format.setByteBuffer("csd-2", createNativeOrderLongCsd(80_000_000L));
 
             decoder.configure(format, null, null, 0);
             decoder.start();
             sharedDecoderStarted = true;
-
-            // Feed init buffers (codec delay + seek pre-roll)
-            long codecDelayNs = 6500000L;
-            long seekPreRollNs = 80000000L;
-            for (int i = 0; i < 2; i++) {
-                int inputBufferId = decoder.dequeueInputBuffer(50000);
-                if (inputBufferId >= 0) {
-                    ByteBuffer inputBuffer = decoder.getInputBuffer(inputBufferId);
-                    if (inputBuffer != null) {
-                        inputBuffer.clear();
-                        long value = (i == 0) ? codecDelayNs : seekPreRollNs;
-                        inputBuffer.order(ByteOrder.LITTLE_ENDIAN);
-                        inputBuffer.putLong(value);
-                        inputBuffer.flip();
-                        decoder.queueInputBuffer(inputBufferId, 0, 8, 0, 0);
-                    }
-                }
-            }
 
             // Wait for decoder output — much faster on reconnect (decoder is warm)
             MediaCodec.BufferInfo bufferInfo = new MediaCodec.BufferInfo();
@@ -218,6 +235,9 @@ public final class AudioReversePlayback implements AsyncProcessor {
             long outputGot = 0;
             long bytesWritten = 0;
             long lastLogTime = System.currentTimeMillis();
+            long firstPacketPtsUs = -1;
+            long playbackStartedNs = 0;
+            long stalePackets = 0;
 
             while (!stopped && !Thread.currentThread().isInterrupted()) {
                 int headerBytes = readFully(inputStream, headerBuf, 0, HEADER_SIZE);
@@ -252,6 +272,17 @@ public final class AudioReversePlayback implements AsyncProcessor {
                 }
 
                 packetCount++;
+                long pts = ptsFlags & 0x1FFFFFFFFFFFFFL;
+                if (firstPacketPtsUs < 0) {
+                    firstPacketPtsUs = pts;
+                    playbackStartedNs = System.nanoTime();
+                }
+                long elapsedUs = (System.nanoTime() - playbackStartedNs) / 1_000L;
+                if (isStalePlaybackPacket(pts, firstPacketPtsUs, elapsedUs)) {
+                    stalePackets++;
+                    continue;
+                }
+
 
                 int inputBufferId = decoder.dequeueInputBuffer(10000);
                 if (inputBufferId < 0) continue;
@@ -262,7 +293,6 @@ public final class AudioReversePlayback implements AsyncProcessor {
                     inputBuffer.put(readBuffer);
                     readBuffer.flip();
                     inputBuffer.flip();
-                    long pts = ptsFlags & 0x1FFFFFFFFFFFFFL;
                     decoder.queueInputBuffer(inputBufferId, 0, payloadSize, pts, 0);
                     inputFed++;
                 }
@@ -288,7 +318,7 @@ public final class AudioReversePlayback implements AsyncProcessor {
 
                 long now = System.currentTimeMillis();
                 if (now - lastLogTime >= 5000) {
-                    Ln.d("Speaker: pkts=" + packetCount + " fed=" + inputFed
+                    Ln.d("Speaker: pkts=" + packetCount + " stale=" + stalePackets + " fed=" + inputFed
                             + " out=" + outputGot + " outBytes=" + bytesWritten);
                     lastLogTime = now;
                 }
