@@ -44,8 +44,6 @@ const state = {
     ws: null,
     wsReconnectTimer: null,
     screenInitRequested: false,
-    remotePowerOffAutoTried: false,
-    remotePowerOffSent: false,
     remoteModeLogEmitted: false,
     remotePopup: null,
     remotePopupCloseHandled: false,
@@ -130,8 +128,8 @@ function init() {
         elements.remoteWakeBtn.addEventListener('click', wakeRemotePhoneScreen);
     }
     if (pageMode === 'remote') {
-        window.addEventListener('beforeunload', restoreRemotePhoneScreen);
-        window.addEventListener('pagehide', restoreRemotePhoneScreen);
+        window.addEventListener('beforeunload', stopRemoteScreenOnUnload);
+        window.addEventListener('pagehide', stopRemoteScreenOnUnload);
         window.addEventListener('blur', resetKeyboardState);
         document.addEventListener('paste', handleRemotePaste);
         setInterval(syncLocalClipboardLoop, 1000);
@@ -639,13 +637,9 @@ async function handleToggleStream(streamName, active) {
 
         if (streamName === 'screen') {
             if (!active) {
-                sendDisplayPowerRequest(true);
                 closeRemotePopup();
-            } else {
-                sendDisplayPowerRequest(false);
-                if (pageMode === 'dashboard') {
-                    focusRemotePopup();
-                }
+            } else if (pageMode === 'dashboard') {
+                focusRemotePopup();
             }
         }
         
@@ -805,7 +799,7 @@ function updateConnectionStatus(status) {
 
     if (connectionChanged) {
         if (!state.connected) {
-            resetRemotePowerState();
+            state.remoteModeLogEmitted = false;
             resetClipboardState();
             closeRemotePopup();
             resetADBState();
@@ -953,9 +947,7 @@ function updateRemoteUI() {
         if (!state.connected) {
             elements.remotePowerStatus.textContent = 'Connect from dashboard first';
         } else if (screen?.active) {
-            elements.remotePowerStatus.textContent = state.remotePowerOffSent || state.remotePowerOffAutoTried
-                ? 'Remote mode active · phone display off requested'
-                : 'Remote mode ready';
+            elements.remotePowerStatus.textContent = 'Remote mode active · phone display managed by host';
         } else {
             elements.remotePowerStatus.textContent = 'Start the screen stream to control';
         }
@@ -988,14 +980,11 @@ function maybeApplyRemoteMode() {
     if (pageMode !== 'remote') return;
     const screen = getStream('screen');
     if (!state.connected || !screen?.active) {
-        resetRemotePowerState();
+        state.remoteModeLogEmitted = false;
         return;
     }
     if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
         return;
-    }
-    if (!state.remotePowerOffAutoTried) {
-        sendDisplayPowerRequest(false);
     }
     maybeEnableLocalClipboardSync();
     if (!state.remoteModeLogEmitted) {
@@ -1009,15 +998,14 @@ function maybeApplyRemoteMode() {
 
 function wakeRemotePhoneScreen() {
     if (pageMode !== 'remote') return;
-    sendDisplayPowerRequest(true);
+    if (sendControlPacket(buildSetDisplayPowerControlMessage(true), { force: true }) && elements.remotePowerStatus) {
+        elements.remotePowerStatus.textContent = 'Requested phone display on';
+    }
 }
 
-function restoreRemotePhoneScreen() {
+function stopRemoteScreenOnUnload() {
     if (pageMode !== 'remote') return;
     const screen = getStream('screen');
-    if (state.ws && state.ws.readyState === WebSocket.OPEN && (state.remotePowerOffAutoTried || state.remotePowerOffSent)) {
-        sendDisplayPowerRequest(true);
-    }
     if (screen?.active) {
         fetch(API.toggleStream, {
             method: 'POST',
@@ -1139,7 +1127,7 @@ async function syncLocalClipboardLoop() {
         if (text === state.lastSentClipboardText) {
             return;
         }
-        const sent = sendControlPacket(buildSetClipboardControlMessage(text, false), { force: true, markPowerOff: false });
+        const sent = sendControlPacket(buildSetClipboardControlMessage(text, false), { force: true });
         if (sent) {
             state.lastSentClipboardText = text;
         }
@@ -1155,7 +1143,7 @@ function handleRemotePaste(e) {
     e.preventDefault();
     state.lastLocalClipboardText = text;
     state.lastSentClipboardText = text;
-    sendControlPacket(buildSetClipboardControlMessage(text, true), { force: true, markPowerOff: false });
+    sendControlPacket(buildSetClipboardControlMessage(text, true), { force: true });
 }
 
 function connectToPhone(ip) {
@@ -1212,7 +1200,7 @@ function initScreenViewer() {
             pressure: action === ANDROID_MOTION_ACTION_UP ? 0 : 1,
             actionButton: ANDROID_BUTTON_PRIMARY,
             buttons: action === ANDROID_MOTION_ACTION_UP ? 0 : ANDROID_BUTTON_PRIMARY,
-        }), { markPowerOff: true });
+        }));
     };
 
     screenCanvasEl.addEventListener('mousedown', (e) => {
@@ -1248,7 +1236,7 @@ function initScreenViewer() {
             if (e.code) {
                 textInjectedKeysDown.add(e.code);
             }
-            sendControlPacket(buildTextControlMessage(e.key), { markPowerOff: true });
+            sendControlPacket(buildTextControlMessage(e.key));
             return;
         }
 
@@ -1260,7 +1248,7 @@ function initScreenViewer() {
             keycode,
             repeat: e.repeat ? 1 : 0,
             metaState: getAndroidMetaState(e),
-        }), { markPowerOff: true });
+        }));
     });
     document.addEventListener('keyup', (e) => {
         if (!screenActive) return;
@@ -1280,7 +1268,7 @@ function initScreenViewer() {
             keycode,
             repeat: 0,
             metaState: getAndroidMetaState(e),
-        }), { markPowerOff: true });
+        }));
         updateModifierKeyState(e, false);
     });
 }
@@ -1289,39 +1277,10 @@ function sendControlPacket(data, options = {}) {
     if (!(data instanceof Uint8Array)) return false;
     if (pageMode === 'remote' && options.force !== true && !screenActive) return false;
     if (state.ws && state.ws.readyState === WebSocket.OPEN) {
-        if (pageMode === 'remote' && options.wake !== true && options.markPowerOff === true && !state.remotePowerOffSent) {
-            sendDisplayPowerRequest(false);
-        }
         state.ws.send(data);
         return true;
     }
     return false;
-}
-
-function resetRemotePowerState() {
-    state.remotePowerOffAutoTried = false;
-    state.remotePowerOffSent = false;
-    state.remoteModeLogEmitted = false;
-}
-
-function sendDisplayPowerRequest(on) {
-    if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
-        return false;
-    }
-    state.ws.send(buildSetDisplayPowerControlMessage(on));
-    if (on) {
-        resetRemotePowerState();
-        if (elements.remotePowerStatus) {
-            elements.remotePowerStatus.textContent = 'Requested phone display on';
-        }
-    } else {
-        state.remotePowerOffSent = true;
-        state.remotePowerOffAutoTried = true;
-        if (elements.remotePowerStatus) {
-            elements.remotePowerStatus.textContent = 'Requested phone display off for remote mode';
-        }
-    }
-    return true;
 }
 
 function ensureScreenDecoder() {

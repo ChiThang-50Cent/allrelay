@@ -279,6 +279,19 @@ func (c *Connection) ControlConn() net.Conn {
 	return c.control
 }
 
+// CloseControlConn closes conn and only clears the active control slot when it
+// still refers to that exact connection. This lets a stale reconnect clean up
+// its own socket without disrupting a newer control route.
+func (c *Connection) CloseControlConn(conn net.Conn) {
+	if c == nil || conn == nil {
+		return
+	}
+	if c.control == conn {
+		c.control = nil
+	}
+	conn.Close()
+}
+
 // HasStream returns true if the given stream connection was established.
 func (c *Connection) HasStream(id uint32) bool {
 	if c == nil {

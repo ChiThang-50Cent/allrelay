@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-08-30
+
+### Fixed
+- Remote screen power now follows the scrcpy lifecycle: the host turns the phone display off only after the active video session and control route are ready, and restores it before that route is closed.
+- Screen/control reconnects are generation-scoped so stale sessions cannot forward input, emit stale decoder metadata, or close a newer control socket.
+
+### Packaging
+- Debian package version advanced to `0.2.16`.
+
 ## 2026-08-28
 
 ### Added

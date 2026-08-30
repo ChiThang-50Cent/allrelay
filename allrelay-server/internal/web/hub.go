@@ -2,6 +2,7 @@ package web
 
 import (
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"sync"
@@ -34,17 +35,38 @@ type Hub struct {
 	register   chan *Client
 	unregister chan *Client
 	mu         sync.RWMutex
-	controlMu  sync.RWMutex
-
+	controlMu  sync.Mutex
+	// Serializes automatic display writes across route replacement and stop
+	// without holding controlMu during a blocked route write.
+	displayMu sync.Mutex
 	// Latest decoder setup for a viewer that joins after screen streaming began.
 	// Access units are immutable once published, so their slices are safe to retain.
 	screenSession      *screenSession
 	screenConfigFrames [][]byte
 	screenKeyFrame     []byte
 
-	// onControl forwards touch and key events to the active control connection.
-	onControl func(data []byte)
+	// Screen lifecycle state is synchronized with route replacement, while
+	// displayMu lets stop release this lock before a blocked route write ends.
+	screenGeneration  uint64
+	screenActive      bool
+	screenHeaderReady bool
+	displayOffDesired bool
+	// displayPowerOff records a successful automatic display OFF write across
+	// route replacements. It is cleared only after the active route restores
+	// display power successfully.
+	displayPowerOff bool
+	controlRoute    *controlRoute
 }
+
+type controlRoute struct {
+	generation     uint64
+	write          func([]byte) error
+	writeMu        sync.Mutex
+	closed         bool
+	displayOffSent bool
+}
+
+var errNoControlRoute = errors.New("no active control route")
 
 type screenSession struct {
 	Width  uint32 `json:"width"`
@@ -109,30 +131,225 @@ func (h *Hub) Run() {
 	}
 }
 
-// SetScreenSession records and broadcasts the active screen dimensions. A new
-// session invalidates codec configuration and keyframes from the old encoder.
-func (h *Hub) SetScreenSession(width, height uint32) {
-	session := &screenSession{Width: width, Height: height}
-	h.mu.Lock()
-	h.screenSession = session
-	h.screenConfigFrames = nil
-	h.screenKeyFrame = nil
-	h.mu.Unlock()
-	h.BroadcastEvent("screen_session", session)
-}
-
-// ClearScreenReplay removes cached decoder state when screen streaming stops.
-func (h *Hub) ClearScreenReplay() {
+// BeginScreenSession starts a new generation-scoped screen lifecycle.
+func (h *Hub) BeginScreenSession() uint64 {
+	h.displayMu.Lock()
+	defer h.displayMu.Unlock()
+	h.controlMu.Lock()
+	if h.screenActive {
+		route := h.endScreenSessionLocked()
+		if err := h.restoreDisplay(route); err != nil {
+			slog.Debug("Failed to restore display while replacing screen session", "error", err)
+		}
+		route.close()
+	}
+	h.screenGeneration++
+	h.screenActive = true
+	h.screenHeaderReady = false
+	h.displayOffDesired = true
+	h.controlRoute = nil
+	generation := h.screenGeneration
 	h.mu.Lock()
 	h.screenSession = nil
 	h.screenConfigFrames = nil
 	h.screenKeyFrame = nil
 	h.mu.Unlock()
+	h.controlMu.Unlock()
+	return generation
+}
+
+// SetScreenSession records the current generation's video header. Only the
+// active generation may update replay state or trigger display power changes.
+func (h *Hub) SetScreenSession(generation uint64, width, height uint32) bool {
+	session := &screenSession{Width: width, Height: height}
+	h.displayMu.Lock()
+	defer h.displayMu.Unlock()
+	h.controlMu.Lock()
+	if !h.screenActive || generation != h.screenGeneration {
+		h.controlMu.Unlock()
+		return false
+	}
+	h.mu.Lock()
+	h.screenSession = session
+	h.screenConfigFrames = nil
+	h.screenKeyFrame = nil
+	h.mu.Unlock()
+	h.screenHeaderReady = true
+
+	// Publish while the generation remains locked. A replacement cannot start
+	// between accepting this header and queuing its session event.
+	h.BroadcastEvent("screen_session", session)
+	route := h.controlRoute
+	var err error
+	if route != nil && h.displayOffDesired {
+		err = route.sendDisplayOff()
+		if err == nil {
+			h.displayPowerOff = true
+		}
+	}
+	h.controlMu.Unlock()
+
+	if err != nil {
+		slog.Debug("Failed to turn off display after screen header", "error", err)
+	}
+	return true
+}
+
+// EndScreenSession ends a lifecycle once. It disables later automatic display
+// OFF writes, restores display power through the active route, then detaches it.
+func (h *Hub) EndScreenSession(generation uint64) error {
+	h.displayMu.Lock()
+	defer h.displayMu.Unlock()
+	h.controlMu.Lock()
+	if !h.screenActive || generation != h.screenGeneration {
+		h.controlMu.Unlock()
+		return nil
+	}
+	route := h.endScreenSessionLocked()
+	h.mu.Lock()
+	h.screenSession = nil
+	h.screenConfigFrames = nil
+	h.screenKeyFrame = nil
+	h.mu.Unlock()
+	h.controlMu.Unlock()
+
+	err := h.restoreDisplay(route)
+	route.close()
+	return err
+}
+
+func (h *Hub) endScreenSessionLocked() *controlRoute {
+	h.screenActive = false
+	h.screenHeaderReady = false
+	h.displayOffDesired = false
+	route := h.controlRoute
+	h.controlRoute = nil
+	return route
+}
+
+// restoreDisplay restores the display through the route that was active when
+// the lifecycle ended. The caller holds displayMu, and this deliberately does
+// not consult the route's displayOffSent flag: an earlier route may have sent
+// the successful OFF.
+func (h *Hub) restoreDisplay(route *controlRoute) error {
+	if !h.displayPowerOff {
+		return nil
+	}
+	if route == nil {
+		return errNoControlRoute
+	}
+	if err := route.sendDisplayOn(); err != nil {
+		return err
+	}
+	h.displayPowerOff = false
+	return nil
+}
+
+// RegisterControlRoute installs a generation-scoped control writer. Replacing
+// a live route retires the prior writer and replays display OFF before an end
+// operation may observe the new route.
+func (h *Hub) RegisterControlRoute(generation uint64, write func([]byte) error) (*controlRoute, error) {
+	h.displayMu.Lock()
+	defer h.displayMu.Unlock()
+	h.controlMu.Lock()
+	defer h.controlMu.Unlock()
+	if !h.screenActive || generation != h.screenGeneration {
+		return nil, nil
+	}
+	if previous := h.controlRoute; previous != nil {
+		previous.close()
+	}
+	route := &controlRoute{generation: generation, write: write}
+	h.controlRoute = route
+	if !h.screenHeaderReady || !h.displayOffDesired {
+		return route, nil
+	}
+	if err := route.sendDisplayOff(); err != nil {
+		return route, err
+	}
+	h.displayPowerOff = true
+	return route, nil
+}
+
+func (h *Hub) ClearControlRoute(route *controlRoute) {
+	h.displayMu.Lock()
+	defer h.displayMu.Unlock()
+	h.controlMu.Lock()
+	shouldClose := h.controlRoute == route
+	if shouldClose {
+		h.controlRoute = nil
+	}
+	h.controlMu.Unlock()
+	if shouldClose {
+		route.close()
+	}
+}
+
+// WriteControl forwards ordinary control input through the active route.
+func (h *Hub) WriteControl(data []byte) error {
+	h.controlMu.Lock()
+	route := h.controlRoute
+	h.controlMu.Unlock()
+	if route == nil {
+		return errNoControlRoute
+	}
+	return route.writeControl(data)
+}
+
+func (r *controlRoute) writeControl(data []byte) error {
+	r.writeMu.Lock()
+	defer r.writeMu.Unlock()
+	if r.closed {
+		return errNoControlRoute
+	}
+	return r.write(data)
+}
+
+func (r *controlRoute) sendDisplayOff() error {
+	r.writeMu.Lock()
+	defer r.writeMu.Unlock()
+	if r.closed {
+		return errNoControlRoute
+	}
+	if r.displayOffSent {
+		return nil
+	}
+	if err := r.write([]byte{10, 0}); err != nil {
+		return err
+	}
+	r.displayOffSent = true
+	return nil
+}
+
+func (r *controlRoute) sendDisplayOn() error {
+	if r == nil {
+		return errNoControlRoute
+	}
+	r.writeMu.Lock()
+	defer r.writeMu.Unlock()
+	if r.closed {
+		return errNoControlRoute
+	}
+	return r.write([]byte{10, 1})
+}
+
+func (r *controlRoute) close() {
+	if r == nil {
+		return
+	}
+	r.writeMu.Lock()
+	r.closed = true
+	r.writeMu.Unlock()
 }
 
 // BroadcastScreenFrame sends one H.264 access unit and retains the small set of
 // decoder inputs needed to start a remote viewer that connects late.
-func (h *Hub) BroadcastScreenFrame(data []byte) {
+func (h *Hub) BroadcastScreenFrame(generation uint64, data []byte) bool {
+	h.controlMu.Lock()
+	if !h.screenActive || generation != h.screenGeneration {
+		h.controlMu.Unlock()
+		return false
+	}
 	h.mu.Lock()
 	if len(data) > 1 {
 		flags := data[0]
@@ -154,21 +371,13 @@ func (h *Hub) BroadcastScreenFrame(data []byte) {
 		}
 	}
 	h.mu.Unlock()
-}
-
-// SetControlHandler updates the active control forwarding target.
-func (h *Hub) SetControlHandler(handler func([]byte)) {
-	h.controlMu.Lock()
-	h.onControl = handler
 	h.controlMu.Unlock()
+	return true
 }
 
 func (h *Hub) forwardControl(data []byte) {
-	h.controlMu.RLock()
-	handler := h.onControl
-	h.controlMu.RUnlock()
-	if handler != nil {
-		handler(data)
+	if err := h.WriteControl(data); err != nil && !errors.Is(err, errNoControlRoute) {
+		slog.Debug("Control write error", "error", err)
 	}
 }
 

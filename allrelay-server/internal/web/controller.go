@@ -19,6 +19,8 @@ import (
 	"github.com/allrelay/allrelay-server/internal/video"
 )
 
+const controlWriteTimeout = time.Second
+
 // ServerController manages the actual connection to the phone
 // and provides an interface for the web UI to control it
 type ServerController struct {
@@ -31,6 +33,13 @@ type ServerController struct {
 	// Connection
 	conn *transport.Connection
 
+	// Control reconnects mutate a shared transport slot. Keep them separate
+	// from server state so a dial never holds mu.
+	controlMu               sync.Mutex
+	controlConnection       *transport.Connection
+	controlScreenGeneration int
+	controlHubGeneration    uint64
+
 	// Stream control
 	streams map[string]*StreamController
 
@@ -38,7 +47,6 @@ type ServerController struct {
 	cleanup []func()
 }
 
-// StreamController manages a single stream
 type StreamController struct {
 	Name    string
 	Port    int
@@ -53,6 +61,7 @@ type StreamController struct {
 	cancel  context.CancelFunc
 	done    chan struct{} // closed when goroutine fully exits
 	gen     int           // generation counter for stream lifecycle
+	hubGen  uint64        // Hub lifecycle generation for the active screen stream
 }
 
 // NewServerController creates a new server controller
@@ -141,6 +150,16 @@ func (sc *ServerController) disconnectLocked() error {
 
 	slog.Info("Disconnecting from phone", "host", sc.host)
 
+	// Restore the display while the current control route and transport are
+	// still live. Ending the Hub lifecycle also prevents a late connector from
+	// becoming active during teardown.
+	if screen, ok := sc.streams["screen"]; ok && screen.hubGen != 0 && sc.webServer != nil {
+		if err := sc.webServer.Hub().EndScreenSession(screen.hubGen); err != nil {
+			slog.Debug("Failed to restore display while disconnecting", "error", err)
+		}
+		screen.hubGen = 0
+	}
+
 	// Stop all streams
 	for _, stream := range sc.streams {
 		if stream.stop != nil {
@@ -156,11 +175,17 @@ func (sc *ServerController) disconnectLocked() error {
 	}
 	sc.cleanup = nil
 
-	// Close connection
+	// Prevent any in-flight control reconnect from replacing a route while the
+	// transport is closed.
+	sc.controlMu.Lock()
+	sc.controlConnection = nil
+	sc.controlScreenGeneration = 0
+	sc.controlHubGeneration = 0
 	if sc.conn != nil {
 		sc.conn.Close()
 		sc.conn = nil
 	}
+	sc.controlMu.Unlock()
 
 	sc.connected = false
 	sc.host = ""
@@ -479,17 +504,19 @@ func (sc *ServerController) startScreenStreamLocked() {
 	}
 
 	// Scrcpy-like lifecycle: every Screen ON starts a fresh TCP session.
-	// Never reuse old screen/control sockets across toggles.
+	// Never reuse an old screen socket across toggles.
 	hub := sc.webServer.Hub()
-	hub.ClearScreenReplay()
-	sc.conn.CloseStream(protocol.StreamScreen)
-	sc.conn.CloseStream(protocol.StreamControl)
+	conn := sc.conn
+	host := sc.host
+	port := sc.port
+	conn.CloseStream(protocol.StreamScreen)
 
 	slog.Info("Screen: opening fresh TCP session")
-	if err := sc.conn.ReconnectStream(sc.host, uint16(sc.port), protocol.StreamScreen); err != nil {
+	if err := conn.ReconnectStream(host, uint16(port), protocol.StreamScreen); err != nil {
 		slog.Error("Screen: reconnect failed", "error", err)
 		return
 	}
+	hubGeneration := hub.BeginScreenSession()
 
 	stream := sc.streams["screen"]
 	stream.Running = false
@@ -502,50 +529,16 @@ func (sc *ServerController) startScreenStreamLocked() {
 	stream.Active = true
 	stream.Running = true
 	stream.gen++
+	stream.hubGen = hubGeneration
 	gen := stream.gen
-	videoConn := sc.conn.VideoConn()
-
-	// Wire control forwarding best-effort. Control must never block screen.
-	hub.SetControlHandler(nil)
-	setControlForwarding := func(controlConn net.Conn) {
-		if controlConn == nil {
-			return
-		}
-		hub.SetControlHandler(func(data []byte) {
-			if len(data) == 0 {
-				return
-			}
-			if _, err := controlConn.Write(data); err != nil {
-				slog.Debug("Control write error", "error", err)
-			}
-		})
-	}
-	go func(expectedGen int) {
-		slog.Info("Control: opening fresh TCP session (best-effort)")
-		sc.conn.CloseStream(protocol.StreamControl)
-		if err := sc.conn.ReconnectStream(sc.host, uint16(sc.port), protocol.StreamControl); err != nil {
-			slog.Warn("Control: reconnect skipped", "error", err)
-			return
-		}
-		sc.mu.RLock()
-		stillCurrent := sc.streams["screen"].gen == expectedGen && sc.streams["screen"].Running
-		sc.mu.RUnlock()
-		if !stillCurrent {
-			sc.conn.CloseStream(protocol.StreamControl)
-			return
-		}
-		setControlForwarding(sc.conn.ControlConn())
-	}(gen)
+	videoConn := conn.VideoConn()
+	sc.prepareScreenControlReconnect(conn, gen, hubGeneration)
+	go sc.reconnectScreenControl(conn, host, port, gen, hubGeneration, hub)
 
 	stream.done = make(chan struct{})
 	go func() {
 		defer close(stream.done)
-		defer func() {
-			// Clear control forwarding and stale decoder data when screen stops.
-			hub.SetControlHandler(nil)
-			hub.ClearScreenReplay()
-		}()
-		if err := runScreenCapture(ctx, videoConn, hub,
+		if err := runScreenCapture(ctx, videoConn, hub, hubGeneration,
 			func(fps, bitrate, latency int, bytes, frames int64) {
 				sc.mu.Lock()
 				if s, ok := sc.streams["screen"]; ok && s.gen == gen {
@@ -567,15 +560,88 @@ func (sc *ServerController) startScreenStreamLocked() {
 				slog.Error("Screen capture error", "error", err)
 			}
 		}
+		if err := hub.EndScreenSession(hubGeneration); err != nil {
+			slog.Debug("Failed to restore display after screen stop", "error", err)
+		}
+		sc.closeScreenControl(conn, gen, hubGeneration)
 		sc.mu.Lock()
-		if stream.Running && stream.gen == gen {
+		conn.CloseStream(protocol.StreamScreen)
+		if stream.Running && stream.gen == gen && stream.hubGen == hubGeneration {
 			stream.Running = false
 			stream.Active = false
+			stream.hubGen = 0
 		}
-		sc.conn.CloseStream(protocol.StreamScreen)
-		sc.conn.CloseStream(protocol.StreamControl)
 		sc.mu.Unlock()
 	}()
+}
+
+func (sc *ServerController) prepareScreenControlReconnect(conn *transport.Connection, screenGeneration int, hubGeneration uint64) {
+	sc.controlMu.Lock()
+	sc.controlConnection = conn
+	sc.controlScreenGeneration = screenGeneration
+	sc.controlHubGeneration = hubGeneration
+	sc.controlMu.Unlock()
+}
+
+func (sc *ServerController) reconnectScreenControl(conn *transport.Connection, host string, port, screenGeneration int, hubGeneration uint64, hub *Hub) {
+	slog.Info("Control: opening fresh TCP session (best-effort)")
+	sc.controlMu.Lock()
+	if sc.controlConnection != conn || sc.controlScreenGeneration != screenGeneration || sc.controlHubGeneration != hubGeneration {
+		sc.controlMu.Unlock()
+		return
+	}
+	conn.CloseStream(protocol.StreamControl)
+	err := conn.ReconnectStream(host, uint16(port), protocol.StreamControl)
+	controlConn := conn.ControlConn()
+	sc.controlMu.Unlock()
+	if err != nil {
+		slog.Warn("Control: reconnect skipped", "error", err)
+		return
+	}
+
+	sc.mu.RLock()
+	stream := sc.streams["screen"]
+	stillCurrent := sc.connected && sc.conn == conn && stream.gen == screenGeneration && stream.hubGen == hubGeneration && stream.Running
+	sc.mu.RUnlock()
+	if !stillCurrent {
+		sc.closeControlConn(conn, controlConn)
+		return
+	}
+
+	route, err := hub.RegisterControlRoute(hubGeneration, func(data []byte) error {
+		if len(data) == 0 {
+			return nil
+		}
+		if err := controlConn.SetWriteDeadline(time.Now().Add(controlWriteTimeout)); err != nil {
+			return err
+		}
+		defer controlConn.SetWriteDeadline(time.Time{})
+		_, err := controlConn.Write(data)
+		return err
+	})
+	if err != nil {
+		slog.Debug("Control route setup error", "error", err)
+	}
+	if route == nil {
+		sc.closeControlConn(conn, controlConn)
+	}
+}
+
+func (sc *ServerController) closeScreenControl(conn *transport.Connection, screenGeneration int, hubGeneration uint64) {
+	sc.controlMu.Lock()
+	if sc.controlConnection == conn && sc.controlScreenGeneration == screenGeneration && sc.controlHubGeneration == hubGeneration {
+		sc.controlConnection = nil
+		sc.controlScreenGeneration = 0
+		sc.controlHubGeneration = 0
+		conn.CloseControlConn(conn.ControlConn())
+	}
+	sc.controlMu.Unlock()
+}
+
+func (sc *ServerController) closeControlConn(conn *transport.Connection, controlConn net.Conn) {
+	sc.controlMu.Lock()
+	conn.CloseControlConn(controlConn)
+	sc.controlMu.Unlock()
 }
 
 // IsConnected returns whether we're connected to a phone
@@ -663,8 +729,8 @@ func runSpeakerCapture(ctx context.Context, w io.Writer, onMetrics func(fps, bit
 	}()
 
 	const (
-		sendSlowThreshold        = 20 * time.Millisecond // send-side tracking bucket
-		loopSlowThreshold        = 20 * time.Millisecond // loop-side tracking bucket
+		sendSlowThreshold        = 20 * time.Millisecond  // send-side tracking bucket
+		loopSlowThreshold        = 20 * time.Millisecond  // loop-side tracking bucket
 		sendStallNoticeThreshold = 100 * time.Millisecond // log INFO when a send stall this large is absorbed
 	)
 
@@ -679,7 +745,7 @@ func runSpeakerCapture(ctx context.Context, w io.Writer, onMetrics func(fps, bit
 	}
 	queue := make(chan opusPacket, queueFrames)
 
-	var sendMaxMs atomic.Int64    // milliseconds
+	var sendMaxMs atomic.Int64 // milliseconds
 	var slowSendCount atomic.Uint64
 	var droppedFrames atomic.Uint64
 	var sentFrames atomic.Uint64
@@ -1236,7 +1302,7 @@ func runCameraCapture(ctx context.Context, reader io.Reader) error {
 
 // runScreenCapture reads H.264 NAL units from the TCP reader via the demuxer
 // and broadcasts them as binary WebSocket messages to all connected clients.
-func runScreenCapture(ctx context.Context, reader io.Reader, hub *Hub,
+func runScreenCapture(ctx context.Context, reader io.Reader, hub *Hub, generation uint64,
 	onMetrics func(fps, bitrate, latency int, bytes, frames int64)) error {
 
 	// Do NOT apply an idle read timeout for screen mirroring.
@@ -1279,7 +1345,7 @@ func runScreenCapture(ctx context.Context, reader io.Reader, hub *Hub,
 		// before frames for the new orientation arrive.
 		if len(payload) == 0 {
 			if header.SessionWidth > 0 && header.SessionHeight > 0 {
-				hub.SetScreenSession(header.SessionWidth, header.SessionHeight)
+				hub.SetScreenSession(generation, header.SessionWidth, header.SessionHeight)
 			}
 			return nil
 		}
@@ -1302,7 +1368,7 @@ func runScreenCapture(ctx context.Context, reader io.Reader, hub *Hub,
 		msg := make([]byte, 1+len(payload))
 		msg[0] = flags
 		copy(msg[1:], payload)
-		hub.BroadcastScreenFrame(msg)
+		hub.BroadcastScreenFrame(generation, msg)
 
 		frameCount++
 		byteCount += uint64(len(payload))
