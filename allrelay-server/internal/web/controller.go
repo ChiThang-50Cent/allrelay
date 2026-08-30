@@ -617,14 +617,14 @@ func runSpeakerCapture(ctx context.Context, w io.Writer, onMetrics func(fps, bit
 		sampleRate = 48000
 		channels   = 2
 		bitrate    = 96000
-		frameMs    = 5
+		frameMs    = 20
 		// queueFrames caps sender-side buffering between the capture/encode
 		// loop and the TCP send goroutine. When the phone or Wi-Fi stalls the
 		// write, the queue fills and the capture loop drops the oldest encoded
 		// frame instead of blocking. This caps sender latency at
 		// queueFrames*frameMs and prevents PulseAudio capture backlog from
 		// accumulating (the latency-drifts-up-until-toggle symptom).
-		queueFrames = 4 // 4 * 5ms = 20ms max sender buffer
+		queueFrames = 5 // 5 * 20ms = 100ms max sender buffer
 	)
 	frameSamples := sampleRate * frameMs / 1000 * channels // int16 samples per frame
 	pcmBytes := frameSamples * 2                           // s16le
@@ -812,13 +812,13 @@ func runSpeakerCapture(ctx context.Context, w io.Writer, onMetrics func(fps, bit
 			bitrate := int(float64(bytesSinceMetrics*8) / metricsElapsed.Seconds())
 			sentF := sentFrames.Load()
 			sentB := sentBytes.Load()
-			latencyMs := int(lastSendLatencyUs.Load()/1000) + 5 + 60
+			latencyMs := int(lastSendLatencyUs.Load()/1000) + frameMs + 60
 			if onMetrics != nil {
 				onMetrics(fps, bitrate, latencyMs, int64(sentB), int64(sentF))
 			}
 
 			// Backlog diagnostics: report per-loop + send timing once per second.
-			// frameMs=5ms is the realtime budget per capture iteration.
+			// frameMs=20ms is the realtime budget per capture iteration.
 			backlogMs := 0
 			if loopMaxMs > time.Duration(frameMs)*time.Millisecond {
 				backlogMs = int(loopMaxMs/(time.Millisecond) - frameMs)

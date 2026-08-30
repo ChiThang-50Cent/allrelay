@@ -7,6 +7,7 @@ import com.genymobile.scrcpy.util.Ln;
 
 import android.annotation.TargetApi;
 import android.media.AudioAttributes;
+import android.media.AudioDeviceInfo;
 import android.media.AudioFormat;
 import android.media.AudioTrack;
 import android.media.MediaCodec;
@@ -18,14 +19,16 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Receives Opus-encoded audio from the PC and plays it through the phone speaker.
  *
- * <p>Receives raw Opus packets (with 16-byte AllRelay header).
- * Uses a static MediaCodec decoder that is created once and flushed/reused
- * across connections — eliminating the ~2s decoder init delay per connection.
+ * <p>A receive thread keeps the transport current while a playback thread owns
+ * the decoder and AudioTrack.
  */
 public final class AudioReversePlayback implements AsyncProcessor {
 
@@ -36,21 +39,23 @@ public final class AudioReversePlayback implements AsyncProcessor {
 
     private static final int HEADER_SIZE = 16;
     private static final long PACKET_FLAG_CONFIG = 1L << 62;
-    private static final long MAX_PLAYBACK_LAG_US = 100_000L;
     private static final byte[] OPUS_HEAD_MAGIC = {'O', 'p', 'u', 's', 'H', 'e', 'a', 'd'};
+    private static final int PACKET_QUEUE_CAPACITY = 25;
+    private static final long EOS_DEQUEUE_TIMEOUT_US = 10_000;
+    private static final int EOS_MAX_DEQUEUE_RETRIES = 100;
 
-
-    // Shared decoder — created once, flushed on reconnect.
-    private static MediaCodec sharedDecoder;
-    private static boolean sharedDecoderStarted;
-    private static final Object decoderLock = new Object();
     private static final AtomicBoolean playbackActive = new AtomicBoolean(false);
 
     private final InputStream inputStream;
+    private final ArrayBlockingQueue<Packet> packetQueue = new ArrayBlockingQueue<>(PACKET_QUEUE_CAPACITY);
+    private final AtomicLong droppedPacketCount = new AtomicLong();
+    private final AtomicLong receivedPacketCount = new AtomicLong();
+    private final AtomicBoolean receiverFinished = new AtomicBoolean();
+    private final AtomicBoolean fatalError = new AtomicBoolean();
 
     private Thread thread;
+    private Thread playbackThread;
     private volatile boolean stopped;
-    private AudioTrack audioTrack;
 
     public AudioReversePlayback(InputStream inputStream) {
         this.inputStream = inputStream;
@@ -58,12 +63,6 @@ public final class AudioReversePlayback implements AsyncProcessor {
 
     public static boolean isPlaybackActive() {
         return playbackActive.get();
-    }
-
-    // Keep transport/codec backlogs from becoming audible latency.
-    static boolean isStalePlaybackPacket(long packetPtsUs, long firstPacketPtsUs, long elapsedUs) {
-
-        return elapsedUs - (packetPtsUs - firstPacketPtsUs) > MAX_PLAYBACK_LAG_US;
     }
 
     static boolean isValidOpusHead(byte[] data) {
@@ -85,49 +84,38 @@ public final class AudioReversePlayback implements AsyncProcessor {
         return csd;
     }
 
-    /**
-     * Get or create a decoder for this speaker session.
-     * Creates a fresh decoder per connection to avoid state corruption
-     * when old goroutines hold stale references.
-     */
-    private static MediaCodec getFreshDecoder() {
-        synchronized (decoderLock) {
-            // Release old decoder if any
-            if (sharedDecoder != null) {
-                try {
-                    sharedDecoder.stop();
-                } catch (Exception ignored) {}
-                try {
-                    sharedDecoder.release();
-                } catch (Exception ignored) {}
-                sharedDecoder = null;
-            }
-            sharedDecoderStarted = false;
-
-            try {
-                sharedDecoder = MediaCodec.createDecoderByType(AudioCodec.OPUS.getMimeType());
-                Ln.i("Speaker: fresh decoder created");
-            } catch (Exception e) {
-                Ln.e("Speaker: failed to create decoder", e);
-                return null;
-            }
-            return sharedDecoder;
+    private static MediaCodec createDecoder() {
+        try {
+            MediaCodec decoder = MediaCodec.createDecoderByType(AudioCodec.OPUS.getMimeType());
+            Ln.i("Speaker: decoder created");
+            return decoder;
+        } catch (Exception e) {
+            Ln.e("Speaker: failed to create decoder", e);
+            return null;
         }
     }
 
     @Override
     public void start(TerminationListener listener) {
         thread = new Thread(() -> {
-            boolean fatalError = false;
             try {
-                Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO);
-                play();
+                byte[] opusHead = readConfiguration();
+                if (opusHead != null && !stopped) {
+                    startPlayback(opusHead);
+                    receivePackets();
+                }
             } catch (IOException e) {
-                Ln.e("Audio reverse playback error", e);
-                fatalError = true;
+                if (!stopped) {
+                    Ln.e("Audio reverse playback error", e);
+                    fatalError.set(true);
+                    stopped = true;
+                }
             } finally {
+                receiverFinished.set(true);
+                wakePlayback();
+                joinPlayback();
                 Ln.d("Audio reverse playback stopped");
-                listener.onTerminated(fatalError);
+                listener.onTerminated(fatalError.get());
             }
         }, "audio-reverse");
         thread.start();
@@ -136,9 +124,12 @@ public final class AudioReversePlayback implements AsyncProcessor {
     @Override
     public void stop() {
         stopped = true;
-        if (thread != null) {
-            thread.interrupt();
+        closeInputStream();
+        Thread receiver = thread;
+        if (receiver != null) {
+            receiver.interrupt();
         }
+        wakePlayback();
     }
 
     @Override
@@ -148,56 +139,126 @@ public final class AudioReversePlayback implements AsyncProcessor {
         }
     }
 
-    @TargetApi(AndroidVersions.API_23_ANDROID_6_0)
-    private void play() throws IOException {
-        playbackActive.set(true);
-        try {
-            byte[] headerBuf = new byte[HEADER_SIZE];
-
-            // Read OpusHead and OpusTags from the stream.
-            byte[] opusHead = null;
-            for (int i = 0; i < 2; i++) {
-                int read = readFully(inputStream, headerBuf, 0, HEADER_SIZE);
-                if (read < HEADER_SIZE) {
+    private byte[] readConfiguration() throws IOException {
+        byte[] headerBuf = new byte[HEADER_SIZE];
+        byte[] opusHead = null;
+        for (int i = 0; i < 2; i++) {
+            int read = readFully(inputStream, headerBuf, 0, HEADER_SIZE);
+            if (read < HEADER_SIZE) {
+                if (!stopped) {
                     Ln.w("Speaker: connection closed before config packet " + i);
-                    return;
                 }
-
-                int streamId = ByteBuffer.wrap(headerBuf, 0, 4).order(ByteOrder.BIG_ENDIAN).getInt();
-                if (streamId != StreamId.SPEAKER.getId()) {
-                    Ln.e("Speaker: unexpected stream ID: 0x" + Integer.toHexString(streamId));
-                    return;
-                }
-
-                int size = ByteBuffer.wrap(headerBuf, 12, 4).order(ByteOrder.BIG_ENDIAN).getInt();
-                if (size <= 0 || size > 65536) {
-                    Ln.e("Speaker: invalid config packet size: " + size);
-                    return;
-                }
-                byte[] data = new byte[size];
-                if (readFully(inputStream, data, 0, size) < size) {
-                    Ln.w("Speaker: connection closed in config packet " + i);
-                    return;
-                }
-                if (i == 0) {
-                    if (!isValidOpusHead(data)) {
-                        Ln.e("Speaker: invalid OpusHead");
-                        return;
-                    }
-                    opusHead = data;
-                }
+                return null;
             }
 
-            Ln.i("Speaker stream connected, OpusHead=" + opusHead.length + " bytes");
+            int streamId = ByteBuffer.wrap(headerBuf, 0, 4).order(ByteOrder.BIG_ENDIAN).getInt();
+            if (streamId != StreamId.SPEAKER.getId()) {
+                Ln.e("Speaker: unexpected stream ID: 0x" + Integer.toHexString(streamId));
+                return null;
+            }
 
-            // Create a fresh decoder per speaker session (avoids stale state from old goroutines)
-            MediaCodec decoder = getFreshDecoder();
+            int size = ByteBuffer.wrap(headerBuf, 12, 4).order(ByteOrder.BIG_ENDIAN).getInt();
+            if (size <= 0 || size > 65536) {
+                Ln.e("Speaker: invalid config packet size: " + size);
+                return null;
+            }
+            byte[] data = new byte[size];
+            if (readFully(inputStream, data, 0, size) < size) {
+                if (!stopped) {
+                    Ln.w("Speaker: connection closed in config packet " + i);
+                }
+                return null;
+            }
+            if (i == 0) {
+                if (!isValidOpusHead(data)) {
+                    Ln.e("Speaker: invalid OpusHead");
+                    return null;
+                }
+                opusHead = data;
+            }
+        }
+
+        Ln.i("Speaker stream connected, OpusHead=" + opusHead.length + " bytes");
+        return opusHead;
+    }
+
+    private void startPlayback(byte[] opusHead) {
+        playbackThread = new Thread(() -> {
+            playbackActive.set(true);
+            try {
+                Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO);
+                playPackets(opusHead);
+            } catch (Exception e) {
+                if (!stopped) {
+                    Ln.e("Audio reverse playback error", e);
+                    fatalError.set(true);
+                    stopReceiving();
+                }
+            } finally {
+                playbackActive.set(false);
+                if (!receiverFinished.get() && !stopped) {
+                    stopReceiving();
+                }
+            }
+        }, "audio-reverse-playback");
+        playbackThread.start();
+    }
+
+    private void receivePackets() throws IOException {
+        byte[] headerBuf = new byte[HEADER_SIZE];
+        while (!stopped && !Thread.currentThread().isInterrupted()) {
+            int headerBytes = readFully(inputStream, headerBuf, 0, HEADER_SIZE);
+            if (headerBytes < HEADER_SIZE) {
+                Ln.d("Speaker: connection closed after " + receivedPacketCount.get() + " packets");
+                return;
+            }
+
+            long ptsFlags = ByteBuffer.wrap(headerBuf, 4, 8).order(ByteOrder.BIG_ENDIAN).getLong();
+            boolean config = (ptsFlags & PACKET_FLAG_CONFIG) != 0;
+            int payloadSize = ByteBuffer.wrap(headerBuf, 12, 4).order(ByteOrder.BIG_ENDIAN).getInt();
+            if (payloadSize <= 0 || payloadSize > 65536) {
+                continue;
+            }
+
+            byte[] payload = new byte[payloadSize];
+            if (readFully(inputStream, payload, 0, payloadSize) < payloadSize) {
+                Ln.d("Speaker: incomplete payload");
+                return;
+            }
+            if (config) {
+                continue;
+            }
+
+            receivedPacketCount.incrementAndGet();
+            enqueuePacket(new Packet(payload, ptsFlags & 0x1FFFFFFFFFFFFFL));
+        }
+    }
+
+    private void enqueuePacket(Packet packet) {
+        if (packetQueue.offer(packet)) {
+            return;
+        }
+        Packet dropped = packetQueue.poll();
+        if (dropped != null) {
+            droppedPacketCount.incrementAndGet();
+        }
+        if (!packetQueue.offer(packet)) {
+            droppedPacketCount.incrementAndGet();
+        }
+    }
+
+    @TargetApi(AndroidVersions.API_23_ANDROID_6_0)
+    private void playPackets(byte[] opusHead) throws IOException {
+        MediaCodec decoder = null;
+        AudioTrack audioTrack = null;
+        boolean decoderStarted = false;
+        try {
+            decoder = createDecoder();
             if (decoder == null) {
                 Ln.e("Speaker: no decoder available");
                 return;
             }
 
-            // Android's Opus decoder consumes all codec-specific data at start.
             MediaFormat format = MediaFormat.createAudioFormat(
                     AudioCodec.OPUS.getMimeType(), SAMPLE_RATE, CHANNELS);
             format.setByteBuffer("csd-0", ByteBuffer.wrap(opusHead));
@@ -206,9 +267,8 @@ public final class AudioReversePlayback implements AsyncProcessor {
 
             decoder.configure(format, null, null, 0);
             decoder.start();
-            sharedDecoderStarted = true;
+            decoderStarted = true;
 
-            // Wait for decoder output — much faster on reconnect (decoder is warm)
             MediaCodec.BufferInfo bufferInfo = new MediaCodec.BufferInfo();
             long initStartMs = System.currentTimeMillis();
             for (int i = 0; i < 10; i++) {
@@ -223,113 +283,316 @@ public final class AudioReversePlayback implements AsyncProcessor {
                 }
             }
 
-            // Create AudioTrack (low latency)
             int minBufferSize = AudioTrack.getMinBufferSize(SAMPLE_RATE, CHANNEL_CONFIG, ENCODING);
-            audioTrack = createAudioTrack(minBufferSize);
-            audioTrack.play();
+            int pcmFrameSize = CHANNELS * AudioConfig.BYTES_PER_SAMPLE;
+            int bufferSize = ((minBufferSize * 2 + pcmFrameSize - 1) / pcmFrameSize) * pcmFrameSize;
+            int playbackStartThreshold = bufferSize / 2;
+            audioTrack = createAudioTrack(bufferSize);
+            if (audioTrack.getState() != AudioTrack.STATE_INITIALIZED) {
+                Ln.e("Speaker: AudioTrack initialization failed, state=" + audioTrack.getState());
+                return;
+            }
 
-            ByteBuffer readBuffer = ByteBuffer.allocate(4096);
-
-            long packetCount = 0;
             long inputFed = 0;
-            long outputGot = 0;
-            long bytesWritten = 0;
-            long lastLogTime = System.currentTimeMillis();
-            long firstPacketPtsUs = -1;
-            long playbackStartedNs = 0;
-            long stalePackets = 0;
+            PcmWriter pcmWriter = new PcmWriter(audioTrack, playbackStartThreshold);
+            Packet pendingPacket = null;
+            long lastLogTime = 0;
 
-            while (!stopped && !Thread.currentThread().isInterrupted()) {
-                int headerBytes = readFully(inputStream, headerBuf, 0, HEADER_SIZE);
-                if (headerBytes < HEADER_SIZE) {
-                    Ln.d("Speaker: connection closed after " + packetCount + " packets");
-                    break;
+            while (!stopped) {
+                long now = System.currentTimeMillis();
+                if (now - lastLogTime >= 5000) {
+                    int bufferSizeFrames = Build.VERSION.SDK_INT >= AndroidVersions.API_23_ANDROID_6_0
+                            ? getBufferSizeInFrames(audioTrack)
+                            : -1;
+                    int bufferCapacityFrames = Build.VERSION.SDK_INT >= AndroidVersions.API_24_ANDROID_7_0
+                            ? getBufferCapacityInFrames(audioTrack)
+                            : -1;
+                    int underruns = Build.VERSION.SDK_INT >= AndroidVersions.API_24_ANDROID_7_0
+                            ? getUnderrunCount(audioTrack)
+                            : -1;
+                    String route = Build.VERSION.SDK_INT >= AndroidVersions.API_23_ANDROID_6_0
+                            ? getRoutedDeviceSummary(audioTrack)
+                            : "n/a";
+                    Ln.i("Speaker: pkts=" + receivedPacketCount.get()
+                            + " queue=" + packetQueue.size() + "/" + PACKET_QUEUE_CAPACITY
+                            + " dropped=" + droppedPacketCount.get() + " fed=" + inputFed
+                            + " out=" + pcmWriter.outputGot + " outBytes=" + pcmWriter.outputBytes
+                            + " writes=" + pcmWriter.audioTrackWrites + " writeBytes=" + pcmWriter.bytesWritten
+                            + " shortWrites=" + pcmWriter.shortWrites + " writeErrors=" + pcmWriter.writeErrors
+                            + " lastWrite=" + pcmWriter.lastWriteResult + "/" + pcmWriter.lastWriteSize
+                            + " prefilled=" + pcmWriter.prefilledBytes + "/" + playbackStartThreshold
+                            + " bufFrames=" + bufferSizeFrames + "/" + bufferCapacityFrames
+                            + " underruns=" + underruns + " initState=" + audioTrack.getState()
+                            + " playState=" + audioTrack.getPlayState()
+                            + " headFrames=" + audioTrack.getPlaybackHeadPosition() + " route=" + route);
+                    lastLogTime = now;
                 }
 
-                long ptsFlags = ByteBuffer.wrap(headerBuf, 4, 8).order(ByteOrder.BIG_ENDIAN).getLong();
-                boolean config = (ptsFlags & PACKET_FLAG_CONFIG) != 0;
-                int payloadSize = ByteBuffer.wrap(headerBuf, 12, 4).order(ByteOrder.BIG_ENDIAN).getInt();
-
-                if (payloadSize <= 0 || payloadSize > 65536) {
-                    continue;
+                if (pendingPacket == null) {
+                    try {
+                        pendingPacket = packetQueue.poll(50, TimeUnit.MILLISECONDS);
+                    } catch (InterruptedException e) {
+                        if (stopped) {
+                            return;
+                        }
+                        continue;
+                    }
+                    if (pendingPacket == null) {
+                        if (receiverFinished.get()) {
+                            if (queueDecoderEos(decoder)) {
+                                drainDecoderEos(decoder, bufferInfo, pcmWriter);
+                            }
+                            if (!stopped && !pcmWriter.playbackStarted && pcmWriter.prefilledBytes > 0) {
+                                playPrefilledPcm(audioTrack, pcmWriter.prefilledBytes, pcmFrameSize);
+                            }
+                            return;
+                        }
+                        continue;
+                    }
                 }
-
-                if (readBuffer.capacity() < payloadSize) {
-                    readBuffer = ByteBuffer.allocate(payloadSize + 1024);
-                }
-                readBuffer.clear();
-                readBuffer.limit(payloadSize);
-                int payloadRead = readFully(inputStream, readBuffer.array(), 0, payloadSize);
-                if (payloadRead < payloadSize) {
-                    Ln.d("Speaker: incomplete payload");
-                    break;
-                }
-                readBuffer.position(payloadRead);
-                readBuffer.flip();
-
-                if (config) {
-                    continue;
-                }
-
-                packetCount++;
-                long pts = ptsFlags & 0x1FFFFFFFFFFFFFL;
-                if (firstPacketPtsUs < 0) {
-                    firstPacketPtsUs = pts;
-                    playbackStartedNs = System.nanoTime();
-                }
-                long elapsedUs = (System.nanoTime() - playbackStartedNs) / 1_000L;
-                if (isStalePlaybackPacket(pts, firstPacketPtsUs, elapsedUs)) {
-                    stalePackets++;
-                    continue;
-                }
-
 
                 int inputBufferId = decoder.dequeueInputBuffer(10000);
-                if (inputBufferId < 0) continue;
+                if (inputBufferId < 0) {
+                    continue;
+                }
 
                 ByteBuffer inputBuffer = decoder.getInputBuffer(inputBufferId);
-                if (inputBuffer != null) {
-                    inputBuffer.clear();
-                    inputBuffer.put(readBuffer);
-                    readBuffer.flip();
-                    inputBuffer.flip();
-                    decoder.queueInputBuffer(inputBufferId, 0, payloadSize, pts, 0);
-                    inputFed++;
+                if (inputBuffer == null) {
+                    throw new IOException("Speaker: MediaCodec input buffer unavailable");
                 }
+                inputBuffer.clear();
+                inputBuffer.put(pendingPacket.data);
+                inputBuffer.flip();
+                decoder.queueInputBuffer(inputBufferId, 0, pendingPacket.data.length, pendingPacket.ptsUs, 0);
+                inputFed++;
+                pendingPacket = null;
 
                 while (true) {
                     int outputBufferId = decoder.dequeueOutputBuffer(bufferInfo, 0);
-                    if (outputBufferId < 0) break;
-                    if (outputBufferId == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) continue;
-
-                    ByteBuffer outputBuffer = decoder.getOutputBuffer(outputBufferId);
-                    if (outputBuffer != null && bufferInfo.size > 0) {
-                        byte[] pcmData = new byte[bufferInfo.size];
-                        outputBuffer.position(bufferInfo.offset);
-                        outputBuffer.get(pcmData, 0, bufferInfo.size);
-                        int written = audioTrack.write(pcmData, 0, bufferInfo.size);
-                        if (written > 0) {
-                            outputGot++;
-                            bytesWritten += written;
-                        }
+                    if (outputBufferId < 0) {
+                        break;
                     }
-                    decoder.releaseOutputBuffer(outputBufferId, false);
-                }
+                    if (outputBufferId == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                        continue;
+                    }
 
-                long now = System.currentTimeMillis();
-                if (now - lastLogTime >= 5000) {
-                    Ln.d("Speaker: pkts=" + packetCount + " stale=" + stalePackets + " fed=" + inputFed
-                            + " out=" + outputGot + " outBytes=" + bytesWritten);
-                    lastLogTime = now;
+                    try {
+                        pcmWriter.write(decoder.getOutputBuffer(outputBufferId), bufferInfo);
+                    } finally {
+                        decoder.releaseOutputBuffer(outputBufferId, false);
+                    }
                 }
             }
         } finally {
-            playbackActive.set(false);
+            if (audioTrack != null) {
+                try {
+                    audioTrack.stop();
+                } catch (Exception ignored) {
+                    // Ignore cleanup failures.
+                }
+                try {
+                    audioTrack.release();
+                } catch (Exception ignored) {
+                    // Ignore cleanup failures.
+                }
+            }
+            if (decoder != null) {
+                if (decoderStarted) {
+                    try {
+                        decoder.stop();
+                    } catch (Exception ignored) {
+                        // Ignore cleanup failures.
+                    }
+                }
+                try {
+                    decoder.release();
+                } catch (Exception ignored) {
+                    // Ignore cleanup failures.
+                }
+            }
+        }
+    }
+
+    private boolean queueDecoderEos(MediaCodec decoder) {
+        for (int retry = 0; !stopped && retry < EOS_MAX_DEQUEUE_RETRIES; ++retry) {
+            int inputBufferId = decoder.dequeueInputBuffer(EOS_DEQUEUE_TIMEOUT_US);
+            if (inputBufferId >= 0) {
+                decoder.queueInputBuffer(inputBufferId, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM);
+                return true;
+            }
+        }
+        if (!stopped) {
+            Ln.w("Speaker: timed out waiting to queue decoder EOS");
+        }
+        return false;
+    }
+
+    private void drainDecoderEos(MediaCodec decoder, MediaCodec.BufferInfo bufferInfo, PcmWriter pcmWriter)
+            throws IOException {
+        for (int attempt = 0; !stopped && attempt < EOS_MAX_DEQUEUE_RETRIES; ++attempt) {
+            int outputBufferId = decoder.dequeueOutputBuffer(bufferInfo, EOS_DEQUEUE_TIMEOUT_US);
+            if (outputBufferId == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                continue;
+            }
+            if (outputBufferId < 0) {
+                continue;
+            }
+
+            try {
+                pcmWriter.write(decoder.getOutputBuffer(outputBufferId), bufferInfo);
+            } finally {
+                decoder.releaseOutputBuffer(outputBufferId, false);
+            }
+            if ((bufferInfo.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
+                return;
+            }
+        }
+        if (!stopped) {
+            Ln.w("Speaker: timed out draining decoder EOS");
+        }
+    }
+
+    private void playPrefilledPcm(AudioTrack audioTrack, long prefilledBytes, int pcmFrameSize) {
+        audioTrack.play();
+        long playbackFrames = prefilledBytes / pcmFrameSize;
+        while (!stopped && audioTrack.getPlayState() == AudioTrack.PLAYSTATE_PLAYING
+                && audioTrack.getPlaybackHeadPosition() < playbackFrames) {
+            try {
+                Thread.sleep(10);
+            } catch (InterruptedException e) {
+                if (stopped) {
+                    return;
+                }
+            }
+        }
+        Ln.i("Speaker: EOF prefill=" + prefilledBytes + " bytes playState=" + audioTrack.getPlayState()
+                + " headFrames=" + audioTrack.getPlaybackHeadPosition());
+    }
+
+    private static final class PcmWriter {
+        private final AudioTrack audioTrack;
+        private final int playbackStartThreshold;
+
+        private long outputGot;
+        private long outputBytes;
+        private long audioTrackWrites;
+        private long bytesWritten;
+        private long shortWrites;
+        private long writeErrors;
+        private int lastWriteResult;
+        private int lastWriteSize;
+        private long prefilledBytes;
+        private boolean playbackStarted;
+
+        PcmWriter(AudioTrack audioTrack, int playbackStartThreshold) {
+            this.audioTrack = audioTrack;
+            this.playbackStartThreshold = playbackStartThreshold;
+        }
+
+        void write(ByteBuffer outputBuffer, MediaCodec.BufferInfo bufferInfo) throws IOException {
+            outputGot++;
+            outputBytes += bufferInfo.size;
+            if (outputBuffer == null || bufferInfo.size <= 0) {
+                return;
+            }
+
+            byte[] pcmData = new byte[bufferInfo.size];
+            outputBuffer.position(bufferInfo.offset);
+            outputBuffer.get(pcmData, 0, bufferInfo.size);
+            int writeOffset = 0;
+            while (writeOffset < pcmData.length) {
+                int writeSize = pcmData.length - writeOffset;
+                if (!playbackStarted) {
+                    writeSize = (int) Math.min(writeSize, playbackStartThreshold - prefilledBytes);
+                }
+                int written = audioTrack.write(pcmData, writeOffset, writeSize);
+                audioTrackWrites++;
+                lastWriteResult = written;
+                lastWriteSize = writeSize;
+                if (written <= 0) {
+                    if (written < 0) {
+                        writeErrors++;
+                    } else {
+                        shortWrites++;
+                    }
+                    throw new IOException("Speaker: AudioTrack.write() returned " + written);
+                }
+                bytesWritten += written;
+                if (written < writeSize) {
+                    shortWrites++;
+                }
+                writeOffset += written;
+                if (!playbackStarted) {
+                    prefilledBytes += written;
+                    if (prefilledBytes >= playbackStartThreshold) {
+                        audioTrack.play();
+                        playbackStarted = true;
+                        Ln.i("Speaker: playing after prefill=" + prefilledBytes
+                                + "/" + playbackStartThreshold + " bytes");
+                    }
+                }
+            }
+        }
+    }
+
+    private void stopReceiving() {
+        stopped = true;
+        closeInputStream();
+        Thread receiver = thread;
+        if (receiver != null) {
+            receiver.interrupt();
+        }
+    }
+
+    private void closeInputStream() {
+        try {
+            inputStream.close();
+        } catch (IOException ignored) {
+            // Ignore close failures during shutdown.
+        }
+    }
+
+    private void wakePlayback() {
+        Thread worker = playbackThread;
+        if (worker != null) {
+            worker.interrupt();
+        }
+    }
+
+    private void joinPlayback() {
+        Thread worker = playbackThread;
+        if (worker == null) {
+            return;
+        }
+        boolean interrupted = false;
+        while (true) {
+            try {
+                worker.join();
+                break;
+            } catch (InterruptedException e) {
+                interrupted = true;
+                stopped = true;
+                closeInputStream();
+                wakePlayback();
+            }
+        }
+        if (interrupted) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    private static final class Packet {
+        private final byte[] data;
+        private final long ptsUs;
+
+        Packet(byte[] data, long ptsUs) {
+            this.data = data;
+            this.ptsUs = ptsUs;
         }
     }
 
     @TargetApi(AndroidVersions.API_23_ANDROID_6_0)
-    private AudioTrack createAudioTrack(int minBufferSize) {
+    private AudioTrack createAudioTrack(int bufferSize) {
         if (Build.VERSION.SDK_INT >= AndroidVersions.API_26_ANDROID_8_0) {
             return new AudioTrack.Builder()
                     .setAudioAttributes(new AudioAttributes.Builder()
@@ -341,7 +604,7 @@ public final class AudioReversePlayback implements AsyncProcessor {
                             .setSampleRate(SAMPLE_RATE)
                             .setChannelMask(CHANNEL_CONFIG)
                             .build())
-                    .setBufferSizeInBytes(minBufferSize)
+                    .setBufferSizeInBytes(bufferSize)
                     .setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
                     .build();
         }
@@ -352,9 +615,30 @@ public final class AudioReversePlayback implements AsyncProcessor {
                 SAMPLE_RATE,
                 CHANNEL_CONFIG,
                 ENCODING,
-                minBufferSize,
+                bufferSize,
                 AudioTrack.MODE_STREAM);
         return track;
+    }
+
+    @TargetApi(AndroidVersions.API_23_ANDROID_6_0)
+    private static int getBufferSizeInFrames(AudioTrack audioTrack) {
+        return audioTrack.getBufferSizeInFrames();
+    }
+
+    @TargetApi(AndroidVersions.API_23_ANDROID_6_0)
+    private static String getRoutedDeviceSummary(AudioTrack audioTrack) {
+        AudioDeviceInfo routedDevice = audioTrack.getRoutedDevice();
+        return routedDevice == null ? "none" : routedDevice.getType() + ":" + routedDevice.getProductName();
+    }
+
+    @TargetApi(AndroidVersions.API_24_ANDROID_7_0)
+    private static int getBufferCapacityInFrames(AudioTrack audioTrack) {
+        return audioTrack.getBufferCapacityInFrames();
+    }
+
+    @TargetApi(AndroidVersions.API_24_ANDROID_7_0)
+    private static int getUnderrunCount(AudioTrack audioTrack) {
+        return audioTrack.getUnderrunCount();
     }
 
     private static int readFully(InputStream in, byte[] buf, int off, int len) throws IOException {

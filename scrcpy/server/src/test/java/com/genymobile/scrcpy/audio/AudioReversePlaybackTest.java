@@ -10,14 +10,6 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 
 public class AudioReversePlaybackTest {
-    @Test
-    public void testStalePlaybackPacketUsesTimelineLag() {
-        assertFalse(AudioReversePlayback.isStalePlaybackPacket(5000, 5000, 0));
-        assertFalse(AudioReversePlayback.isStalePlaybackPacket(5000, 5000, 100000));
-        assertTrue(AudioReversePlayback.isStalePlaybackPacket(5000, 5000, 100001));
-        assertFalse(AudioReversePlayback.isStalePlaybackPacket(25000, 5000, 120000));
-        assertTrue(AudioReversePlayback.isStalePlaybackPacket(25000, 5000, 120001));
-    }
 
     @Test
     public void testValidOpusHeadRequiresHeaderVersionAndChannels() {

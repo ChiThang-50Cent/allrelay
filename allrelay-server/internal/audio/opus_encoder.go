@@ -8,6 +8,14 @@ package audio
 static int opus_set_bitrate(OpusEncoder *enc, opus_int32 bitrate) {
     return opus_encoder_ctl(enc, OPUS_SET_BITRATE(bitrate));
 }
+
+static int opus_set_vbr(OpusEncoder *enc, int vbr) {
+    return opus_encoder_ctl(enc, OPUS_SET_VBR(vbr));
+}
+
+static int opus_set_dtx(OpusEncoder *enc, int dtx) {
+    return opus_encoder_ctl(enc, OPUS_SET_DTX(dtx));
+}
 */
 import "C"
 
@@ -60,6 +68,16 @@ func NewOpusEncoder(sampleRate, channels, bitrate int) (*OpusEncoder, error) {
 	if ret := C.opus_set_bitrate(enc, C.opus_int32(bitrate)); ret != C.OPUS_OK {
 		C.opus_encoder_destroy(enc)
 		return nil, fmt.Errorf("opus_set_bitrate failed: %d", int(ret))
+	}
+
+	if ret := C.opus_set_vbr(enc, 0); ret != C.OPUS_OK {
+		C.opus_encoder_destroy(enc)
+		return nil, fmt.Errorf("opus_set_vbr failed: %d", int(ret))
+	}
+
+	if ret := C.opus_set_dtx(enc, 0); ret != C.OPUS_OK {
+		C.opus_encoder_destroy(enc)
+		return nil, fmt.Errorf("opus_set_dtx failed: %d", int(ret))
 	}
 
 	return &OpusEncoder{enc: enc, channels: channels}, nil
