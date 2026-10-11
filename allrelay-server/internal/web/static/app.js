@@ -128,8 +128,6 @@ function init() {
         elements.remoteWakeBtn.addEventListener('click', wakeRemotePhoneScreen);
     }
     if (pageMode === 'remote') {
-        window.addEventListener('beforeunload', stopRemoteScreenOnUnload);
-        window.addEventListener('pagehide', stopRemoteScreenOnUnload);
         window.addEventListener('blur', resetKeyboardState);
         document.addEventListener('paste', handleRemotePaste);
         setInterval(syncLocalClipboardLoop, 1000);
@@ -926,6 +924,7 @@ function checkRemotePopupLifecycle() {
         return;
     }
     state.remotePopup = null;
+    emitClientLog('warn', 'remote_popup_closed', { screen_active: !!screen?.active });
     if (screen?.active && !state.remotePopupCloseHandled) {
         state.remotePopupCloseHandled = true;
         handleToggleStream('screen', false);
@@ -1003,18 +1002,6 @@ function wakeRemotePhoneScreen() {
     }
 }
 
-function stopRemoteScreenOnUnload() {
-    if (pageMode !== 'remote') return;
-    const screen = getStream('screen');
-    if (screen?.active) {
-        fetch(API.toggleStream, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ stream: 'screen', active: false }),
-            keepalive: true,
-        }).catch(() => {});
-    }
-}
 
 // ============================================
 // Utility Functions
