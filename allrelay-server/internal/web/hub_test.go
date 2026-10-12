@@ -3,8 +3,14 @@ package web
 import (
 	"bytes"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"runtime"
+	"strings"
 	"testing"
+	"time"
+
+	"github.com/gorilla/websocket"
 )
 
 func TestScreenInitMessageReplaysDecoderState(t *testing.T) {
@@ -258,4 +264,262 @@ func equalPackets(got, want [][]byte) bool {
 		}
 	}
 	return true
+}
+
+func TestCheckSameOrigin(t *testing.T) {
+	tests := []struct {
+		name   string
+		host   string
+		origin string
+		allow  bool
+	}{
+		{
+			name:   "no origin allowed (tray or non-browser client)",
+			host:   "localhost:8080",
+			origin: "",
+			allow:  true,
+		},
+		{
+			name:   "same origin exact match",
+			host:   "localhost:8080",
+			origin: "http://localhost:8080",
+			allow:  true,
+		},
+		{
+			name:   "same origin 127.0.0.1 exact match",
+			host:   "127.0.0.1:9090",
+			origin: "http://127.0.0.1:9090",
+			allow:  true,
+		},
+		{
+			name:   "case insensitive host match",
+			host:   "LocalHost:8080",
+			origin: "http://localhost:8080",
+			allow:  true,
+		},
+		{
+			name:   "foreign origin rejected",
+			host:   "localhost:8080",
+			origin: "http://attacker.com:8080",
+			allow:  false,
+		},
+		{
+			name:   "foreign origin with different port rejected",
+			host:   "localhost:8080",
+			origin: "http://localhost:9999",
+			allow:  false,
+		},
+		{
+			name:   "malformed origin rejected",
+			host:   "localhost:8080",
+			origin: "://malformed-url",
+			allow:  false,
+		},
+		{
+			name:   "ftp scheme rejected",
+			host:   "localhost:8080",
+			origin: "ftp://localhost:8080",
+			allow:  false,
+		},
+		{
+			name:   "userinfo rejected",
+			host:   "localhost:8080",
+			origin: "http://user:pass@localhost:8080",
+			allow:  false,
+		},
+		{
+			name:   "origin with path rejected",
+			host:   "localhost:8080",
+			origin: "http://localhost:8080/somepath",
+			allow:  false,
+		},
+		{
+			name:   "origin with query rejected",
+			host:   "localhost:8080",
+			origin: "http://localhost:8080?param=1",
+			allow:  false,
+		},
+		{
+			name:   "default http port match when host omits 80",
+			host:   "localhost",
+			origin: "http://localhost:80",
+			allow:  true,
+		},
+		{
+			name:   "default http port match when origin omits 80",
+			host:   "localhost:80",
+			origin: "http://localhost",
+			allow:  true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest("GET", "/ws", nil)
+			req.Host = tc.host
+			if tc.origin != "" {
+				req.Header.Set("Origin", tc.origin)
+			}
+			got := checkSameOrigin(req)
+			if got != tc.allow {
+				t.Errorf("checkSameOrigin(host=%q, origin=%q) = %v; want %v", tc.host, tc.origin, got, tc.allow)
+			}
+		})
+	}
+}
+
+func TestWebSocketAdmissionAndTeardownLifecycle(t *testing.T) {
+	ws := NewWebServer(DefaultConfig())
+	defer ws.Stop()
+
+	server := httptest.NewServer(http.HandlerFunc(ws.HandleWebSocket))
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+
+	// 1. Foreign origin client is refused
+	dialerForeign := websocket.Dialer{}
+	foreignHeader := http.Header{}
+	foreignHeader.Set("Origin", "http://evil.com")
+	_, resp, err := dialerForeign.Dial(wsURL, foreignHeader)
+	if err == nil {
+		t.Fatal("expected foreign origin WebSocket connection to fail")
+	}
+	if resp != nil && resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for foreign origin, got %d", resp.StatusCode)
+	}
+
+	// 2. Same-origin or no-origin client succeeds
+	dialerNoOrigin := websocket.Dialer{}
+	conn, _, err := dialerNoOrigin.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("expected no-origin client to connect successfully: %v", err)
+	}
+
+	// Read initial status
+	_, msg, err := conn.ReadMessage()
+	if err != nil {
+		t.Fatalf("read initial status: %v", err)
+	}
+	if !strings.Contains(string(msg), `"status"`) {
+		t.Fatalf("unexpected message: %s", string(msg))
+	}
+
+	// Send ping and receive pong
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"ping"}`)); err != nil {
+		t.Fatalf("write ping: %v", err)
+	}
+	_, pongMsg, err := conn.ReadMessage()
+	if err != nil {
+		t.Fatalf("read pong: %v", err)
+	}
+	if !strings.Contains(string(pongMsg), `"pong"`) {
+		t.Fatalf("unexpected pong: %s", string(pongMsg))
+	}
+
+	// Closing client connection tears down cleanly and removes client under hub.mu even without broadcasts
+	if err := conn.Close(); err != nil {
+		t.Fatalf("close conn: %v", err)
+	}
+
+	removed := false
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		ws.hub.mu.RLock()
+		n := len(ws.hub.clients)
+		ws.hub.mu.RUnlock()
+		if n == 0 {
+			removed = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !removed {
+		t.Fatal("client was not removed from hub after connection close")
+	}
+}
+
+func TestClientTeardownIdempotent(t *testing.T) {
+	hub := NewHub()
+	defer hub.Stop()
+
+	client := &Client{
+		hub:     hub,
+		send:    make(chan []byte, 2),
+		sendBin: make(chan []byte, 2),
+		closed:  make(chan struct{}),
+	}
+
+	// Test enqueueText and enqueueBin after closed channel
+	close(client.closed)
+	if client.enqueueText([]byte("msg")) {
+		t.Fatal("enqueueText succeeded on closed client")
+	}
+	if client.enqueueBin([]byte("data")) {
+		t.Fatal("enqueueBin succeeded on closed client")
+	}
+}
+
+func TestHubBroadcastOverflowDisconnection(t *testing.T) {
+	hub := NewHub()
+	defer hub.Stop()
+	go hub.Run()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		client := &Client{
+			hub:        hub,
+			conn:       conn,
+			remoteAddr: r.RemoteAddr,
+			send:       make(chan []byte, 1),
+			sendBin:    make(chan []byte, 1),
+			closed:     make(chan struct{}),
+		}
+		hub.register <- client
+		// Fill send buffer
+		client.send <- []byte("msg1")
+		go client.readPump()
+	}))
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	// Wait for client to be registered in hub
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		hub.mu.RLock()
+		n := len(hub.clients)
+		hub.mu.RUnlock()
+		if n > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Broadcast another message which will overflow this client
+	hub.broadcast <- []byte("msg2")
+
+	// Wait for client to be removed from hub.clients
+	removed := false
+	deadline = time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		hub.mu.RLock()
+		n := len(hub.clients)
+		hub.mu.RUnlock()
+		if n == 0 {
+			removed = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !removed {
+		t.Fatal("client was not disconnected and removed from hub after queue overflow")
+	}
 }

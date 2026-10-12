@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"time"
 
@@ -27,7 +28,7 @@ type ServerConfig struct {
 func DefaultConfig() ServerConfig {
 	return ServerConfig{
 		Port:    8080,
-		Host:    "0.0.0.0",
+		Host:    "127.0.0.1",
 		Debug:   false,
 		URLFile: "",
 	}
@@ -73,6 +74,7 @@ type WebServer struct {
 	scanner          *discovery.Scanner
 	mu               sync.RWMutex
 	httpServer       *http.Server
+	listener         net.Listener
 	adbMonitorCancel context.CancelFunc
 	adbMonitorID     uint64
 }
@@ -105,28 +107,43 @@ func NewWebServer(config ServerConfig) *WebServer {
 
 func (ws *WebServer) setADBStatus(status ADBStatus) {
 	ws.mu.Lock()
-	defer ws.mu.Unlock()
 	ws.currentConn.ADB = status
+	snapshot := ws.snapshotStatusLocked()
+	ws.mu.Unlock()
+
+	ws.hub.BroadcastStatus(&snapshot)
 }
 
 func (ws *WebServer) resetADBStatus() {
 	ws.setADBStatus(ADBStatus{})
 }
 
-// Start begins serving the web UI
-func (ws *WebServer) Start() error {
+func (ws *WebServer) requireSameOrigin(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions {
+			if !checkSameOrigin(r) {
+				http.Error(w, "Forbidden", http.StatusForbidden)
+				return
+			}
+		}
+		next(w, r)
+	}
+}
+
+// Listen sets up routes and starts the TCP listener.
+func (ws *WebServer) Listen() error {
 	mux := http.NewServeMux()
 
 	// API routes
 	mux.HandleFunc("/api/phones", ws.handlePhones)
-	mux.HandleFunc("/api/phones/scan", ws.handleScanPhones)
-	mux.HandleFunc("/api/connect", ws.handleConnect)
-	mux.HandleFunc("/api/disconnect", ws.handleDisconnect)
+	mux.HandleFunc("/api/phones/scan", ws.requireSameOrigin(ws.handleScanPhones))
+	mux.HandleFunc("/api/connect", ws.requireSameOrigin(ws.handleConnect))
+	mux.HandleFunc("/api/disconnect", ws.requireSameOrigin(ws.handleDisconnect))
 	mux.HandleFunc("/api/status", ws.handleStatus)
-	mux.HandleFunc("/api/streams/toggle", ws.handleToggleStream)
+	mux.HandleFunc("/api/streams/toggle", ws.requireSameOrigin(ws.handleToggleStream))
 	mux.HandleFunc("/api/streams/metrics", ws.handleStreamMetrics)
-	mux.HandleFunc("/api/adb/connect", ws.handleADBConnect)
-	mux.HandleFunc("/api/adb/disconnect", ws.handleADBDisconnect)
+	mux.HandleFunc("/api/adb/connect", ws.requireSameOrigin(ws.handleADBConnect))
+	mux.HandleFunc("/api/adb/disconnect", ws.requireSameOrigin(ws.handleADBDisconnect))
 	mux.HandleFunc("/api/adb/status", ws.handleADBStatus)
 
 	// WebSocket endpoint
@@ -161,7 +178,7 @@ func (ws *WebServer) Start() error {
 	// Main page
 	mux.HandleFunc("/", ws.handleIndex)
 
-	addr := fmt.Sprintf("%s:%d", ws.config.Host, ws.config.Port)
+	addr := net.JoinHostPort(ws.config.Host, strconv.Itoa(ws.config.Port))
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
@@ -171,6 +188,7 @@ func (ws *WebServer) Start() error {
 		ws.config.Port = tcpAddr.Port
 	}
 
+	ws.listener = listener
 	ws.httpServer = &http.Server{
 		Addr:    listener.Addr().String(),
 		Handler: mux,
@@ -179,33 +197,65 @@ func (ws *WebServer) Start() error {
 	url := ws.URL()
 	if ws.config.URLFile != "" {
 		if err := os.MkdirAll(filepath.Dir(ws.config.URLFile), 0o755); err != nil {
+			listener.Close()
 			return err
 		}
 		if err := os.WriteFile(ws.config.URLFile, []byte(url+"\n"), 0o644); err != nil {
+			listener.Close()
 			return err
 		}
 	}
 
-	slog.Info("Web UI starting", "address", listener.Addr().String(), "url", url)
-	return ws.httpServer.Serve(listener)
+	return nil
+}
+
+// Serve accepts incoming connections on the listener.
+func (ws *WebServer) Serve() error {
+	if ws.listener == nil || ws.httpServer == nil {
+		return fmt.Errorf("web server not initialized; call Listen first")
+	}
+	url := ws.URL()
+	slog.Info("Web UI starting", "address", ws.listener.Addr().String(), "url", url)
+	return ws.httpServer.Serve(ws.listener)
+}
+
+// Start begins serving the web UI (listens then serves).
+func (ws *WebServer) Start() error {
+	if err := ws.Listen(); err != nil {
+		return err
+	}
+	return ws.Serve()
 }
 
 // Stop gracefully stops the web server
 func (ws *WebServer) Stop() error {
+	ws.stopADBMonitor()
+	if ws.controller != nil {
+		_ = ws.controller.Disconnect()
+	}
+	if ws.hub != nil {
+		ws.hub.Stop()
+	}
 	if ws.httpServer != nil {
 		return ws.httpServer.Close()
+	}
+	if ws.listener != nil {
+		return ws.listener.Close()
 	}
 	return nil
 }
 
 // URL returns the current local web UI URL.
 func (ws *WebServer) URL() string {
+	ws.mu.RLock()
+	defer ws.mu.RUnlock()
+
 	host := ws.config.Host
 	switch host {
 	case "", "0.0.0.0", "::":
-		host = "localhost"
+		host = "127.0.0.1"
 	}
-	return fmt.Sprintf("http://%s:%d", host, ws.config.Port)
+	return fmt.Sprintf("http://%s", net.JoinHostPort(host, strconv.Itoa(ws.config.Port)))
 }
 
 // GetController returns the server controller
@@ -217,6 +267,7 @@ func (ws *WebServer) GetController() *ServerController {
 func (ws *WebServer) Hub() *Hub {
 	return ws.hub
 }
+
 func (ws *WebServer) handleIndex(w http.ResponseWriter, r *http.Request) {
 	ws.serveTemplate(w, r, "index.html")
 }
@@ -341,6 +392,11 @@ func (ws *WebServer) handleConnect(w http.ResponseWriter, r *http.Request) {
 
 // handleDisconnect disconnects from current phone
 func (ws *WebServer) handleDisconnect(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
 	ws.stopADBMonitor()
 	// Use controller to actually disconnect
 	if ws.controller != nil {
@@ -354,24 +410,53 @@ func (ws *WebServer) handleDisconnect(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"status": "disconnected"})
 }
 
-// handleStatus returns current connection status
-func (ws *WebServer) handleStatus(w http.ResponseWriter, r *http.Request) {
-	// Sync stream states from controller if available
+// snapshotStatus returns a detached copy of ConnectionStatus.
+// Controller is authoritative for stream state and metrics.
+func (ws *WebServer) snapshotStatus() ConnectionStatus {
+	var streams []StreamStatus
 	if ws.controller != nil {
-		ws.controller.SyncStreamStatus(ws.currentConn.Streams)
+		streams = ws.controller.GetStreamStatus()
 	}
 
-	ws.mu.RLock()
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+
+	if len(streams) > 0 {
+		ws.currentConn.Streams = streams
+	}
+
+	return ws.snapshotStatusLocked()
+}
+
+func (ws *WebServer) snapshotStatusLocked() ConnectionStatus {
 	status := ConnectionStatus{
 		Connected: ws.currentConn.Connected,
 		ADB:       ws.currentConn.ADB,
 	}
 	if ws.currentConn.Phone != nil {
 		phone := *ws.currentConn.Phone
+		phone.Connected = ws.currentConn.Connected
 		status.Phone = &phone
 	}
-	status.Streams = append([]StreamStatus(nil), ws.currentConn.Streams...)
-	ws.mu.RUnlock()
+	status.Streams = make([]StreamStatus, len(ws.currentConn.Streams))
+	copy(status.Streams, ws.currentConn.Streams)
+	return status
+}
+
+// publishCanonicalStatus takes a snapshot and broadcasts it via WebSocket.
+func (ws *WebServer) publishCanonicalStatus() {
+	snapshot := ws.snapshotStatus()
+	ws.hub.BroadcastStatus(&snapshot)
+}
+
+// SetStreamActive updates active state for a specific stream and broadcasts canonical snapshot.
+func (ws *WebServer) SetStreamActive(name string, active bool) {
+	ws.publishCanonicalStatus()
+}
+
+// handleStatus returns current connection status
+func (ws *WebServer) handleStatus(w http.ResponseWriter, r *http.Request) {
+	status := ws.snapshotStatus()
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(status)
@@ -402,32 +487,16 @@ func (ws *WebServer) handleToggleStream(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 
-	// Update local state
-	ws.mu.Lock()
-	var updatedStream StreamStatus
-	for i, s := range ws.currentConn.Streams {
-		if s.Name == req.Stream {
-			ws.currentConn.Streams[i].Active = req.Active
-			updatedStream = ws.currentConn.Streams[i]
-			break
-		}
-	}
-	ws.mu.Unlock()
-
-	// Broadcast update to all WebSocket clients
-	ws.hub.BroadcastStreamUpdate(updatedStream)
-
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "updated"})
 }
 
-// handleStreamMetrics returns detailed stream metrics
+// handleStreamMetrics returns detailed stream metrics matching handleStatus.
 func (ws *WebServer) handleStreamMetrics(w http.ResponseWriter, r *http.Request) {
-	ws.mu.RLock()
-	defer ws.mu.RUnlock()
+	status := ws.snapshotStatus()
 
-	metrics := make(map[string]interface{})
-	for _, s := range ws.currentConn.Streams {
+	metrics := make(map[string]interface{}, len(status.Streams))
+	for _, s := range status.Streams {
 		metrics[s.Name] = map[string]interface{}{
 			"active":  s.Active,
 			"fps":     s.FPS,
@@ -444,32 +513,42 @@ func (ws *WebServer) handleStreamMetrics(w http.ResponseWriter, r *http.Request)
 
 // UpdateStreamMetrics updates metrics for a specific stream
 func (ws *WebServer) UpdateStreamMetrics(name string, fps, bitrate, latency int, bytesSent, frames int64) {
-	ws.mu.Lock()
-	for i, s := range ws.currentConn.Streams {
-		if s.Name == name {
-			ws.currentConn.Streams[i].FPS = fps
-			ws.currentConn.Streams[i].Bitrate = bitrate
-			ws.currentConn.Streams[i].Latency = latency
-			ws.currentConn.Streams[i].BytesSent = bytesSent
-			ws.currentConn.Streams[i].Frames = frames
-			break
+	if ws.controller != nil {
+		ws.controller.mu.Lock()
+		if s, ok := ws.controller.streams[name]; ok {
+			s.FPS = fps
+			s.Bitrate = bitrate
+			s.Latency = latency
+			s.Bytes = bytesSent
+			s.Frames = frames
 		}
+		ws.controller.mu.Unlock()
 	}
-	ws.mu.Unlock()
-
-	// Broadcast updated metrics
-	ws.hub.BroadcastStatus(ws.currentConn)
+	ws.publishCanonicalStatus()
 }
 
 // SetConnectionStatus updates the connection status
 func (ws *WebServer) SetConnectionStatus(connected bool, phone *PhoneDevice) {
 	ws.mu.Lock()
 	ws.currentConn.Connected = connected
-	ws.currentConn.Phone = phone
+	if phone != nil {
+		phoneCopy := *phone
+		phoneCopy.Connected = connected
+		ws.currentConn.Phone = &phoneCopy
+		if p, ok := ws.phones[phone.ID]; ok {
+			p.Connected = connected
+		}
+	} else {
+		if ws.currentConn.Phone != nil {
+			ws.currentConn.Phone.Connected = false
+		}
+		ws.currentConn.Phone = nil
+	}
+	snapshot := ws.snapshotStatusLocked()
 	ws.mu.Unlock()
 
 	// Broadcast status change
-	ws.hub.BroadcastStatus(ws.currentConn)
+	ws.hub.BroadcastStatus(&snapshot)
 }
 
 // AddPhone adds a phone to the discovered list

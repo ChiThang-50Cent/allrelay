@@ -13,6 +13,7 @@ import (
 	"io"
 	"log/slog"
 	"os/exec"
+	"sync"
 )
 
 // CapturePipeline manages a subprocess that captures system audio,
@@ -21,10 +22,12 @@ import (
 // Data is read via the Read() method from the pipeline's stdout.
 // The pipeline runs until Close() is called or the process exits.
 type CapturePipeline struct {
-	name   string
-	cmd    *exec.Cmd
-	stdout io.ReadCloser
-	done   chan error
+	name      string
+	cmd       *exec.Cmd
+	stdout    io.ReadCloser // immutable; the pipe supports concurrent Read and Close
+	done      chan error
+	waitDone  chan struct{}
+	closeOnce sync.Once
 }
 
 // SpeakerPCMCapturePipeline creates a pipeline that captures system audio
@@ -75,14 +78,16 @@ func NewCapturePipeline(name, command string, args []string) (*CapturePipeline, 
 	}
 
 	p := &CapturePipeline{
-		name:   name,
-		cmd:    cmd,
-		stdout: stdout,
-		done:   make(chan error, 1),
+		name:     name,
+		cmd:      cmd,
+		stdout:   stdout,
+		done:     make(chan error, 1),
+		waitDone: make(chan struct{}),
 	}
 
 	// Monitor the process in background
 	go func() {
+		defer close(p.waitDone)
 		errBuf := make([]byte, 4096)
 		n, _ := stderr.Read(errBuf)
 		err := cmd.Wait()
@@ -125,17 +130,16 @@ func (p *CapturePipeline) Close() error {
 	if p.stdout == nil {
 		return nil
 	}
-
-	slog.Info("Stopping capture pipeline", "name", p.name)
-
-	p.stdout.Close()
-	p.stdout = nil
-
-	if p.cmd != nil && p.cmd.Process != nil {
-		p.cmd.Process.Kill()
-		p.cmd.Wait()
-	}
-
+	p.closeOnce.Do(func() {
+		slog.Info("Stopping capture pipeline", "name", p.name)
+		_ = p.stdout.Close()
+		if p.cmd != nil && p.cmd.Process != nil {
+			_ = p.cmd.Process.Kill()
+		}
+		// The monitor is the sole owner of cmd.Wait. Do not return while the
+		// capture subprocess is still being reaped.
+		<-p.waitDone
+	})
 	return nil
 }
 

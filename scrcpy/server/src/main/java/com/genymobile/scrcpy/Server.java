@@ -158,7 +158,7 @@ public final class Server {
                 try {
                     // Fast path: persistent daemon mode for independently managed ports.
                     // Keep enabled ports open permanently and accept reconnections in a loop.
-                    // Speaker daemon runs on main thread (needs Looper for decoder callbacks).
+                    // Speaker daemon runs on main thread (waits on reverse playback lifecycle).
                     // Screen, camera, mic, and control daemons run on background threads.
                     if (daemon
                             && (speakerEnabled || cameraDaemonEnabled || micEnabled || video || control)) {
@@ -697,29 +697,92 @@ public final class Server {
                     speakerSocket.getOutputStream().flush();
                     Ln.i("Wi-Fi speaker client connected from " + speakerSocket.getRemoteSocketAddress());
 
-                    InputStream input = speakerSocket.getInputStream();
-                    AudioReversePlayback reversePlayback = new AudioReversePlayback(input);
-                    Completion completion = new Completion(1, true);
-                    reversePlayback.start((fatalError) -> completion.addCompleted(fatalError));
+                    runSpeakerStream(speakerSocket);
 
-                    Looper.loop(); // blocks until stream completes
                     Ln.i("Speaker stream ended, accepting next connection...");
-                } catch (IOException e) {
-                    Ln.e("Speaker accept error: " + e.getMessage());
-                    if (speakerSocket != null) {
-                        try { speakerSocket.close(); } catch (IOException ignored) {}
+                } catch (Exception e) {
+                    Ln.e("Speaker daemon stream error: " + e.getMessage(), e);
+                    try {
+                        Thread.sleep(500);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        Ln.w("Speaker daemon interrupted during backoff", ie);
                     }
-                    try { Thread.sleep(500); } catch (InterruptedException ignored) {}
+                } finally {
+                    if (speakerSocket != null && !speakerSocket.isClosed()) {
+                        try {
+                            speakerSocket.close();
+                        } catch (IOException e) {
+                            Ln.w("Speaker socket close error: " + e.getMessage());
+                        }
+                    }
                 }
             }
         } catch (IOException e) {
-            Ln.e("Speaker daemon: " + e.getMessage());
-            try { Thread.sleep(500); } catch (InterruptedException ignored) {}
+            Ln.e("Speaker daemon bind failed: " + e.getMessage(), e);
+            try {
+                Thread.sleep(500);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                Ln.w("Speaker daemon interrupted during backoff", ie);
+            }
         } finally {
             if (speakerServer != null) {
-                try { speakerServer.close(); } catch (IOException ignored) {}
+                try {
+                    speakerServer.close();
+                } catch (IOException e) {
+                    Ln.w("Speaker server socket close error: " + e.getMessage());
+                }
             }
         }
+    }
+
+    private static void runStream(java.net.Socket socket, AsyncProcessor processor, Runnable captureStop, String streamName) throws Exception {
+        final boolean[] fatal = {false};
+        try {
+            processor.start((fatalError) -> fatal[0] = fatalError);
+            try {
+                processor.join();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                Ln.w(streamName + " stream interrupted waiting for completion", e);
+            }
+            if (fatal[0]) {
+                Ln.w(streamName + " stream completed with fatal error");
+            } else {
+                Ln.i(streamName + " stream completed");
+            }
+        } finally {
+            try {
+                try {
+                    socket.close();
+                } catch (IOException e) {
+                    Ln.w(streamName + " socket close error: " + e.getMessage());
+                }
+                processor.stop();
+                try {
+                    processor.join();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    Ln.w(streamName + " interrupted joining processor", e);
+                }
+            } finally {
+                if (captureStop != null) {
+                    try {
+                        captureStop.run();
+                    } catch (Exception e) {
+                        Ln.w(streamName + " capture stop error: " + e.getMessage(), e);
+                    }
+                }
+                Ln.i(streamName + " stream cleanup done");
+            }
+        }
+    }
+
+    private static void runSpeakerStream(java.net.Socket socket) throws Exception {
+        InputStream input = socket.getInputStream();
+        AudioReversePlayback reversePlayback = new AudioReversePlayback(input);
+        runStream(socket, reversePlayback, null, "Speaker");
     }
 
     /**
@@ -751,18 +814,38 @@ public final class Server {
 
                         Ln.i("Camera stream ended, accepting next connection...");
                     } catch (Exception e) {
-                        Ln.e("Camera daemon stream error: " + e.getMessage());
-                        if (cameraSocket != null) {
-                            try { cameraSocket.close(); } catch (IOException ignored) {}
+                        Ln.e("Camera daemon stream error: " + e.getMessage(), e);
+                        try {
+                            Thread.sleep(500);
+                        } catch (InterruptedException ie) {
+                            Thread.currentThread().interrupt();
+                            Ln.w("Camera daemon interrupted during backoff", ie);
                         }
-                        try { Thread.sleep(500); } catch (InterruptedException ignored) {}
+                    } finally {
+                        if (cameraSocket != null && !cameraSocket.isClosed()) {
+                            try {
+                                cameraSocket.close();
+                            } catch (IOException e) {
+                                Ln.w("Camera socket close error: " + e.getMessage());
+                            }
+                        }
                     }
                 }
             } catch (IOException e) {
-                Ln.e("Camera daemon bind failed: " + e.getMessage());
+                Ln.e("Camera daemon bind failed: " + e.getMessage(), e);
+                try {
+                    Thread.sleep(500);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    Ln.w("Camera daemon interrupted during backoff", ie);
+                }
             } finally {
                 if (cameraServer != null) {
-                    try { cameraServer.close(); } catch (IOException ignored) {}
+                    try {
+                        cameraServer.close();
+                    } catch (IOException e) {
+                        Ln.w("Camera server socket close error: " + e.getMessage());
+                    }
                 }
             }
         }, "camera-daemon");
@@ -800,17 +883,37 @@ public final class Server {
                         Ln.i("Mic stream ended, accepting next connection...");
                     } catch (Exception e) {
                         Ln.e("Mic daemon stream error: " + e.getMessage(), e);
-                        if (micSocket != null) {
-                            try { micSocket.close(); } catch (IOException ignored) {}
+                        try {
+                            Thread.sleep(500);
+                        } catch (InterruptedException ie) {
+                            Thread.currentThread().interrupt();
+                            Ln.w("Mic daemon interrupted during backoff", ie);
                         }
-                        try { Thread.sleep(500); } catch (InterruptedException ignored) {}
+                    } finally {
+                        if (micSocket != null && !micSocket.isClosed()) {
+                            try {
+                                micSocket.close();
+                            } catch (IOException e) {
+                                Ln.w("Mic socket close error: " + e.getMessage());
+                            }
+                        }
                     }
                 }
             } catch (IOException e) {
                 Ln.e("Mic daemon bind failed: " + e.getMessage(), e);
+                try {
+                    Thread.sleep(500);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    Ln.w("Mic daemon interrupted during backoff", ie);
+                }
             } finally {
                 if (micServer != null) {
-                    try { micServer.close(); } catch (IOException ignored) {}
+                    try {
+                        micServer.close();
+                    } catch (IOException e) {
+                        Ln.w("Mic server socket close error: " + e.getMessage());
+                    }
                 }
             }
         }, "mic-daemon");
@@ -846,16 +949,7 @@ public final class Server {
         WifiSurfaceEncoder encoder = new WifiSurfaceEncoder(
                 cameraCapture, cameraStreamer, options);
 
-        // Start encoder, receive termination callback
-        Completion completion = new Completion(1, true);
-        encoder.start((fatalError) -> completion.addCompleted(fatalError));
-
-        // Wait for stream to end (client disconnect or error)
-        encoder.join();
-
-        // Cleanup
-        cameraCapture.stop();
-        Ln.i("Camera stream completed");
+        runStream(socket, encoder, cameraCapture::stop, "Camera");
     }
 
     /**
@@ -874,16 +968,7 @@ public final class Server {
                 options.getSendStreamMeta(), options.getSendFrameMeta());
         WifiAudioEncoder encoder = new WifiAudioEncoder(audioCapture, audioStreamer, options);
 
-        final boolean[] fatal = {false};
-        encoder.start((fatalError) -> fatal[0] = fatalError);
-        encoder.join();
-
-        audioCapture.stop();
-        if (fatal[0]) {
-            Ln.w("Mic stream completed with fatal error");
-        } else {
-            Ln.i("Mic stream completed");
-        }
+        runStream(socket, encoder, audioCapture::stop, "Mic");
     }
 
     /**
@@ -915,17 +1000,37 @@ public final class Server {
                         Ln.i("Screen stream ended, accepting next connection...");
                     } catch (Exception e) {
                         Ln.e("Screen daemon stream error: " + e.getMessage(), e);
-                        if (screenSocket != null) {
-                            try { screenSocket.close(); } catch (IOException ignored) {}
+                        try {
+                            Thread.sleep(500);
+                        } catch (InterruptedException ie) {
+                            Thread.currentThread().interrupt();
+                            Ln.w("Screen daemon interrupted during backoff", ie);
                         }
-                        try { Thread.sleep(500); } catch (InterruptedException ignored) {}
+                    } finally {
+                        if (screenSocket != null && !screenSocket.isClosed()) {
+                            try {
+                                screenSocket.close();
+                            } catch (IOException e) {
+                                Ln.w("Screen socket close error: " + e.getMessage());
+                            }
+                        }
                     }
                 }
             } catch (IOException e) {
                 Ln.e("Screen daemon bind failed: " + e.getMessage(), e);
+                try {
+                    Thread.sleep(500);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    Ln.w("Screen daemon interrupted during backoff", ie);
+                }
             } finally {
                 if (screenServer != null) {
-                    try { screenServer.close(); } catch (IOException ignored) {}
+                    try {
+                        screenServer.close();
+                    } catch (IOException e) {
+                        Ln.w("Screen server socket close error: " + e.getMessage());
+                    }
                 }
             }
         }, "screen-daemon");
@@ -963,17 +1068,37 @@ public final class Server {
                         Ln.i("Control stream ended, accepting next connection...");
                     } catch (Exception e) {
                         Ln.e("Control daemon stream error: " + e.getMessage(), e);
-                        if (controlSocket != null) {
-                            try { controlSocket.close(); } catch (IOException ignored) {}
+                        try {
+                            Thread.sleep(500);
+                        } catch (InterruptedException ie) {
+                            Thread.currentThread().interrupt();
+                            Ln.w("Control daemon interrupted during backoff", ie);
                         }
-                        try { Thread.sleep(500); } catch (InterruptedException ignored) {}
+                    } finally {
+                        if (controlSocket != null && !controlSocket.isClosed()) {
+                            try {
+                                controlSocket.close();
+                            } catch (IOException e) {
+                                Ln.w("Control socket close error: " + e.getMessage());
+                            }
+                        }
                     }
                 }
             } catch (IOException e) {
                 Ln.e("Control daemon bind failed: " + e.getMessage(), e);
+                try {
+                    Thread.sleep(500);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    Ln.w("Control daemon interrupted during backoff", ie);
+                }
             } finally {
                 if (controlServer != null) {
-                    try { controlServer.close(); } catch (IOException ignored) {}
+                    try {
+                        controlServer.close();
+                    } catch (IOException e) {
+                        Ln.w("Control server socket close error: " + e.getMessage());
+                    }
                 }
             }
         }, "control-daemon");
@@ -997,23 +1122,7 @@ public final class Server {
         WifiSurfaceEncoder encoder = new WifiSurfaceEncoder(
                 screenCapture, streamer, options);
 
-        try {
-            Completion completion = new Completion(1, true);
-            encoder.start((fatalError) -> completion.addCompleted(fatalError));
-            encoder.join();
-            Ln.i("Screen stream completed");
-        } finally {
-            try {
-                encoder.stop();
-            } catch (Throwable ignored) {}
-            try {
-                screenCapture.stop();
-            } catch (Throwable ignored) {}
-            try {
-                socket.close();
-            } catch (IOException ignored) {}
-            Ln.i("Screen stream cleanup done");
-        }
+        runStream(socket, encoder, screenCapture::stop, "Screen");
     }
 
     /**
@@ -1027,19 +1136,6 @@ public final class Server {
         ControlChannel controlChannel = new ControlChannel(inputStream, outputStream);
         Controller controller = new Controller(controlChannel, cleanUp, options);
 
-        try {
-            Completion completion = new Completion(1, true);
-            controller.start((fatalError) -> completion.addCompleted(fatalError));
-            controller.join();
-            Ln.i("Control stream completed");
-        } finally {
-            try {
-                controller.stop();
-            } catch (Throwable ignored) {}
-            try {
-                socket.close();
-            } catch (IOException ignored) {}
-            Ln.i("Control stream cleanup done");
-        }
+        runStream(socket, controller, null, "Control");
     }
 }

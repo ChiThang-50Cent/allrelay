@@ -30,6 +30,10 @@ type ServerController struct {
 	port      int
 	webServer *WebServer
 
+	// Connect lifecycle
+	connectGen    int
+	connectCancel context.CancelFunc
+
 	// Connection
 	conn *transport.Connection
 
@@ -57,7 +61,6 @@ type StreamController struct {
 	Latency int
 	Bytes   int64
 	Frames  int64
-	stop    func()
 	cancel  context.CancelFunc
 	done    chan struct{} // closed when goroutine fully exits
 	gen     int           // generation counter for stream lifecycle
@@ -83,52 +86,71 @@ func NewServerController(webServer *WebServer) *ServerController {
 }
 
 // Connect connects to a phone and starts streaming.
-// If already connected to the same host, disconnects and reconnects
-// (handles Go server restart after crash).
+// If already connected or connecting, disconnects/cancels first.
 func (sc *ServerController) Connect(host string, port int) error {
 	sc.mu.Lock()
-	defer sc.mu.Unlock()
-
-	// If already connected to same host, force reconnect
-	if sc.connected && sc.host == host {
-		slog.Info("Reconnecting to phone", "host", host)
-		sc.disconnectLocked()
+	if sc.connectCancel != nil {
+		sc.connectCancel()
+		sc.connectCancel = nil
 	}
+	if sc.connected {
+		sc.mu.Unlock()
+		if err := sc.Disconnect(); err != nil {
+			slog.Warn("Disconnect before reconnect had error", "error", err)
+		}
+		sc.mu.Lock()
+	}
+
+	sc.connectGen++
+	gen := sc.connectGen
+	ctx, cancel := context.WithCancel(context.Background())
+	sc.connectCancel = cancel
+	sc.mu.Unlock()
 
 	slog.Info("Connecting to phone", "host", host, "port", port)
 
-	// Only open the speaker TCP stream at connect time (PC → phone audio is
-	// the default thing the user wants right away). Camera, mic, screen and
-	// control are opened lazily via ReconnectStream when the UI toggles them
-	// ON, so we don't pay for streams the user never uses.
-	conn, err := transport.Connect(host, uint16(port),
+	// Dial initial speaker stream (PC → phone audio) outside sc.mu with cancellation.
+	conn, err := transport.ConnectContext(ctx, host, uint16(port),
 		false, // video (screen)
 		false, // camera
 		false, // mic
 		true,  // speaker
 		false) // control
 	if err != nil {
+		sc.mu.Lock()
+		if sc.connectGen == gen {
+			sc.connectCancel = nil
+		}
+		sc.mu.Unlock()
 		return fmt.Errorf("connection failed: %w", err)
 	}
 
+	sc.mu.Lock()
+	if sc.connectGen != gen || ctx.Err() != nil {
+		conn.Close()
+		sc.mu.Unlock()
+		return fmt.Errorf("connection aborted")
+	}
+
+	sc.connectCancel = nil
 	sc.conn = conn
 	sc.connected = true
 	sc.host = host
 	sc.port = port
 
-	// Update web server status
+	sc.launchSpeakerWorkerLocked(conn)
+	sc.mu.Unlock()
+
+	// Update web server status outside sc.mu to avoid lock ordering deadlocks
 	if sc.webServer != nil {
 		phone := &PhoneDevice{
-			ID:   host,
-			IP:   host,
-			Name: fmt.Sprintf("Phone (%s)", host),
+			ID:        host,
+			IP:        host,
+			Name:      fmt.Sprintf("Phone (%s)", host),
+			Connected: true,
 		}
 		sc.webServer.SetConnectionStatus(true, phone)
-	}
-
-	// Start speaker stream by default (PC → phone audio)
-	if conn.HasStream(protocol.StreamSpeaker) {
-		sc.startSpeakerStream()
+		sc.webServer.publishCanonicalStatus()
 	}
 
 	slog.Info("Connected to phone", "host", host)
@@ -138,21 +160,20 @@ func (sc *ServerController) Connect(host string, port int) error {
 // Disconnect disconnects from the phone
 func (sc *ServerController) Disconnect() error {
 	sc.mu.Lock()
-	defer sc.mu.Unlock()
-	return sc.disconnectLocked()
-}
+	if sc.connectCancel != nil {
+		sc.connectCancel()
+		sc.connectCancel = nil
+		sc.connectGen++
+	}
 
-// disconnectLocked disconnects (caller holds lock)
-func (sc *ServerController) disconnectLocked() error {
 	if !sc.connected {
+		sc.mu.Unlock()
 		return nil
 	}
 
 	slog.Info("Disconnecting from phone", "host", sc.host)
 
-	// Restore the display while the current control route and transport are
-	// still live. Ending the Hub lifecycle also prevents a late connector from
-	// becoming active during teardown.
+	// Restore the display while the current control route and transport are still live.
 	if screen, ok := sc.streams["screen"]; ok && screen.hubGen != 0 && sc.webServer != nil {
 		if err := sc.webServer.Hub().EndScreenSession(screen.hubGen); err != nil {
 			slog.Debug("Failed to restore display while disconnecting", "error", err)
@@ -160,47 +181,63 @@ func (sc *ServerController) disconnectLocked() error {
 		screen.hubGen = 0
 	}
 
-	// Stop all streams
+	// Capture conn and active stream workers
+	conn := sc.conn
+	var dones []chan struct{}
 	for _, stream := range sc.streams {
-		if stream.stop != nil {
-			stream.stop()
+		if stream.cancel != nil {
+			stream.cancel()
+			stream.cancel = nil
+		}
+		if stream.done != nil {
+			dones = append(dones, stream.done)
+			stream.done = nil
 		}
 		stream.Running = false
 		stream.Active = false
+		stream.gen++ // bump generation so any lingering worker can never match
 	}
 
-	// Run cleanup functions
-	for _, fn := range sc.cleanup {
-		fn()
-	}
+	cleanups := sc.cleanup
 	sc.cleanup = nil
 
-	// Prevent any in-flight control reconnect from replacing a route while the
-	// transport is closed.
 	sc.controlMu.Lock()
 	sc.controlConnection = nil
 	sc.controlScreenGeneration = 0
 	sc.controlHubGeneration = 0
-	if sc.conn != nil {
-		sc.conn.Close()
-		sc.conn = nil
-	}
 	sc.controlMu.Unlock()
 
+	sc.conn = nil
 	sc.connected = false
 	sc.host = ""
 	sc.port = 0
+	sc.mu.Unlock()
 
-	// Update web server status
+	// Update web server status outside sc.mu
 	if sc.webServer != nil {
 		sc.webServer.SetConnectionStatus(false, nil)
+		sc.webServer.publishCanonicalStatus()
+	}
+
+	// Close transport connection outside lock to unblock all blocking reads/writes immediately
+	if conn != nil {
+		conn.Close()
+	}
+
+	// Run cleanup functions outside lock
+	for _, fn := range cleanups {
+		fn()
+	}
+
+	// Wait for every active worker to exit outside lock
+	for _, done := range dones {
+		<-done
 	}
 
 	return nil
 }
 
 // SyncStreamStatus updates stream statuses from controller into the provided slice.
-// This is called by the HTTP handler before returning status.
 func (sc *ServerController) SyncStreamStatus(streams []StreamStatus) {
 	sc.mu.RLock()
 	defer sc.mu.RUnlock()
@@ -216,130 +253,286 @@ func (sc *ServerController) SyncStreamStatus(streams []StreamStatus) {
 	}
 }
 
+func streamIDFromName(name string) (uint32, bool) {
+	switch name {
+	case "screen":
+		return protocol.StreamScreen, true
+	case "camera":
+		return protocol.StreamCamera, true
+	case "mic":
+		return protocol.StreamMic, true
+	case "speaker":
+		return protocol.StreamSpeaker, true
+	case "control":
+		return protocol.StreamControl, true
+	default:
+		return 0, false
+	}
+}
+
 // ToggleStream toggles a stream on/off
 func (sc *ServerController) ToggleStream(name string, active bool) error {
-	sc.mu.Lock()
-	defer sc.mu.Unlock()
-
-	stream, ok := sc.streams[name]
-	if !ok {
+	streamID, ok := streamIDFromName(name)
+	if !ok || name == "control" {
 		return fmt.Errorf("unknown stream: %s", name)
 	}
 
+	if !active {
+		return sc.stopStream(name, streamID)
+	}
+	return sc.startStream(name, streamID)
+}
+
+func (sc *ServerController) stopStream(name string, streamID uint32) error {
+	sc.mu.Lock()
 	if !sc.connected {
+		sc.mu.Unlock()
 		return fmt.Errorf("not connected to phone")
 	}
 
-	slog.Info("Toggling stream", "stream", name, "active", active)
-	stream.Active = active
-
-	if active && !stream.Running {
-		// Release lock while waiting for old goroutine to stop
-		// (avoids deadlock: old goroutine needs mu to cleanup)
-		cancel := stream.cancel
-		done := stream.done
+	stream, ok := sc.streams[name]
+	if !ok {
 		sc.mu.Unlock()
-
-		if cancel != nil {
-			cancel()
-		}
-		if done != nil {
-			<-done
-		}
-
-		sc.mu.Lock()
-		// Re-read stream state (may have changed)
-		stream, ok = sc.streams[name]
-		if !ok || stream.Running {
-			return nil
-		}
-
-		// Start stream
-		switch name {
-		case "speaker":
-			sc.startSpeakerStreamLocked()
-		case "camera":
-			sc.startCameraStreamLocked()
-		case "mic":
-			go sc.startMicStreamAsync()
-		case "screen":
-			sc.startScreenStreamLocked()
-		}
-	} else if !active && stream.Running {
-		// Release lock while waiting for goroutine to stop
-		// (avoids deadlock: goroutine needs mu to cleanup)
-		cancel := stream.cancel
-		done := stream.done
-		sc.mu.Unlock()
-
-		if cancel != nil {
-			cancel()
-		}
-		if done != nil {
-			<-done
-		}
-
-		sc.mu.Lock()
-		// Re-read stream state (may have changed during unlock)
-		stream, ok = sc.streams[name]
-		if ok {
-			stream.Running = false
-		}
+		return fmt.Errorf("unknown stream: %s", name)
 	}
 
+	cancel := stream.cancel
+	stream.cancel = nil
+	stream.gen++
+	gen := stream.gen
+	stream.Active = false
+
+	if !stream.Running && stream.done == nil {
+		sc.mu.Unlock()
+		if cancel != nil {
+			cancel()
+		}
+		if sc.webServer != nil {
+			sc.webServer.publishCanonicalStatus()
+		}
+		return nil
+	}
+
+	done := stream.done
+	// Keep completion visible until teardown joins, so a concurrent ON also waits.
+	conn := sc.conn
+
+	if name == "screen" && stream.hubGen != 0 && sc.webServer != nil {
+		_ = sc.webServer.Hub().EndScreenSession(stream.hubGen)
+		stream.hubGen = 0
+	}
+
+	if cancel != nil {
+		cancel()
+	}
+	if conn != nil {
+		conn.CloseStream(streamID)
+	}
+	sc.mu.Unlock()
+	if done != nil {
+		<-done
+	}
+
+	sc.mu.Lock()
+	if stream.gen == gen {
+		stream.Running = false
+		stream.Active = false
+		stream.done = nil
+	}
+	sc.mu.Unlock()
+
+	if sc.webServer != nil {
+		sc.webServer.publishCanonicalStatus()
+	}
 	return nil
 }
 
-// startSpeakerStream starts the speaker stream (PC → phone)
-func (sc *ServerController) startSpeakerStream() {
-	sc.startSpeakerStreamLocked()
-}
+func (sc *ServerController) startStream(name string, streamID uint32) error {
+	sc.mu.Lock()
+	if !sc.connected {
+		sc.mu.Unlock()
+		return fmt.Errorf("not connected to phone")
+	}
 
-// startSpeakerStreamLocked starts the speaker stream (must hold lock)
-func (sc *ServerController) startSpeakerStreamLocked() {
-	stream := sc.streams["speaker"]
+	stream, ok := sc.streams[name]
+	if !ok {
+		sc.mu.Unlock()
+		return fmt.Errorf("unknown stream: %s", name)
+	}
+
+	if stream.Running && stream.Active {
+		sc.mu.Unlock()
+		return nil
+	}
+
+	// Wait for any previous stopping worker
+	if stream.Running || stream.done != nil {
+		cancel := stream.cancel
+		done := stream.done
+		conn := sc.conn
+		stream.cancel = nil
+		stream.gen++
+		waitGen := stream.gen
+
+		if cancel != nil {
+			cancel()
+		}
+		if conn != nil {
+			conn.CloseStream(streamID)
+		}
+		sc.mu.Unlock()
+		if done != nil {
+			<-done
+		}
+		sc.mu.Lock()
+		if !sc.connected {
+			sc.mu.Unlock()
+			return fmt.Errorf("not connected to phone")
+		}
+		stream, ok = sc.streams[name]
+		if !ok {
+			sc.mu.Unlock()
+			return fmt.Errorf("unknown stream: %s", name)
+		}
+		if sc.conn != conn || stream.gen != waitGen {
+			sc.mu.Unlock()
+			return fmt.Errorf("%s start aborted: session changed", name)
+		}
+		stream.done = nil
+		stream.Running = false
+	}
+
 	conn := sc.conn
 	if conn == nil {
-		slog.Warn("Speaker stream not available (no connection)")
-		stream.Active = false
-		return
+		sc.mu.Unlock()
+		return fmt.Errorf("not connected to phone")
 	}
-	if !conn.HasStream(protocol.StreamSpeaker) {
-		slog.Info("Speaker: reconnecting TCP")
-		if err := conn.ReconnectStream(sc.host, uint16(sc.port), protocol.StreamSpeaker); err != nil {
-			slog.Error("Speaker: reconnect failed", "error", err)
-			stream.Active = false
-			return
-		}
+	host := sc.host
+	port := sc.port
+	// A pending dial has no worker/done channel yet, but still owns a
+	// cancellation context. Release it before replacing that ownership.
+	if stream.cancel != nil {
+		stream.cancel()
 	}
-
-	// Cancel old goroutine (caller already waited for it via done channel)
-	// Cancel and done are set to new values below
-	stream.Running = false
-	stream.Active = false
-
-	// Create a cancel context for this stream
-	ctx, cancel := context.WithCancel(context.Background())
-	stream.cancel = cancel
-
-	slog.Info("Starting speaker stream")
-	stream.Active = true
-	stream.Running = true
 	stream.gen++
 	gen := stream.gen
 
-	// Metrics callback
-	onMetrics := func(fps, bitrate, latency int, bytes, frames int64) {
-		if sc.webServer != nil {
-			sc.webServer.UpdateStreamMetrics("speaker", fps, bitrate, latency, bytes, frames)
+	// Create context for dial & worker lifecycle so stopStream or Disconnect promptly aborts in-flight dial/backoff
+	ctx, cancel := context.WithCancel(context.Background())
+	stream.cancel = cancel
+	// NOTE: stream.Active remains false while dialing.
+
+	// Screen always opens a fresh TCP session per Scrcpy-like lifecycle
+	needsDial := (name == "screen") || !conn.HasStream(streamID)
+	if name == "screen" {
+		conn.CloseStream(streamID)
+	}
+	sc.mu.Unlock()
+
+	var newSocket net.Conn
+	if needsDial {
+		var dialErr error
+		newSocket, dialErr = transport.ConnectStreamPortContext(ctx, host, uint16(port), streamID)
+		if dialErr != nil {
+			cancel()
+			sc.mu.Lock()
+			if sc.conn == conn && stream.gen == gen {
+				stream.Active = false
+				stream.Running = false
+				stream.cancel = nil
+			}
+			sc.mu.Unlock()
+			if sc.webServer != nil {
+				sc.webServer.publishCanonicalStatus()
+			}
+			return fmt.Errorf("%s connect failed: %w", name, dialErr)
 		}
 	}
 
-	// Start speaker capture in background
-	stream.done = make(chan struct{})
+	sc.mu.Lock()
+	// Generation / state ownership check before install: check context & gen
+	if !sc.connected || sc.conn != conn || stream.gen != gen || ctx.Err() != nil {
+		cancel()
+		if newSocket != nil {
+			newSocket.Close()
+		}
+		if stream.gen == gen {
+			stream.Active = false
+			stream.Running = false
+			stream.cancel = nil
+		}
+		sc.mu.Unlock()
+		return fmt.Errorf("%s start aborted: session changed", name)
+	}
+
+	if newSocket != nil {
+		if err := conn.InstallStream(streamID, newSocket); err != nil {
+			cancel()
+			newSocket.Close()
+			stream.Active = false
+			stream.Running = false
+			stream.cancel = nil
+			sc.mu.Unlock()
+			if sc.webServer != nil {
+				sc.webServer.publishCanonicalStatus()
+			}
+			return err
+		}
+	}
+
+	stream.Running = true
+	stream.Active = true
+	done := make(chan struct{})
+	stream.done = done
+
+	switch name {
+	case "speaker":
+		sc.launchSpeakerWorker(ctx, cancel, conn, stream, gen, done)
+	case "camera":
+		sc.launchCameraWorker(ctx, cancel, conn, stream, gen, done)
+	case "mic":
+		sc.launchMicWorker(ctx, cancel, conn, stream, gen, done)
+	case "screen":
+		sc.launchScreenWorker(ctx, cancel, conn, stream, gen, done, host, port)
+	}
+
+	sc.mu.Unlock()
+
+	if sc.webServer != nil {
+		sc.webServer.publishCanonicalStatus()
+	}
+	return nil
+}
+
+func (sc *ServerController) launchSpeakerWorkerLocked(conn *transport.Connection) {
+	stream := sc.streams["speaker"]
+	if conn == nil || !conn.HasStream(protocol.StreamSpeaker) {
+		stream.Active = false
+		stream.Running = false
+		return
+	}
+
+	stream.Running = true
+	stream.Active = true
+	stream.gen++
+	gen := stream.gen
+
+	ctx, cancel := context.WithCancel(context.Background())
+	stream.cancel = cancel
+	done := make(chan struct{})
+	stream.done = done
+
+	sc.launchSpeakerWorker(ctx, cancel, conn, stream, gen, done)
+}
+
+func (sc *ServerController) launchSpeakerWorker(ctx context.Context, cancel context.CancelFunc, conn *transport.Connection, stream *StreamController, gen int, done chan struct{}) {
+	onMetrics := func(fps, bitrate, latency int, bytes, frames int64) {
+		sc.UpdateStreamMetrics("speaker", gen, conn, fps, bitrate, latency, bytes, frames)
+	}
+	writer := conn.SpeakerWriter()
 	go func() {
-		defer close(stream.done)
-		writer := conn.SpeakerWriter()
+		defer close(done)
+		defer cancel()
 		if err := runSpeakerCapture(ctx, writer, onMetrics); err != nil {
 			if err == context.Canceled {
 				slog.Info("Speaker: stopped by toggle")
@@ -347,67 +540,30 @@ func (sc *ServerController) startSpeakerStreamLocked() {
 				slog.Error("Speaker capture error", "error", err)
 			}
 		}
-		// A failed or stopped speaker stream must not leave a dead TCP
-		// connection marked available for the next toggle.
-		conn.CloseStream(protocol.StreamSpeaker)
+
 		sc.mu.Lock()
-		if stream.Running && stream.gen == gen {
+		wasRunning := stream.Running && stream.gen == gen && sc.conn == conn
+		if wasRunning {
+			conn.CloseStream(protocol.StreamSpeaker)
 			stream.Running = false
 			stream.Active = false
 		}
 		sc.mu.Unlock()
+
+		if wasRunning && sc.webServer != nil {
+			sc.webServer.publishCanonicalStatus()
+		}
 	}()
 }
 
-func (sc *ServerController) startMicStreamAsync() {
-	sc.mu.Lock()
-	defer sc.mu.Unlock()
-	stream, ok := sc.streams["mic"]
-	if !ok || !stream.Active || stream.Running {
-		return
-	}
-	sc.startMicStreamLocked()
-}
-
-// startMicStreamLocked starts the mic stream (phone → PC virtual microphone)
-func (sc *ServerController) startMicStreamLocked() {
-	stream := sc.streams["mic"]
-	if sc.conn == nil {
-		slog.Warn("Mic stream not available (no connection)")
-		stream.Active = false
-		return
-	}
-	if !sc.conn.HasStream(protocol.StreamMic) {
-		slog.Info("Mic: reconnecting TCP")
-		if err := sc.conn.ReconnectStream(sc.host, uint16(sc.port), protocol.StreamMic); err != nil {
-			slog.Error("Mic: reconnect failed", "error", err)
-			stream.Active = false
-			return
-		}
-	}
-
-	stream.Running = false
-	stream.Active = false
-
-	ctx, cancel := context.WithCancel(context.Background())
-	stream.cancel = cancel
-
-	slog.Info("Starting mic stream")
-	stream.Active = true
-	stream.Running = true
-	stream.gen++
-	gen := stream.gen
-
+func (sc *ServerController) launchMicWorker(ctx context.Context, cancel context.CancelFunc, conn *transport.Connection, stream *StreamController, gen int, done chan struct{}) {
 	onMetrics := func(fps, bitrate, latency int, bytes, frames int64) {
-		if sc.webServer != nil {
-			sc.webServer.UpdateStreamMetrics("mic", fps, bitrate, latency, bytes, frames)
-		}
+		sc.UpdateStreamMetrics("mic", gen, conn, fps, bitrate, latency, bytes, frames)
 	}
-
-	stream.done = make(chan struct{})
+	reader := conn.MicStream()
 	go func() {
-		defer close(stream.done)
-		reader := sc.conn.MicStream()
+		defer close(done)
+		defer cancel()
 		if err := runMicCapture(ctx, reader, onMetrics); err != nil {
 			switch err {
 			case context.Canceled:
@@ -418,60 +574,27 @@ func (sc *ServerController) startMicStreamLocked() {
 				slog.Error("Mic capture error", "error", err)
 			}
 		}
+
 		sc.mu.Lock()
-		if stream.Running && stream.gen == gen {
+		wasRunning := stream.Running && stream.gen == gen && sc.conn == conn
+		if wasRunning {
+			conn.CloseStream(protocol.StreamMic)
 			stream.Running = false
 			stream.Active = false
 		}
-		sc.conn.CloseStream(protocol.StreamMic)
 		sc.mu.Unlock()
+
+		if wasRunning && sc.webServer != nil {
+			sc.webServer.publishCanonicalStatus()
+		}
 	}()
 }
 
-// startCameraStream starts the camera stream (phone camera → PC → v4l2loopback)
-func (sc *ServerController) startCameraStream() {
-	sc.startCameraStreamLocked()
-}
-
-// startCameraStreamLocked starts the camera stream (must hold lock)
-func (sc *ServerController) startCameraStreamLocked() {
-	if sc.conn == nil {
-		slog.Warn("Camera stream not available (no connection)")
-		return
-	}
-
-	// Reconnect camera TCP if the old connection was closed by a previous OFF.
-	// This ensures a clean session with a fresh TCP reader — the old demuxer
-	// goroutine was unblocked and should have exited after the TCP close.
-	if !sc.conn.HasStream(protocol.StreamCamera) {
-		slog.Info("Camera: reconnecting TCP")
-		if err := sc.conn.ReconnectStream(sc.host, uint16(sc.port), protocol.StreamCamera); err != nil {
-			slog.Error("Camera: reconnect failed", "error", err)
-			return
-		}
-	}
-
-	stream := sc.streams["camera"]
-
-	// Old goroutine already cancelled + waited by caller
-	stream.Running = false
-	stream.Active = false
-
-	// Create a cancel context for this stream
-	ctx, cancel := context.WithCancel(context.Background())
-	stream.cancel = cancel
-
-	slog.Info("Starting camera stream")
-	stream.Active = true
-	stream.Running = true
-	stream.gen++
-	gen := stream.gen
-
-	// Start camera capture in background (reads from phone, writes to v4l2loopback)
-	stream.done = make(chan struct{})
+func (sc *ServerController) launchCameraWorker(ctx context.Context, cancel context.CancelFunc, conn *transport.Connection, stream *StreamController, gen int, done chan struct{}) {
+	reader := conn.CameraStream()
 	go func() {
-		defer close(stream.done)
-		reader := sc.conn.CameraStream()
+		defer close(done)
+		defer cancel()
 		if err := runCameraCapture(ctx, reader); err != nil {
 			switch err {
 			case context.Canceled:
@@ -482,73 +605,36 @@ func (sc *ServerController) startCameraStreamLocked() {
 				slog.Error("Camera capture error", "error", err)
 			}
 		}
+
 		sc.mu.Lock()
-		if stream.Running && stream.gen == gen {
+		wasRunning := stream.Running && stream.gen == gen && sc.conn == conn
+		if wasRunning {
+			conn.CloseStream(protocol.StreamCamera)
 			stream.Running = false
 			stream.Active = false
 		}
-		// Close camera TCP to force-unblock any orphaned demuxer goroutine
-		// that may still be blocked on ReadHeader. Without this, the TCP
-		// connection stays ESTAB and the old goroutine competes with the
-		// new one on the next camera ON.
-		sc.conn.CloseStream(protocol.StreamCamera)
 		sc.mu.Unlock()
+
+		if wasRunning && sc.webServer != nil {
+			sc.webServer.publishCanonicalStatus()
+		}
 	}()
 }
 
-// startScreenStreamLocked starts the screen stream (must hold lock)
-func (sc *ServerController) startScreenStreamLocked() {
-	if sc.conn == nil {
-		slog.Warn("Screen stream not available (no connection)")
-		return
-	}
-
-	// Scrcpy-like lifecycle: every Screen ON starts a fresh TCP session.
-	// Never reuse an old screen socket across toggles.
+func (sc *ServerController) launchScreenWorker(ctx context.Context, cancel context.CancelFunc, conn *transport.Connection, stream *StreamController, gen int, done chan struct{}, host string, port int) {
 	hub := sc.webServer.Hub()
-	conn := sc.conn
-	host := sc.host
-	port := sc.port
-	conn.CloseStream(protocol.StreamScreen)
-
-	slog.Info("Screen: opening fresh TCP session")
-	if err := conn.ReconnectStream(host, uint16(port), protocol.StreamScreen); err != nil {
-		slog.Error("Screen: reconnect failed", "error", err)
-		return
-	}
 	hubGeneration := hub.BeginScreenSession()
-
-	stream := sc.streams["screen"]
-	stream.Running = false
-	stream.Active = false
-
-	ctx, cancel := context.WithCancel(context.Background())
-	stream.cancel = cancel
-
-	slog.Info("Starting screen stream")
-	stream.Active = true
-	stream.Running = true
-	stream.gen++
 	stream.hubGen = hubGeneration
-	gen := stream.gen
 	videoConn := conn.VideoConn()
 	sc.prepareScreenControlReconnect(conn, gen, hubGeneration)
-	go sc.reconnectScreenControl(conn, host, port, gen, hubGeneration, hub)
+	go sc.reconnectScreenControl(ctx, conn, host, port, gen, hubGeneration, hub)
 
-	stream.done = make(chan struct{})
 	go func() {
-		defer close(stream.done)
+		defer close(done)
+		defer cancel()
 		if err := runScreenCapture(ctx, videoConn, hub, hubGeneration,
 			func(fps, bitrate, latency int, bytes, frames int64) {
-				sc.mu.Lock()
-				if s, ok := sc.streams["screen"]; ok && s.gen == gen {
-					s.FPS = fps
-					s.Bitrate = bitrate
-					s.Latency = latency
-					s.Bytes = bytes
-					s.Frames = frames
-				}
-				sc.mu.Unlock()
+				sc.UpdateStreamMetrics("screen", gen, conn, fps, bitrate, latency, bytes, frames)
 			},
 		); err != nil {
 			switch err {
@@ -564,14 +650,20 @@ func (sc *ServerController) startScreenStreamLocked() {
 			slog.Debug("Failed to restore display after screen stop", "error", err)
 		}
 		sc.closeScreenControl(conn, gen, hubGeneration)
-		sc.mu.Lock()
 		conn.CloseStream(protocol.StreamScreen)
-		if stream.Running && stream.gen == gen && stream.hubGen == hubGeneration {
+
+		sc.mu.Lock()
+		wasRunning := stream.Running && stream.gen == gen && stream.hubGen == hubGeneration && sc.conn == conn
+		if wasRunning {
 			stream.Running = false
 			stream.Active = false
 			stream.hubGen = 0
 		}
 		sc.mu.Unlock()
+
+		if wasRunning && sc.webServer != nil {
+			sc.webServer.publishCanonicalStatus()
+		}
 	}()
 }
 
@@ -583,7 +675,7 @@ func (sc *ServerController) prepareScreenControlReconnect(conn *transport.Connec
 	sc.controlMu.Unlock()
 }
 
-func (sc *ServerController) reconnectScreenControl(conn *transport.Connection, host string, port, screenGeneration int, hubGeneration uint64, hub *Hub) {
+func (sc *ServerController) reconnectScreenControl(ctx context.Context, conn *transport.Connection, host string, port, screenGeneration int, hubGeneration uint64, hub *Hub) {
 	slog.Info("Control: opening fresh TCP session (best-effort)")
 	sc.controlMu.Lock()
 	if sc.controlConnection != conn || sc.controlScreenGeneration != screenGeneration || sc.controlHubGeneration != hubGeneration {
@@ -591,13 +683,27 @@ func (sc *ServerController) reconnectScreenControl(conn *transport.Connection, h
 		return
 	}
 	conn.CloseStream(protocol.StreamControl)
-	err := conn.ReconnectStream(host, uint16(port), protocol.StreamControl)
-	controlConn := conn.ControlConn()
 	sc.controlMu.Unlock()
+
+	controlSocket, err := transport.ConnectStreamPortContext(ctx, host, uint16(port), protocol.StreamControl)
 	if err != nil {
 		slog.Warn("Control: reconnect skipped", "error", err)
 		return
 	}
+
+	sc.controlMu.Lock()
+	if sc.controlConnection != conn || sc.controlScreenGeneration != screenGeneration || sc.controlHubGeneration != hubGeneration || ctx.Err() != nil {
+		controlSocket.Close()
+		sc.controlMu.Unlock()
+		return
+	}
+	if err := conn.InstallStream(protocol.StreamControl, controlSocket); err != nil {
+		controlSocket.Close()
+		sc.controlMu.Unlock()
+		return
+	}
+	controlConn := conn.ControlConn()
+	sc.controlMu.Unlock()
 
 	sc.mu.RLock()
 	stream := sc.streams["screen"]
@@ -658,18 +764,47 @@ func (sc *ServerController) GetHost() string {
 	return sc.host
 }
 
-// GetStreamStatus returns the status of all streams
+// UpdateStreamMetrics updates metrics for a specific stream in the controller.
+// It is guarded by generation and connection ownership.
+func (sc *ServerController) UpdateStreamMetrics(name string, gen int, conn *transport.Connection, fps, bitrate, latency int, bytesSent, frames int64) {
+	sc.mu.Lock()
+	stream, ok := sc.streams[name]
+	if !ok || sc.conn != conn || stream.gen != gen || !stream.Running {
+		sc.mu.Unlock()
+		return
+	}
+	stream.FPS = fps
+	stream.Bitrate = bitrate
+	stream.Latency = latency
+	stream.Bytes = bytesSent
+	stream.Frames = frames
+	sc.mu.Unlock()
+
+	if sc.webServer != nil {
+		sc.webServer.publishCanonicalStatus()
+	}
+}
+
+// GetStreamStatus returns the authoritative status of all streams in fixed order.
 func (sc *ServerController) GetStreamStatus() []StreamStatus {
 	sc.mu.RLock()
 	defer sc.mu.RUnlock()
 
-	statuses := make([]StreamStatus, 0, len(sc.streams))
-	for _, s := range sc.streams {
-		statuses = append(statuses, StreamStatus{
-			Name:   s.Name,
-			Port:   s.Port,
-			Active: s.Active,
-		})
+	names := []string{"screen", "camera", "mic", "speaker"}
+	statuses := make([]StreamStatus, len(names))
+	for i, name := range names {
+		if s, ok := sc.streams[name]; ok {
+			statuses[i] = StreamStatus{
+				Name:      s.Name,
+				Port:      s.Port,
+				Active:    s.Active,
+				FPS:       s.FPS,
+				Bitrate:   s.Bitrate,
+				Latency:   s.Latency,
+				BytesSent: s.Bytes,
+				Frames:    s.Frames,
+			}
+		}
 	}
 	return statuses
 }
@@ -1171,6 +1306,20 @@ func isNetTimeout(err error) bool {
 }
 
 func runCameraCapture(ctx context.Context, reader io.Reader) error {
+	var camConn net.Conn
+	if conn, ok := reader.(net.Conn); ok {
+		camConn = conn
+	}
+
+	// Explicitly close TCP on toggle OFF/cancel so a blocked preamble or demux read wakes up immediately.
+	if camConn != nil {
+		go func() {
+			<-ctx.Done()
+			slog.Info("Camera: context cancelled, closing TCP reader")
+			_ = camConn.Close()
+		}()
+	}
+
 	device := video.GetCameraDevice()
 
 	// Do NOT apply an idle read timeout for the camera (same policy as screen).
@@ -1215,7 +1364,13 @@ func runCameraCapture(ctx context.Context, reader io.Reader) error {
 	// Debug: peek first bytes to diagnose protocol issues
 	peek := make([]byte, 32)
 	n, peekErr := io.ReadFull(reader, peek)
-	slog.Info("Camera: preamble bytes", "n", n, "err", peekErr, "hex", fmt.Sprintf("%x", peek[:n]))
+	if peekErr != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return fmt.Errorf("camera read preamble: %w", peekErr)
+	}
+	slog.Info("Camera: preamble bytes", "n", n, "hex", fmt.Sprintf("%x", peek[:n]))
 
 	// Reconstruct reader with peek bytes prepended
 	combinedReader := io.MultiReader(bytes.NewReader(peek[:n]), reader)
@@ -1279,6 +1434,9 @@ func runCameraCapture(ctx context.Context, reader io.Reader) error {
 	case <-ctx.Done():
 		slog.Info("Camera: context cancelled, stopping")
 		demuxer.Stop()
+		if camConn != nil {
+			_ = camConn.Close()
+		}
 		return ctx.Err()
 	case err := <-pipelineErrCh:
 		if err != nil {

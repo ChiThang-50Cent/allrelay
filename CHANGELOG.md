@@ -1,5 +1,26 @@
 # Changelog
 
+## 2026-10-12
+
+### Fixed
+- Failed phone connections and stream starts return errors instead of reporting requested state as success; status and metrics use the controller's current state.
+- Disconnect, stream OFF, and superseding ON requests cancel pending handshakes; OFF also cancels stalled reads. Stream dials no longer hold the controller lock, and worker cleanup is scoped to its connection and generation.
+- Speaker capture shutdown is idempotent, keeps the stdout pipe immutable, and gives one goroutine ownership of subprocess `Wait`.
+- WebSocket teardown removes disconnected/overflowed clients, closes their sockets, and stops the hub on server shutdown without closing producer-facing queues.
+- Mismatched or malformed browser Origins are rejected for WebSockets and mismatched Origins for mutating APIs. Disconnect requires POST.
+- Listener and dynamic-URL publication failures exit nonzero; the dashboard listener defaults to loopback.
+- Android stream workers stop/join their own processors rather than quitting the shared main looper, and close accepted sockets during teardown.
+- Screen popups survive inactive statuses while ON is pending; decoder bootstrap waits for an active screen session. Popup reload/navigation still does not stop mirroring; actual popup closure stops only Screen.
+- Dashboard connection actions use one handler, preserve connected phone identity/IP, disable unavailable or pending actions, expose accessible stream names, retain API error details, and label latency as estimated.
+
+### Changed
+- Android camera capture now matches the 640×480 output profile at 15 FPS with a 3 Mbps encoder target, independently of the 16 Mbps screen target.
+- Single-file log trimming retains approximately 75% of the configured ceiling, leaving append headroom while preserving newest line boundaries and oversized-record tails.
+
+### Packaging
+- Debian and Android versions advanced to `0.2.18`; Debian archives use root ownership.
+- Documented Go/libopus and JDK/Android SDK source-build prerequisites.
+
 ## 2026-08-30
 
 ### Fixed

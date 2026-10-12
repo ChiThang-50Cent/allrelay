@@ -13,11 +13,13 @@
 package transport
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net"
+	"strconv"
 	"sync"
 	"time"
 
@@ -32,7 +34,9 @@ const (
 
 // Connection holds all TCP connections to the Android server.
 type Connection struct {
-	host string
+	mu     sync.RWMutex
+	host   string
+	closed bool
 
 	video   net.Conn
 	camera  net.Conn
@@ -44,6 +48,11 @@ type Connection struct {
 // Connect establishes TCP connections to the Android server on all requested ports.
 // basePort is typically 5000. All connections are made in parallel.
 func Connect(host string, basePort uint16, connectVideo, connectCamera, connectMic, connectSpeaker, connectControl bool) (*Connection, error) {
+	return ConnectContext(context.Background(), host, basePort, connectVideo, connectCamera, connectMic, connectSpeaker, connectControl)
+}
+
+// ConnectContext establishes TCP connections with context cancellation support.
+func ConnectContext(ctx context.Context, host string, basePort uint16, connectVideo, connectCamera, connectMic, connectSpeaker, connectControl bool) (*Connection, error) {
 	if basePort == 0 {
 		basePort = DefaultBasePort
 	}
@@ -61,7 +70,7 @@ func Connect(host string, basePort uint16, connectVideo, connectCamera, connectM
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			c, err := connectPort(host, port, name)
+			c, err := connectPortContext(ctx, host, port, name)
 			results <- result{name: name, conn: c, err: err}
 		}()
 	}
@@ -70,44 +79,44 @@ func Connect(host string, basePort uint16, connectVideo, connectCamera, connectM
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			c := connectPortWithRetry(host, basePort+0, "video", 6)
-			if c == nil {
-				slog.Error("Video connection failed (mandatory)")
+			c, err := connectPortWithRetryContext(ctx, host, basePort+0, "video", 6)
+			if err != nil {
+				slog.Error("Video connection failed (mandatory)", "error", err)
 			}
-			results <- result{name: "video", conn: c, err: nil}
+			results <- result{name: "video", conn: c, err: err}
 		}()
 	}
 	if connectCamera {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			c := connectPortWithRetry(host, basePort+1, "camera", 8)
-			if c == nil {
-				slog.Warn("Camera connection failed (optional)")
+			c, err := connectPortWithRetryContext(ctx, host, basePort+1, "camera", 8)
+			if err != nil {
+				slog.Warn("Camera connection failed (optional)", "error", err)
 			}
-			results <- result{name: "camera", conn: c, err: nil}
+			results <- result{name: "camera", conn: c, err: err}
 		}()
 	}
 	if connectMic {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			c := connectPortWithRetry(host, basePort+2, "mic", 5)
-			if c == nil {
-				slog.Warn("Mic connection failed (optional)")
+			c, err := connectPortWithRetryContext(ctx, host, basePort+2, "mic", 5)
+			if err != nil {
+				slog.Warn("Mic connection failed (optional)", "error", err)
 			}
-			results <- result{name: "mic", conn: c, err: nil}
+			results <- result{name: "mic", conn: c, err: err}
 		}()
 	}
 	if connectSpeaker {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			c := connectPortWithRetry(host, basePort+3, "speaker", 5)
-			if c == nil {
-				slog.Warn("Speaker connection failed (optional)")
+			c, err := connectPortWithRetryContext(ctx, host, basePort+3, "speaker", 5)
+			if err != nil {
+				slog.Warn("Speaker connection failed", "error", err)
 			}
-			results <- result{name: "speaker", conn: c, err: nil}
+			results <- result{name: "speaker", conn: c, err: err}
 		}()
 	}
 	if connectControl {
@@ -148,29 +157,53 @@ func Connect(host string, basePort uint16, connectVideo, connectCamera, connectM
 }
 
 // connectPortWithRetry attempts to connect to a port with retries.
-// Returns nil if all attempts fail.
-func connectPortWithRetry(host string, port uint16, name string, maxRetries int) net.Conn {
-	for i := 0; i < maxRetries; i++ {
-		conn, err := connectPort(host, port, name)
-		if err == nil {
-			return conn
-		}
-		if i < maxRetries-1 {
-			slog.Debug(name+" port not ready, retrying...", "attempt", i+1, "error", err)
-			time.Sleep(time.Duration(i+1) * 500 * time.Millisecond)
-		}
-	}
-	slog.Warn(name+" connection failed after retries", "attempts", maxRetries)
-	return nil
+// Returns the last error if all attempts fail.
+func connectPortWithRetry(host string, port uint16, name string, maxRetries int) (net.Conn, error) {
+	return connectPortWithRetryContext(context.Background(), host, port, name, maxRetries)
 }
 
-// connectPort connects to a single port, reads the dummy byte,
-// and returns the connection.
+// connectPortWithRetryContext connects with retries and aborts promptly on context cancellation.
+func connectPortWithRetryContext(ctx context.Context, host string, port uint16, name string, maxRetries int) (net.Conn, error) {
+	var lastErr error
+	for i := range maxRetries {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+
+		conn, err := connectPortContext(ctx, host, port, name)
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = err
+		if i < maxRetries-1 {
+			slog.Debug(name+" port not ready, retrying...", "attempt", i+1, "error", err)
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(time.Duration(i+1) * 500 * time.Millisecond):
+			}
+		}
+	}
+	slog.Warn(name+" connection failed after retries", "attempts", maxRetries, "error", lastErr)
+	if lastErr == nil {
+		lastErr = fmt.Errorf("%s connection failed: zero retries", name)
+	}
+	return nil, lastErr
+}
+
+// connectPort connects to a single port, reads the dummy byte, and returns the connection.
 func connectPort(host string, port uint16, name string) (net.Conn, error) {
-	addr := fmt.Sprintf("%s:%d", host, port)
+	return connectPortContext(context.Background(), host, port, name)
+}
+
+// connectPortContext connects to a single port with context cancellation.
+func connectPortContext(ctx context.Context, host string, port uint16, name string) (net.Conn, error) {
+	addr := net.JoinHostPort(host, strconv.Itoa(int(port)))
 
 	dialer := net.Dialer{Timeout: connectTimeout}
-	conn, err := dialer.Dial("tcp", addr)
+	conn, err := dialer.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return nil, fmt.Errorf("dial %s: %w", name, err)
 	}
@@ -184,11 +217,24 @@ func connectPort(host string, port uint16, name string) (net.Conn, error) {
 		}
 	}
 
+	stopDone := make(chan struct{})
+	defer close(stopDone)
+	go func() {
+		select {
+		case <-ctx.Done():
+			conn.Close()
+		case <-stopDone:
+		}
+	}()
+
 	conn.SetReadDeadline(time.Now().Add(15 * time.Second))
 
 	dummy := make([]byte, 1)
 	if _, err := io.ReadFull(conn, dummy); err != nil {
 		conn.Close()
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		return nil, fmt.Errorf("read dummy byte (%s): %w", name, err)
 	}
 
@@ -205,28 +251,48 @@ func connectPort(host string, port uint16, name string) (net.Conn, error) {
 		return conn, nil
 	}
 
-	// The video connection also receives a 64-byte device name.
-	// We don't need it for speaker-only mode, so skip reading it.
 	return conn, nil
 }
 
 // Close closes all connections.
 func (c *Connection) Close() error {
-	var errs []error
+	if c == nil {
+		return nil
+	}
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return nil
+	}
+	c.closed = true
+	var conns []net.Conn
 	if c.video != nil {
-		errs = append(errs, c.video.Close())
+		conns = append(conns, c.video)
+		c.video = nil
 	}
 	if c.camera != nil {
-		errs = append(errs, c.camera.Close())
+		conns = append(conns, c.camera)
+		c.camera = nil
 	}
 	if c.mic != nil {
-		errs = append(errs, c.mic.Close())
+		conns = append(conns, c.mic)
+		c.mic = nil
 	}
 	if c.speaker != nil {
-		errs = append(errs, c.speaker.Close())
+		conns = append(conns, c.speaker)
+		c.speaker = nil
 	}
 	if c.control != nil {
-		errs = append(errs, c.control.Close())
+		conns = append(conns, c.control)
+		c.control = nil
+	}
+	c.mu.Unlock()
+
+	var errs []error
+	for _, conn := range conns {
+		if err := conn.Close(); err != nil {
+			errs = append(errs, err)
+		}
 	}
 	return errors.Join(errs...)
 }
@@ -236,6 +302,8 @@ func (c *Connection) VideoStream() io.Reader {
 	if c == nil {
 		return nil
 	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	return c.video
 }
 
@@ -244,6 +312,8 @@ func (c *Connection) VideoConn() net.Conn {
 	if c == nil {
 		return nil
 	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	return c.video
 }
 
@@ -252,6 +322,8 @@ func (c *Connection) CameraStream() io.Reader {
 	if c == nil {
 		return nil
 	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	return c.camera
 }
 
@@ -260,6 +332,8 @@ func (c *Connection) MicStream() io.Reader {
 	if c == nil {
 		return nil
 	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	return c.mic
 }
 
@@ -268,6 +342,8 @@ func (c *Connection) SpeakerWriter() io.Writer {
 	if c == nil {
 		return nil
 	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	return c.speaker
 }
 
@@ -276,6 +352,8 @@ func (c *Connection) ControlConn() net.Conn {
 	if c == nil {
 		return nil
 	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	return c.control
 }
 
@@ -286,9 +364,11 @@ func (c *Connection) CloseControlConn(conn net.Conn) {
 	if c == nil || conn == nil {
 		return
 	}
+	c.mu.Lock()
 	if c.control == conn {
 		c.control = nil
 	}
+	c.mu.Unlock()
 	conn.Close()
 }
 
@@ -297,6 +377,8 @@ func (c *Connection) HasStream(id uint32) bool {
 	if c == nil {
 		return false
 	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	switch id {
 	case protocol.StreamScreen:
 		return c.video != nil
@@ -319,109 +401,157 @@ func (c *Connection) CloseStream(id uint32) {
 	if c == nil {
 		return
 	}
+	var toClose net.Conn
+	c.mu.Lock()
 	switch id {
 	case protocol.StreamScreen:
 		if c.video != nil {
 			slog.Info("Closing screen TCP connection")
-			c.video.Close()
+			toClose = c.video
 			c.video = nil
 		}
 	case protocol.StreamCamera:
 		if c.camera != nil {
 			slog.Info("Closing camera TCP connection")
-			c.camera.Close()
+			toClose = c.camera
 			c.camera = nil
 		}
 	case protocol.StreamMic:
 		if c.mic != nil {
 			slog.Info("Closing mic TCP connection")
-			c.mic.Close()
+			toClose = c.mic
 			c.mic = nil
 		}
 	case protocol.StreamSpeaker:
 		if c.speaker != nil {
 			slog.Info("Closing speaker TCP connection")
-			c.speaker.Close()
+			toClose = c.speaker
 			c.speaker = nil
 		}
 	case protocol.StreamControl:
 		if c.control != nil {
 			slog.Info("Closing control TCP connection")
-			c.control.Close()
+			toClose = c.control
 			c.control = nil
 		}
 	}
+	c.mu.Unlock()
+	if toClose != nil {
+		toClose.Close()
+	}
+}
+
+// InstallStream installs a dialed socket into the given stream slot, closing any previous socket.
+func (c *Connection) InstallStream(id uint32, streamConn net.Conn) error {
+	if c == nil {
+		if streamConn != nil {
+			streamConn.Close()
+		}
+		return fmt.Errorf("connection is nil")
+	}
+	var oldConn net.Conn
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		if streamConn != nil {
+			streamConn.Close()
+		}
+		return fmt.Errorf("connection is closed")
+	}
+	switch id {
+	case protocol.StreamScreen:
+		oldConn = c.video
+		c.video = streamConn
+	case protocol.StreamCamera:
+		oldConn = c.camera
+		c.camera = streamConn
+	case protocol.StreamMic:
+		oldConn = c.mic
+		c.mic = streamConn
+	case protocol.StreamSpeaker:
+		oldConn = c.speaker
+		c.speaker = streamConn
+	case protocol.StreamControl:
+		oldConn = c.control
+		c.control = streamConn
+	default:
+		c.mu.Unlock()
+		if streamConn != nil {
+			streamConn.Close()
+		}
+		return fmt.Errorf("unknown stream id: %d", id)
+	}
+	c.mu.Unlock()
+
+	if oldConn != nil && oldConn != streamConn {
+		oldConn.Close()
+	}
+	return nil
+}
+
+// ConnectStreamPort connects to a single stream port with retries.
+func ConnectStreamPort(host string, basePort uint16, id uint32) (net.Conn, error) {
+	return ConnectStreamPortContext(context.Background(), host, basePort, id)
+}
+
+// ConnectStreamPortContext connects to a single stream port with context cancellation.
+func ConnectStreamPortContext(ctx context.Context, host string, basePort uint16, id uint32) (net.Conn, error) {
+	var port uint16
+	var name string
+	var retries int
+
+	switch id {
+	case protocol.StreamScreen:
+		port = basePort + 0
+		name = "video"
+		retries = 8
+	case protocol.StreamCamera:
+		port = basePort + 1
+		name = "camera"
+		retries = 8
+	case protocol.StreamMic:
+		port = basePort + 2
+		name = "mic"
+		retries = 5
+	case protocol.StreamSpeaker:
+		port = basePort + 3
+		name = "speaker"
+		retries = 5
+	case protocol.StreamControl:
+		port = basePort + 4
+		name = "control"
+		retries = 8
+	default:
+		return nil, fmt.Errorf("unknown stream id: %d", id)
+	}
+
+	return connectPortWithRetryContext(ctx, host, port, name, retries)
 }
 
 // ReconnectStream re-establishes a single stream connection to the phone.
 // host is the phone IP, basePort is the base port (e.g. 5000).
 // The per-stream port offset is added automatically.
 func (c *Connection) ReconnectStream(host string, basePort uint16, id uint32) error {
+	return c.ReconnectStreamContext(context.Background(), host, basePort, id)
+}
+
+// ReconnectStreamContext re-establishes a single stream connection with context cancellation.
+func (c *Connection) ReconnectStreamContext(ctx context.Context, host string, basePort uint16, id uint32) error {
 	if c == nil {
 		return fmt.Errorf("connection is nil")
 	}
-	switch id {
-	case protocol.StreamScreen:
-		if c.video != nil {
-			c.video.Close()
-			c.video = nil
-		}
-		newConn := connectPortWithRetry(host, basePort+0, "video", 8)
-		if newConn == nil {
-			return fmt.Errorf("screen reconnect failed: %s:%d", host, basePort+0)
-		}
-		c.video = newConn
-		slog.Info("Screen reconnected", "host", host, "port", basePort+0)
-		return nil
-	case protocol.StreamCamera:
-		if c.camera != nil {
-			c.camera.Close()
-			c.camera = nil
-		}
-		newConn := connectPortWithRetry(host, basePort+1, "camera", 8)
-		if newConn == nil {
-			return fmt.Errorf("camera reconnect failed: %s:%d", host, basePort+1)
-		}
-		c.camera = newConn
-		slog.Info("Camera reconnected", "host", host, "port", basePort+1)
-		return nil
-	case protocol.StreamMic:
-		if c.mic != nil {
-			c.mic.Close()
-			c.mic = nil
-		}
-		newConn := connectPortWithRetry(host, basePort+2, "mic", 5)
-		if newConn == nil {
-			return fmt.Errorf("mic reconnect failed: %s:%d", host, basePort+2)
-		}
-		c.mic = newConn
-		slog.Info("Mic reconnected", "host", host, "port", basePort+2)
-		return nil
-	case protocol.StreamSpeaker:
-		if c.speaker != nil {
-			c.speaker.Close()
-			c.speaker = nil
-		}
-		newConn := connectPortWithRetry(host, basePort+3, "speaker", 5)
-		if newConn == nil {
-			return fmt.Errorf("speaker reconnect failed: %s:%d", host, basePort+3)
-		}
-		c.speaker = newConn
-		slog.Info("Speaker reconnected", "host", host, "port", basePort+3)
-		return nil
-	case protocol.StreamControl:
-		if c.control != nil {
-			c.control.Close()
-			c.control = nil
-		}
-		newConn := connectPortWithRetry(host, basePort+4, "control", 8)
-		if newConn == nil {
-			return fmt.Errorf("control reconnect failed: %s:%d", host, basePort+4)
-		}
-		c.control = newConn
-		slog.Info("Control reconnected", "host", host, "port", basePort+4)
-		return nil
-	default:
-		return fmt.Errorf("reconnect not implemented for stream %s", protocol.StreamName(id))
+	c.mu.RLock()
+	if c.closed {
+		c.mu.RUnlock()
+		return fmt.Errorf("connection is closed")
 	}
+	c.mu.RUnlock()
+
+	c.CloseStream(id)
+
+	newConn, err := ConnectStreamPortContext(ctx, host, basePort, id)
+	if err != nil {
+		return fmt.Errorf("reconnect stream %s failed: %w", protocol.StreamName(id), err)
+	}
+	return c.InstallStream(id, newConn)
 }

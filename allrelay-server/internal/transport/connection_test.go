@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"context"
 	"net"
 	"testing"
 	"time"
@@ -185,5 +186,41 @@ func TestReconnectSpeaker(t *testing.T) {
 	case <-accepted:
 	case <-time.After(time.Second):
 		t.Fatal("speaker reconnect did not reach listener")
+	}
+}
+
+// TestConnectFailsWhenRequestedPortOffline verifies that requested port failures are not swallowed.
+func TestConnectFailsWhenRequestedPortOffline(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Failed to listen: %v", err)
+	}
+	port := uint16(listener.Addr().(*net.TCPAddr).Port)
+	listener.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	conn, err := ConnectContext(ctx, "127.0.0.1", port, false, false, false, true, false)
+	if err == nil {
+		if conn != nil {
+			conn.Close()
+		}
+		t.Fatal("expected Connect to fail when speaker port is offline, but it succeeded")
+	}
+}
+
+// TestConnectContextCancellation verifies prompt abort on context cancellation.
+func TestConnectContextCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	start := time.Now()
+	_, err := ConnectStreamPortContext(ctx, "127.0.0.1", 59999, protocol.StreamSpeaker)
+	if err == nil {
+		t.Fatal("expected error on cancelled context")
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("cancellation took too long: %v", elapsed)
 	}
 }

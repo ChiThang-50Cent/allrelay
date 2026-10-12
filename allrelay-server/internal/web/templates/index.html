@@ -43,7 +43,7 @@
                 </div>
                 <div class="panel-body">
                     <div class="input-group">
-                        <input type="text" id="phoneIP" placeholder="Enter phone IP address (e.g., 192.168.1.100)" class="input">
+                        <input type="text" id="phoneIP" placeholder="Enter phone IP address (e.g., 192.168.1.100)" class="input" aria-label="Phone IP address">
                         <button class="btn btn-primary" id="connectBtn">Connect</button>
                     </div>
                     <div class="phone-list" id="phoneList">
@@ -83,8 +83,8 @@
                 <div class="panel-header">
                     <h2>Streams</h2>
                     <div class="stream-actions">
-                        <button class="btn btn-secondary btn-sm" id="enableAllBtn">Enable All</button>
-                        <button class="btn btn-secondary btn-sm" id="disableAllBtn">Disable All</button>
+                        <button class="btn btn-secondary btn-sm" id="enableAllBtn" aria-label="Enable all streams" disabled>Enable All</button>
+                        <button class="btn btn-secondary btn-sm" id="disableAllBtn" aria-label="Disable all streams" disabled>Disable All</button>
                     </div>
                 </div>
                 <div class="panel-body">

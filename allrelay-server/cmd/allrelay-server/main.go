@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -33,7 +34,7 @@ import (
 
 func main() {
 	host := flag.String("host", "", "Phone IP address (direct mode)")
-	webHost := flag.String("web-host", "0.0.0.0", "Web UI host/interface")
+	webHost := flag.String("web-host", "127.0.0.1", "Web UI host/interface")
 	webPort := flag.Int("web-port", 9090, "Web UI port (use 0 for auto-select)")
 	webURLFile := flag.String("web-url-file", "", "Write actual Web UI URL to this file after startup")
 	logFile := flag.String("log-file", defaultLogFilePath(), "Append remote/web logs to this file")
@@ -79,28 +80,26 @@ func main() {
 		}
 	}
 
-	// Start web server
+	// Bind web server listener and publish URL before announcing running state
+	if err := webServer.Listen(); err != nil {
+		slog.Error("Web server failed to listen", "error", err)
+		os.Exit(1)
+	}
+
+	defer webServer.Stop()
+
 	go func() {
-		if err := webServer.Start(); err != nil {
+		if err := webServer.Serve(); err != nil && err != http.ErrServerClosed {
 			slog.Error("Web server error", "error", err)
 		}
 	}()
 
-	defer webServer.Stop()
-
 	if *host != "" {
 		slog.Info("AllRelay running", "mode", "direct", "host", *host)
-	} else if *webPort == 0 {
-		slog.Info("AllRelay running", "mode", "web", "url", "dynamic (use allrelay open or check startup log)")
 	} else {
-		displayHost := *webHost
-		if displayHost == "" || displayHost == "0.0.0.0" || displayHost == "::" {
-			displayHost = "localhost"
-		}
-		slog.Info("AllRelay running", "mode", "web", "url", fmt.Sprintf("http://%s:%d", displayHost, *webPort))
+		slog.Info("AllRelay running", "mode", "web", "url", webServer.URL())
 	}
 	slog.Info("Open browser and connect to your phone!")
-
 	// Wait for interrupt
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)

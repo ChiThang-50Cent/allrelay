@@ -95,12 +95,15 @@ func (w *SlidingFileWriter) trimLocked() error {
 		return nil
 	}
 
-	start := len(data) - int(w.maxBytes)
+	// Leave headroom so sustained logging does not rewrite the retained window
+	// on every subsequent line. The file stays within the configured ceiling.
+	retainBytes := w.maxBytes - w.maxBytes/4
+	start := len(data) - int(retainBytes)
 	if start < 0 {
 		start = 0
 	}
-	if start > 0 {
-		if idx := bytes.IndexByte(data[start:], '\n'); idx >= 0 {
+	if start > 0 && data[start-1] != '\n' {
+		if idx := bytes.IndexByte(data[start:], '\n'); idx >= 0 && start+idx+1 < len(data) {
 			start += idx + 1
 		}
 	}

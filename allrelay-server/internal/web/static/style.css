@@ -561,6 +561,20 @@ body {
     z-index: 1;
 }
 
+.stream-toggle input:disabled {
+    cursor: not-allowed;
+}
+
+.stream-toggle input:disabled + .toggle-slider {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.stream-toggle input:focus-visible + .toggle-slider {
+    outline: 2px solid var(--color-primary);
+    outline-offset: 2px;
+}
+
 .toggle-slider {
     position: absolute;
     cursor: pointer;

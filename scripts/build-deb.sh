@@ -43,7 +43,7 @@ done
 echo "=== [3/3] Build .deb ==="
 VERSION=$(grep Version "$DEB_DIR/DEBIAN/control" | cut -d' ' -f2)
 DEB_FILE="$BIN_DIR/allrelay_${VERSION}_amd64.deb"
-dpkg-deb --build "$DEB_DIR" "$DEB_FILE"
+dpkg-deb --root-owner-group --build "$DEB_DIR" "$DEB_FILE"
 echo ""
 echo "   Package: $DEB_FILE ($(du -h "$DEB_FILE" | cut -f1))"
 echo ""

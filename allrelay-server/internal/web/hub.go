@@ -4,16 +4,76 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/url"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
 )
 
+const (
+	wsWriteDeadline = 5 * time.Second
+)
+
+func checkSameOrigin(r *http.Request) bool {
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin == "" {
+		// Non-browser / tray clients do not send Origin header.
+		return true
+	}
+
+	originURL, err := url.Parse(origin)
+	if err != nil || originURL.Host == "" {
+		return false
+	}
+
+	// Origin grammar: must be http or https, and cannot have userinfo, path, query, or fragment.
+	scheme := strings.ToLower(originURL.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return false
+	}
+	if originURL.User != nil || (originURL.Path != "" && originURL.Path != "/") || originURL.RawQuery != "" || originURL.Fragment != "" {
+		return false
+	}
+
+	reqScheme := "http"
+	if r.TLS != nil {
+		reqScheme = "https"
+	}
+	if scheme != reqScheme {
+		return false
+	}
+
+	reqHost := r.Host
+	if reqHost == "" && r.URL != nil {
+		reqHost = r.URL.Host
+	}
+	if reqHost == "" {
+		return false
+	}
+
+	defaultPort := "80"
+	if scheme == "https" {
+		defaultPort = "443"
+	}
+
+	normalizeHostPort := func(hp string) string {
+		host, port, err := net.SplitHostPort(hp)
+		if err != nil {
+			host = hp
+			port = defaultPort
+		}
+		return strings.ToLower(host) + ":" + port
+	}
+
+	return normalizeHostPort(originURL.Host) == normalizeHostPort(reqHost)
+}
+
 var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool {
-		return true // Allow all origins for development
-	},
+	CheckOrigin: checkSameOrigin,
 }
 
 // Client represents a WebSocket client
@@ -26,16 +86,60 @@ type Client struct {
 	sendBin    chan []byte // binary messages (H.264 NAL units for screen)
 	writeMu    sync.Mutex  // serializes concurrent WriteMessage calls
 	wg         sync.WaitGroup
+	closeOnce  sync.Once
+	closed     chan struct{}
+}
+
+func (c *Client) teardown() {
+	c.closeOnce.Do(func() {
+		close(c.closed)
+		c.conn.Close()
+		if c.hub != nil {
+			c.hub.removeClient(c)
+		}
+	})
+}
+
+func (c *Client) enqueueText(data []byte) bool {
+	select {
+	case <-c.closed:
+		return false
+	default:
+	}
+
+	select {
+	case c.send <- data:
+		return true
+	default:
+		return false
+	}
+}
+
+func (c *Client) enqueueBin(data []byte) bool {
+	select {
+	case <-c.closed:
+		return false
+	default:
+	}
+
+	select {
+	case c.sendBin <- data:
+		return true
+	default:
+		// Screen frames are best-effort; buffer full drops frame without disconnecting client.
+		return false
+	}
 }
 
 // Hub maintains the set of active clients and broadcasts messages
 type Hub struct {
-	clients    map[*Client]bool
-	broadcast  chan []byte
-	register   chan *Client
-	unregister chan *Client
-	mu         sync.RWMutex
-	controlMu  sync.Mutex
+	clients   map[*Client]bool
+	broadcast chan []byte
+	register  chan *Client
+	stop      chan struct{}
+	stopOnce  sync.Once
+	mu        sync.RWMutex
+	controlMu sync.Mutex
 	// Serializes automatic display writes across route replacement and stop
 	// without holding controlMu during a blocked route write.
 	displayMu sync.Mutex
@@ -85,48 +189,84 @@ const maxScreenReplayConfigFrames = 4
 // NewHub creates a new WebSocket hub
 func NewHub() *Hub {
 	return &Hub{
-		clients:    make(map[*Client]bool),
-		broadcast:  make(chan []byte, 256),
-		register:   make(chan *Client),
-		unregister: make(chan *Client),
+		clients:   make(map[*Client]bool),
+		broadcast: make(chan []byte, 256),
+		register:  make(chan *Client),
+		stop:      make(chan struct{}),
 	}
+}
+
+func (h *Hub) removeClient(client *Client) {
+	h.mu.Lock()
+	_, ok := h.clients[client]
+	if ok {
+		delete(h.clients, client)
+	}
+	total := len(h.clients)
+	h.mu.Unlock()
+	if ok {
+		slog.Debug("WebSocket client disconnected", "total", total, "remote_addr", client.remoteAddr)
+	}
+}
+
+// Stop stops the hub event loop and tears down all active clients.
+func (h *Hub) Stop() {
+	h.stopOnce.Do(func() {
+		close(h.stop)
+	})
 }
 
 // Run starts the hub
 func (h *Hub) Run() {
 	for {
 		select {
+		case <-h.stop:
+			h.mu.Lock()
+			var activeClients []*Client
+			for client := range h.clients {
+				activeClients = append(activeClients, client)
+			}
+			h.clients = make(map[*Client]bool)
+			h.mu.Unlock()
+
+			for _, client := range activeClients {
+				client.teardown()
+			}
+			return
+
 		case client := <-h.register:
 			h.mu.Lock()
+			select {
+			case <-h.stop:
+				h.mu.Unlock()
+				client.teardown()
+				continue
+			default:
+			}
 			h.clients[client] = true
 			total := len(h.clients)
 			h.mu.Unlock()
 			slog.Debug("WebSocket client connected", "total", total, "remote_addr", client.remoteAddr)
 
-		case client := <-h.unregister:
-			h.mu.Lock()
-			if _, ok := h.clients[client]; ok {
-				delete(h.clients, client)
-				close(client.send)
-				close(client.sendBin)
-			}
-			total := len(h.clients)
-			h.mu.Unlock()
-			slog.Debug("WebSocket client disconnected", "total", total, "remote_addr", client.remoteAddr)
-
 		case message := <-h.broadcast:
-			// A full client queue removes that client, so this must be an
-			// exclusive lock rather than an RLock.
 			h.mu.Lock()
+			var slowClients []*Client
 			for client := range h.clients {
 				select {
+				case <-client.closed:
+					delete(h.clients, client)
 				case client.send <- message:
 				default:
-					close(client.send)
 					delete(h.clients, client)
+					slowClients = append(slowClients, client)
 				}
 			}
 			h.mu.Unlock()
+
+			for _, client := range slowClients {
+				slog.Warn("WebSocket broadcast queue overflow, disconnecting client", "remote_addr", client.remoteAddr)
+				client.teardown()
+			}
 		}
 	}
 }
@@ -364,11 +504,7 @@ func (h *Hub) BroadcastScreenFrame(generation uint64, data []byte) bool {
 		}
 	}
 	for client := range h.clients {
-		select {
-		case client.sendBin <- data:
-		default:
-			// Client buffer full, drop this frame
-		}
+		client.enqueueBin(data)
 	}
 	h.mu.Unlock()
 	h.controlMu.Unlock()
@@ -461,18 +597,18 @@ func (ws *WebServer) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 		userAgent:  r.UserAgent(),
 		send:       make(chan []byte, 256),
 		sendBin:    make(chan []byte, 64),
+		closed:     make(chan struct{}),
 	}
 
 	ws.hub.register <- client
 
-	// Send initial status
-	ws.mu.RLock()
-	status := ws.currentConn
-	ws.mu.RUnlock()
-
+	// Send initial status using snapshotStatus()
+	status := ws.snapshotStatus()
 	msg := WSMessage{Type: "status", Data: status}
-	data, _ := json.Marshal(msg)
-	client.send <- data
+	data, err := json.Marshal(msg)
+	if err == nil {
+		client.enqueueText(data)
+	}
 
 	go client.writePump()
 	go client.readPump()
@@ -480,10 +616,7 @@ func (ws *WebServer) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 // readPump reads messages from the WebSocket connection
 func (c *Client) readPump() {
-	defer func() {
-		c.hub.unregister <- c
-		c.conn.Close()
-	}()
+	defer c.teardown()
 
 	for {
 		messageType, message, err := c.conn.ReadMessage()
@@ -509,12 +642,12 @@ func (c *Client) readPump() {
 		// Process message based on type
 		switch msg.Type {
 		case "ping":
-			c.send <- []byte(`{"type":"pong"}`)
+			c.enqueueText([]byte(`{"type":"pong"}`))
 		case "screen_init":
 			// The client requests this after applying its initial status update, so
 			// its screen canvas is ready before replayed config/keyframe data arrives.
 			if init := c.hub.screenInitMessage(); init != nil {
-				c.send <- init
+				c.enqueueText(init)
 			}
 		case "control":
 			// Backward-compatible fallback for older clients.
@@ -575,37 +708,45 @@ func (c *Client) writePump() {
 	go c.writeTextPump()
 	go c.writeBinaryPump()
 	c.wg.Wait()
-	c.conn.Close()
+	c.teardown()
 }
 
 // writeTextPump writes text (JSON) messages from c.send.
 func (c *Client) writeTextPump() {
 	defer c.wg.Done()
-	for message := range c.send {
-		c.writeMu.Lock()
-		err := c.conn.WriteMessage(websocket.TextMessage, message)
-		c.writeMu.Unlock()
-		if err != nil {
+	for {
+		select {
+		case <-c.closed:
 			return
+		case message := <-c.send:
+			c.writeMu.Lock()
+			c.conn.SetWriteDeadline(time.Now().Add(wsWriteDeadline))
+			err := c.conn.WriteMessage(websocket.TextMessage, message)
+			c.writeMu.Unlock()
+			if err != nil {
+				c.teardown()
+				return
+			}
 		}
 	}
-	c.writeMu.Lock()
-	c.conn.WriteMessage(websocket.CloseMessage, []byte{})
-	c.writeMu.Unlock()
 }
 
 // writeBinaryPump writes binary (H.264) messages from c.sendBin.
 func (c *Client) writeBinaryPump() {
 	defer c.wg.Done()
-	for data := range c.sendBin {
-		c.writeMu.Lock()
-		err := c.conn.WriteMessage(websocket.BinaryMessage, data)
-		c.writeMu.Unlock()
-		if err != nil {
+	for {
+		select {
+		case <-c.closed:
 			return
+		case data := <-c.sendBin:
+			c.writeMu.Lock()
+			c.conn.SetWriteDeadline(time.Now().Add(wsWriteDeadline))
+			err := c.conn.WriteMessage(websocket.BinaryMessage, data)
+			c.writeMu.Unlock()
+			if err != nil {
+				c.teardown()
+				return
+			}
 		}
 	}
-	c.writeMu.Lock()
-	c.conn.WriteMessage(websocket.CloseMessage, []byte{})
-	c.writeMu.Unlock()
 }

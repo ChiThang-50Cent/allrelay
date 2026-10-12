@@ -88,10 +88,13 @@ function init() {
 
     // Dashboard event listeners
     if (elements.connectBtn) {
-        elements.connectBtn.addEventListener('click', handleConnect);
+        elements.connectBtn.addEventListener('click', handleConnectionToggle);
     }
     if (elements.scanBtn) {
         elements.scanBtn.addEventListener('click', handleScan);
+    }
+    if (elements.phoneList) {
+        elements.phoneList.addEventListener('click', handlePhoneListClick);
     }
     if (elements.enableAllBtn) {
         elements.enableAllBtn.addEventListener('click', () => toggleAllStreams(true));
@@ -116,7 +119,7 @@ function init() {
     }
     if (elements.phoneIP) {
         elements.phoneIP.addEventListener('keypress', (e) => {
-            if (e.key === 'Enter') handleConnect();
+            if (e.key === 'Enter') handleConnectionToggle();
         });
     }
 
@@ -150,9 +153,11 @@ function init() {
     renderStreams();
     renderPhoneList();
 
-    // Load initial status
-    loadStatus().then(loadADBStatus);
+    updateConnectionUI();
 
+    // Load initial discovered phones and status
+    loadDiscoveredPhones();
+    loadStatus().then(loadADBStatus);
     // Connect WebSocket
     connectWebSocket();
 
@@ -227,7 +232,7 @@ function handleWebSocketMessage(msg) {
             // Request cached decoder state once, after the initial status has
             // made the remote canvas active. Periodic metrics also use status
             // messages and must never reset the decoder.
-            if (pageMode === 'remote' && !state.screenInitRequested) {
+            if (pageMode === 'remote' && screenActive && !state.screenInitRequested) {
                 state.screenInitRequested = true;
                 sendWebSocketMessage('screen_init');
             }
@@ -395,8 +400,35 @@ async function loadADBStatus() {
     }
 }
 
-async function handleConnect() {
-    const ip = elements.phoneIP.value.trim();
+let connectionAction = null;
+
+async function loadDiscoveredPhones() {
+    try {
+        const phones = await apiCall(API.phones);
+        if (Array.isArray(phones)) {
+            state.phones = phones;
+            renderPhoneList();
+            if (state.connected) {
+                updateConnectionUI();
+            }
+        }
+    } catch (error) {
+        // Non-critical background load
+    }
+}
+
+async function handleConnectionToggle() {
+    if (connectionAction) return;
+    if (state.connected) {
+        await handleDisconnect();
+    } else {
+        await handleConnect();
+    }
+}
+
+async function handleConnect(targetIp = null) {
+    if (connectionAction) return;
+    const ip = (typeof targetIp === 'string' && targetIp.trim()) ? targetIp.trim() : (elements.phoneIP?.value?.trim() || '');
     
     if (!ip) {
         showError('Please enter a phone IP address');
@@ -410,34 +442,43 @@ async function handleConnect() {
         return;
     }
 
-    elements.connectBtn.disabled = true;
-    elements.connectBtn.textContent = 'Connecting...';
+    connectionAction = 'connect';
+    updateConnectionUI();
 
     try {
         await apiCall(API.connect, 'POST', { ip, port: 5000 });
         state.connected = true;
-        state.currentPhone = { ip, name: `Phone (${ip})` };
-        updateConnectionUI();
+        const matched = state.phones.find(p => p.ip === ip);
+        state.currentPhone = matched ? { ...matched, ip } : { ip, name: `Phone (${ip})` };
         void loadADBStatus();
         showSuccess(`Connected to ${ip}`);
     } catch (error) {
-        showError('Failed to connect. Is the phone running AllRelay server?');
+        showError(error.message || 'Failed to connect. Is the phone running AllRelay server?');
     } finally {
-        elements.connectBtn.disabled = false;
-        elements.connectBtn.textContent = 'Connect';
+        connectionAction = null;
+        updateConnectionUI();
     }
 }
 
 async function handleDisconnect() {
+    if (connectionAction) return;
+    connectionAction = 'disconnect';
+    updateConnectionUI();
+
     try {
         await apiCall(API.disconnect, 'POST');
         state.connected = false;
         state.currentPhone = null;
+        if (elements.phoneIP) {
+            elements.phoneIP.value = '';
+        }
         resetADBState();
-        updateConnectionUI();
         showSuccess('Disconnected');
     } catch (error) {
-        showError('Failed to disconnect');
+        showError(error.message || 'Failed to disconnect');
+    } finally {
+        connectionAction = null;
+        updateConnectionUI();
     }
 }
 
@@ -613,53 +654,133 @@ async function handleADBDisconnect() {
     }
 }
 
+const pendingStreamActions = new Set();
+let isBulkActionInProgress = false;
+
+function areStreamControlsDisabled() {
+    return !state.connected || isBulkActionInProgress || pendingStreamActions.size > 0;
+}
+
+function updateStreamControlsUI() {
+    const disabled = areStreamControlsDisabled();
+    if (elements.enableAllBtn) {
+        elements.enableAllBtn.disabled = disabled;
+    }
+    if (elements.disableAllBtn) {
+        elements.disableAllBtn.disabled = disabled;
+    }
+    if (elements.streamsGrid) {
+        const toggles = elements.streamsGrid.querySelectorAll('.stream-toggle-input');
+        toggles.forEach(toggle => {
+            const streamName = toggle.dataset.stream;
+            const isPending = pendingStreamActions.has(streamName);
+            toggle.disabled = disabled || isPending;
+        });
+    }
+}
+
 async function handleToggleStream(streamName, active) {
+    if (!state.connected) {
+        showError('Connect to a phone first');
+        renderStreams();
+        updateStreamControlsUI();
+        return;
+    }
+
+    if (pendingStreamActions.has(streamName)) {
+        return;
+    }
+
+    const currentStream = getStream(streamName);
+    if (currentStream && Boolean(currentStream.active) === Boolean(active)) {
+        renderStreams();
+        updateStreamControlsUI();
+        return;
+    }
+
     let popupOpened = false;
     if (pageMode === 'dashboard' && streamName === 'screen' && active) {
         popupOpened = openRemotePopup();
         if (!popupOpened) {
             showError('Popup blocked. Please allow popups for AllRelay.');
             renderStreams();
+            updateStreamControlsUI();
             return;
         }
     }
 
+    pendingStreamActions.add(streamName);
+    updateStreamControlsUI();
+
     try {
         await apiCall(API.toggleStream, 'POST', { stream: streamName, active });
-        
-        // Update local state
-        const stream = state.streams.find(s => s.name === streamName);
-        if (stream) {
-            stream.active = active;
-        }
+
+        // Read canonical status after result; no unconditional requested Active
+        await loadStatus();
+
+        const canonical = getStream(streamName);
+        const succeeded = canonical ? Boolean(canonical.active) === Boolean(active) : true;
 
         if (streamName === 'screen') {
-            if (!active) {
+            if (!canonical?.active) {
                 closeRemotePopup();
             } else if (pageMode === 'dashboard') {
                 focusRemotePopup();
             }
         }
-        
-        renderStreams();
-        updateStatusDisplay();
-        updateRemoteUI();
-        
-        showSuccess(`${streamName} ${active ? 'enabled' : 'disabled'}`);
+
+        if (succeeded) {
+            showSuccess(`${streamName} ${active ? 'enabled' : 'disabled'}`);
+        } else {
+            showError(`Failed to update ${streamName}: server state does not match the request`);
+        }
     } catch (error) {
         if (popupOpened) {
             closeRemotePopup();
         }
-        showError(`Failed to toggle ${streamName}`);
-        // Revert UI on error
+        // Preserve API error details
+        const details = error.message ? error.message : 'Unknown error';
+        showError(`Failed to toggle ${streamName}: ${details}`);
+
+        // Rollback state truthfully by reading canonical status
+        try {
+            await loadStatus();
+        } catch (_) {
+            renderStreams();
+        }
+    } finally {
+        pendingStreamActions.delete(streamName);
+        updateStreamControlsUI();
         renderStreams();
+        updateStatusDisplay();
+        updateRemoteUI();
     }
 }
 
 function toggleAllStreams(active) {
-    state.streams.forEach(stream => {
-        handleToggleStream(stream.name, active);
-    });
+    if (!state.connected || isBulkActionInProgress || pendingStreamActions.size > 0) {
+        return;
+    }
+
+    // Bulk controls avoid duplicate same-stream actions
+    const targets = state.streams.filter(s => Boolean(s.active) !== Boolean(active) && !pendingStreamActions.has(s.name));
+    if (targets.length === 0) {
+        return;
+    }
+
+    isBulkActionInProgress = true;
+    updateStreamControlsUI();
+
+    (async () => {
+        try {
+            for (const target of targets) {
+                await handleToggleStream(target.name, active);
+            }
+        } finally {
+            isBulkActionInProgress = false;
+            updateStreamControlsUI();
+        }
+    })();
 }
 
 // ============================================
@@ -668,24 +789,36 @@ function toggleAllStreams(active) {
 
 function renderStreams() {
     if (!elements.streamsGrid) return;
-    elements.streamsGrid.innerHTML = state.streams.map(stream => `
+    const controlsDisabled = areStreamControlsDisabled();
+    elements.streamsGrid.innerHTML = state.streams.map(stream => {
+        const displayName = stream.name.charAt(0).toUpperCase() + stream.name.slice(1);
+        const inputId = `stream-toggle-${stream.name}`;
+        const isPending = pendingStreamActions.has(stream.name);
+        const isDisabled = controlsDisabled || isPending;
+        return `
         <div class="stream-card ${stream.active ? 'active' : 'inactive'}" data-stream="${stream.name}">
             <div class="stream-header">
                 <div class="stream-icon">
-                    <span>${stream.icon}</span>
+                    <span aria-hidden="true">${stream.icon}</span>
                 </div>
-                <label class="stream-toggle">
-                    <input type="checkbox" class="stream-toggle-input" 
+                <label class="stream-toggle" for="${inputId}">
+                    <input type="checkbox" 
+                           id="${inputId}"
+                           name="${inputId}"
+                           class="stream-toggle-input" 
                            data-stream="${stream.name}"
-                           ${stream.active ? 'checked' : ''}>
-                    <span class="toggle-slider"></span>
+                           aria-label="Toggle ${displayName} stream"
+                           ${stream.active ? 'checked' : ''}
+                           ${isDisabled ? 'disabled' : ''}>
+                    <span class="toggle-slider" aria-hidden="true"></span>
                 </label>
             </div>
-            <div class="stream-name">${stream.name.charAt(0).toUpperCase() + stream.name.slice(1)}</div>
+            <div class="stream-name">${displayName}</div>
             <div class="stream-port">${stream.name === 'screen' ? 'Opens popup remote window' : `Port ${stream.port}`}</div>
             ${stream.active ? renderStreamMetrics(stream) : ''}
         </div>
-    `).join('');
+    `;
+    }).join('');
 }
 
 function renderStreamMetrics(stream) {
@@ -708,7 +841,7 @@ function renderStreamMetrics(stream) {
     }
     
     if (stream.latency > 0) {
-        metrics.push(`<div class="metric"><span class="metric-value">${stream.latency}ms</span><span class="metric-label">Latency</span></div>`);
+        metrics.push(`<div class="metric" title="Estimated latency"><span class="metric-value">${stream.latency}ms</span><span class="metric-label">Est. Latency</span></div>`);
     }
     
     if (metrics.length === 0) {
@@ -716,6 +849,52 @@ function renderStreamMetrics(stream) {
     }
     
     return `<div class="stream-metrics">${metrics.join('')}</div>`;
+}
+
+function isPhoneConnected(phone) {
+    if (!state.connected || !state.currentPhone) return false;
+    const currentIp = state.currentPhone.ip?.trim();
+    if (currentIp && phone.ip && currentIp === phone.ip.trim()) {
+        return true;
+    }
+    const currentId = state.currentPhone.id?.trim();
+    if (currentId && phone.id && currentId === phone.id.trim()) {
+        return true;
+    }
+    return false;
+}
+
+function getBestPhoneIdentity(phone) {
+    if (!phone) return null;
+    const ip = phone.ip?.trim() || '';
+    let name = phone.name?.trim() || '';
+    if ((!name || name === `Phone (${ip})` || name === ip) && ip) {
+        const matched = state.phones.find(p => p.ip === ip && p.name && p.name !== `Phone (${ip})` && p.name !== ip);
+        if (matched) {
+            name = matched.name.trim();
+        }
+    }
+    return {
+        id: phone.id || ip,
+        ip,
+        name: name || (ip ? `Phone (${ip})` : 'Connected Phone'),
+    };
+}
+
+function formatConnectedIdentity(phone) {
+    if (!phone) return 'Connected';
+    const resolved = getBestPhoneIdentity(phone);
+    const name = resolved?.name?.trim() || '';
+    const ip = resolved?.ip?.trim() || '';
+    if (name && ip) {
+        if (name === ip || name === `Phone (${ip})`) {
+            return `Connected: ${ip}`;
+        }
+        return `Connected: ${name} (${ip})`;
+    }
+    if (name) return `Connected: ${name}`;
+    if (ip) return `Connected: ${ip}`;
+    return 'Connected';
 }
 
 function renderPhoneList() {
@@ -734,20 +913,39 @@ function renderPhoneList() {
         return;
     }
 
-    elements.phoneList.innerHTML = state.phones.map(phone => `
-        <div class="phone-item ${phone.connected ? 'connected' : ''}" data-phone-id="${phone.id}">
-            <div class="phone-info">
-                <div class="phone-name">${escapeHtml(phone.name)}</div>
-                <div class="phone-ip">${escapeHtml(phone.ip)}</div>
+    elements.phoneList.innerHTML = state.phones.map(phone => {
+        const connected = isPhoneConnected(phone);
+        const displayName = phone.name || (phone.ip ? `Phone (${phone.ip})` : 'Phone');
+        return `
+            <div class="phone-item ${connected ? 'connected' : ''}" data-phone-id="${escapeHtml(phone.id || phone.ip)}">
+                <div class="phone-info">
+                    <div class="phone-name">${escapeHtml(displayName)}</div>
+                    <div class="phone-ip">${escapeHtml(phone.ip)}</div>
+                </div>
+                <div class="phone-actions">
+                    <button class="btn btn-sm ${connected ? 'btn-danger' : 'btn-primary'}" 
+                            data-phone-action="${connected ? 'disconnect' : 'connect'}"
+                            data-phone-ip="${escapeHtml(phone.ip)}"
+                            aria-label="${connected ? 'Disconnect' : 'Connect'} ${escapeHtml(displayName)}"
+                            ${connectionAction ? 'disabled' : ''}>
+                        ${connected ? 'Disconnect' : 'Connect'}
+                    </button>
+                </div>
             </div>
-            <div class="phone-actions">
-                <button class="btn btn-sm ${phone.connected ? 'btn-danger' : 'btn-primary'}" 
-                        onclick="${phone.connected ? 'handleDisconnect()' : `connectToPhone('${phone.ip}')`}">
-                    ${phone.connected ? 'Disconnect' : 'Connect'}
-                </button>
-            </div>
-        </div>
-    `).join('');
+        `;
+    }).join('');
+}
+
+function handlePhoneListClick(e) {
+    const btn = e.target.closest('button[data-phone-action]');
+    if (!btn || btn.disabled) return;
+    const action = btn.dataset.phoneAction;
+    const ip = btn.dataset.phoneIp;
+    if (action === 'disconnect') {
+        handleDisconnect();
+    } else if (action === 'connect') {
+        connectToPhone(ip);
+    }
 }
 
 function updateConnectionUI() {
@@ -756,28 +954,33 @@ function updateConnectionUI() {
         elements.statusDot.className = `status-dot ${state.connected ? 'connected' : 'disconnected'}`;
     }
     if (elements.statusText) {
-        elements.statusText.textContent = state.connected ? 'Connected' : 'Disconnected';
+        elements.statusText.textContent = state.connected 
+            ? formatConnectedIdentity(state.currentPhone) 
+            : 'Disconnected';
     }
 
-    // Update connect button (dashboard only)
-    if (elements.connectBtn && elements.phoneIP) {
+    // Update connect button and phone IP input (dashboard only)
+    if (elements.connectBtn) {
+        elements.connectBtn.disabled = connectionAction !== null;
+        elements.connectBtn.textContent = connectionAction === 'connect'
+            ? 'Connecting...'
+            : connectionAction === 'disconnect' ? 'Disconnecting...' : state.connected ? 'Disconnect' : 'Connect';
+        elements.connectBtn.className = state.connected ? 'btn btn-danger' : 'btn btn-primary';
+    }
+
+    if (elements.phoneIP) {
         if (state.connected) {
-            elements.connectBtn.textContent = 'Disconnect';
-            elements.connectBtn.className = 'btn btn-danger';
-            elements.connectBtn.onclick = handleDisconnect;
             elements.phoneIP.disabled = true;
+            if (state.currentPhone?.ip) {
+                elements.phoneIP.value = state.currentPhone.ip;
+            }
         } else {
-            elements.connectBtn.textContent = 'Connect';
-            elements.connectBtn.className = 'btn btn-primary';
-            elements.connectBtn.onclick = handleConnect;
-            elements.phoneIP.disabled = false;
-            elements.phoneIP.value = '';
+            elements.phoneIP.disabled = connectionAction !== null;
         }
     }
 
+    updateStreamControlsUI();
     updateADBUI();
-
-    // Re-render phone list to update button states
     renderPhoneList();
 }
 
@@ -795,17 +998,14 @@ function updateConnectionStatus(status) {
         resetADBState();
     }
 
-    if (connectionChanged) {
-        if (!state.connected) {
-            state.remoteModeLogEmitted = false;
-            resetClipboardState();
-            closeRemotePopup();
-            resetADBState();
-        }
-        updateConnectionUI();
-    } else {
-        updateADBUI();
+    if (!state.connected) {
+        state.remoteModeLogEmitted = false;
+        resetClipboardState();
+        closeRemotePopup();
+        resetADBState();
     }
+
+    updateConnectionUI();
 
     if (status.streams) {
         status.streams.forEach(s => {
@@ -819,7 +1019,10 @@ function updateConnectionStatus(status) {
 
     const screen = getStream('screen');
     showScreenViewer(Boolean(screen?.active && state.connected));
-    if (pageMode === 'dashboard' && !screen?.active) {
+    if (pageMode === 'remote' && !screenActive) {
+        state.screenInitRequested = false;
+    }
+    if (pageMode === 'dashboard' && !screen?.active && !pendingStreamActions.has('screen')) {
         closeRemotePopup();
     }
     updateStatusDisplay();
@@ -915,7 +1118,7 @@ function closeRemotePopup() {
 }
 
 function checkRemotePopupLifecycle() {
-    if (pageMode !== 'dashboard') return;
+    if (pageMode !== 'dashboard' || pendingStreamActions.has('screen')) return;
     const screen = getStream('screen');
     if (!state.remotePopup || !state.remotePopup.closed) {
         if (!screen?.active) {
@@ -1133,10 +1336,16 @@ function handleRemotePaste(e) {
     sendControlPacket(buildSetClipboardControlMessage(text, true), { force: true });
 }
 
-function connectToPhone(ip) {
-    elements.phoneIP.value = ip;
-    handleConnect();
+async function connectToPhone(ip) {
+    if (connectionAction || !ip) return;
+    if (elements.phoneIP) {
+        elements.phoneIP.value = ip;
+    }
+    await handleConnect(ip);
 }
+
+window.connectToPhone = connectToPhone;
+window.handleDisconnect = handleDisconnect;
 
 // ============================================
 // Initialize on DOM ready

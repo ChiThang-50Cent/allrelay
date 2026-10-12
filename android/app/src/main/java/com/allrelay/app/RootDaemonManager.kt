@@ -14,7 +14,7 @@ object RootDaemonManager {
     private const val SERVER_ASSET_NAME = "allrelay.jar"
     private const val ROOT_LOG_PATH = "/data/local/tmp/allrelay-unified.log"
     private const val PROCESS_PATTERN = "com.genymobile.scrcpy.Server"
-    private const val CAMERA_SAFE_SIZE = "1280x720"
+    private const val CAMERA_SAFE_SIZE = "640x480"
     private const val CAMERA_SAFE_FPS = 15
     private const val CAMERA_SAFE_VIDEO_BIT_RATE = 3_000_000
     private const val SCREEN_VIDEO_BIT_RATE = 16_000_000
@@ -447,8 +447,10 @@ ${screenTuningArgs}${cameraTuningArgs}  daemon=true \
 
         // Camera profile tuned for stability on thermally constrained phones.
         // camera_size/camera_fps only affect the camera path.
-        // video_bit_rate/max_fps are global scrcpy options, so only apply them
-        // in camera-only mode to avoid unexpectedly degrading screen mirroring.
+        // video_bit_rate is applied for camera independently because WifiSurfaceEncoder
+        // selects camera/screen bitrates separately (screen uses screen_video_bit_rate).
+        // max_fps is a global scrcpy option, so only apply it in camera-only mode
+        // to avoid inadvertently constraining screen mirroring framerate.
         return buildString {
             append("  camera_size=")
             append(CAMERA_SAFE_SIZE)
@@ -456,10 +458,10 @@ ${screenTuningArgs}${cameraTuningArgs}  daemon=true \
             append("  camera_fps=")
             append(CAMERA_SAFE_FPS)
             append(" \\\n")
+            append("  video_bit_rate=")
+            append(CAMERA_SAFE_VIDEO_BIT_RATE)
+            append(" \\\n")
             if (!config.screen) {
-                append("  video_bit_rate=")
-                append(CAMERA_SAFE_VIDEO_BIT_RATE)
-                append(" \\\n")
                 append("  max_fps=")
                 append(CAMERA_SAFE_FPS)
                 append(" \\\n")

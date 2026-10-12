@@ -47,9 +47,11 @@ AllRelay streams media directly over Wi‑Fi between Android and Ubuntu. The Ubu
 - Ubuntu 22.04+
 - PipeWire / pipewire-pulse
 - `v4l2loopback`
-- Go 1.22+ (only if building from source)
+- Go 1.24+, `pkg-config`, and `libopus-dev` (only if building the backend from source)
 
 ## Build
+
+For APK builds, use a full JDK 21 (including `javac`) and an Android SDK with platforms 34/36 and build tools 34/36. Set `JAVA_HOME` and `ANDROID_HOME` to those installations before running the build scripts.
 
 ### Main package build
 
@@ -119,6 +121,7 @@ allrelay/
 - Discovery uses a route-aware **UDP subnet scan**.
 - Screen/control use the **raw binary scrcpy control protocol**, not JSON.
 - The packaged Linux services are on-demand **user services**, not system services.
+- The dashboard listener defaults to loopback. Mismatched browser Origins are rejected; non-browser clients without an Origin header remain supported. These checks are not authentication.
 
 ## Related docs
 

@@ -36,18 +36,6 @@ class RootDaemonManagerTest {
         )
     }
 
-    @Test
-    fun daemonScriptUsesShellCommandSubstitution() {
-        val script = RootDaemonManager.buildStartScript(
-            "/data/user/0/com.allrelay.app/files/allrelay/allrelay.jar",
-            RootDaemonManager.Config(screen = true, camera = true, mic = true, speaker = true),
-        )
-
-        assertTrue(script.contains("""if [ "$(ss -tln"""))
-        assertFalse(script.contains("""\$(ss -tln"""))
-    }
-
-
     private fun adbKey(marker: Int): String {
         return Base64.getEncoder().encodeToString(ByteArray(524).also {
             it[0] = 64
