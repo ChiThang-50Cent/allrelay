@@ -1,5 +1,17 @@
 # Changelog
 
+## 2026-10-15 — v0.2.19
+
+### Changed
+- Screen startup now checks the physical fold state, dynamically requests a supported opened state only when needed, and keeps physical panels off while mirroring the main display.
+- Fold overrides belong to the video session and are released on stop or failure; external overrides are preserved, conflicting requests reject startup, and display restoration is suppressed while the phone remains folded.
+
+### Fixed
+- Starting Screen from a sleeping phone wakes the logical display on both folded and unfolded paths without requiring a separate manual wake action.
+
+### Packaging
+- Debian and Android versions advanced to `0.2.19` with Android `versionCode` 4.
+
 ## 2026-10-12
 
 ### Fixed

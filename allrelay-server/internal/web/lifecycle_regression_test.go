@@ -417,3 +417,75 @@ func TestLaterOFFCancelsRestartWaitingForPreviousWorker(t *testing.T) {
 		}
 	}
 }
+
+// TestScreenEarlyFailureReturnsActionableError verifies that if the Android daemon aborts
+// folded startup before sending the dummy handshake byte, ToggleStream("screen", true)
+// returns an actionable error, does not mark screen active, and does not enter a black stream state.
+func TestScreenEarlyFailureReturnsActionableError(t *testing.T) {
+	screenListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Failed to listen: %v", err)
+	}
+	defer screenListener.Close()
+
+	port := screenListener.Addr().(*net.TCPAddr).Port
+	basePort := port // StreamScreen port is basePort + 0
+
+	// Accept screen connection and immediately close without sending dummy byte 0xAB
+	// (simulating daemon aborting folded init due to fold state preparation failure)
+	go func() {
+		for {
+			conn, err := screenListener.Accept()
+			if err != nil {
+				return
+			}
+			conn.Close()
+		}
+	}()
+
+	ws := NewWebServer(DefaultConfig())
+	defer ws.Stop()
+
+	sc := ws.controller
+	conn, err := transport.ConnectContext(context.Background(), "127.0.0.1", uint16(basePort), false, false, false, false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sc.mu.Lock()
+	sc.conn, sc.connected, sc.host, sc.port = conn, true, "127.0.0.1", basePort
+	sc.mu.Unlock()
+
+	err = sc.ToggleStream("screen", true)
+	if err == nil {
+		t.Fatal("expected ToggleStream(\"screen\", true) to fail when daemon closes before handshake")
+	}
+
+	snap := ws.snapshotStatus()
+	for _, s := range snap.Streams {
+		if s.Name == "screen" && s.Active {
+			t.Fatal("screen was marked active in snapshot despite failed startup")
+		}
+	}
+
+	sc.mu.RLock()
+	if screenStream, ok := sc.streams["screen"]; ok {
+		if screenStream.Running || screenStream.Active {
+			sc.mu.RUnlock()
+			t.Fatal("screen stream was marked running/active in controller despite failed startup")
+		}
+	}
+	sc.mu.RUnlock()
+
+	// Also verify that /api/streams/toggle HTTP endpoint returns HTTP 400
+	body, _ := json.Marshal(map[string]interface{}{
+		"stream": "screen",
+		"active": true,
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/streams/toggle", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	ws.handleToggleStream(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected HTTP 400 Bad Request on failed stream toggle, got %d", rec.Code)
+	}
+}

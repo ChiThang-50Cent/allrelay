@@ -185,6 +185,10 @@ public final class Device {
         return SurfaceControl.setDisplayPowerMode(d, mode);
     }
 
+    public static boolean isPhysicallyFolded() {
+        return FoldManager.getInstance().isPhysicallyFolded();
+    }
+
     public static boolean powerOffScreen(int displayId) {
         assert displayId != DISPLAY_ID_NONE;
 

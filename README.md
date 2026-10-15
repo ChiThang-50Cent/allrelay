@@ -6,7 +6,7 @@ AllRelay streams media directly over Wi‑Fi between Android and Ubuntu. The Ubu
 
 ## What it does
 
-- **Screen + control**: Android screen in a dedicated browser popup with touch/keyboard control
+- **Screen + control**: Android screen in a dedicated browser popup with touch/keyboard control and fold-aware, physical-panel-off mirroring
 - **Camera**: Android camera exposed to Linux apps via `v4l2loopback`
 - **Microphone**: Android mic exposed as a Linux audio input
 - **Speaker**: PC audio played on the phone speaker

@@ -854,6 +854,13 @@ public class Controller implements AsyncProcessor, VirtualDisplayListener {
     }
 
     private void setDisplayPower(boolean on) {
+        if (on && Device.isPhysicallyFolded()) {
+            Ln.i("Device is physically folded; skipping display power ON to protect folded panel");
+            if (cleanUp != null) {
+                cleanUp.setRestoreDisplayPower(false);
+            }
+            return;
+        }
         // Change the power of the main display when mirroring a virtual display
         int targetDisplayId = displayId != Device.DISPLAY_ID_NONE ? displayId : 0;
         boolean setDisplayPowerOk = Device.setDisplayPower(targetDisplayId, on);

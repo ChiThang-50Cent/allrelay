@@ -261,8 +261,12 @@ public final class CleanUp {
                 Ln.i("Power off screen");
                 Device.powerOffScreen(targetDisplayId);
             } else if (restoreDisplayPower) {
-                Ln.i("Restoring display power");
-                Device.setDisplayPower(targetDisplayId, true);
+                if (!Device.isPhysicallyFolded()) {
+                    Ln.i("Restoring display power");
+                    Device.setDisplayPower(targetDisplayId, true);
+                } else {
+                    Ln.i("Device is physically folded; skipping display power restore");
+                }
             }
         }
 

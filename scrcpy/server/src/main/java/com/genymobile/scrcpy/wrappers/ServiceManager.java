@@ -46,6 +46,22 @@ public final class ServiceManager {
             throw new AssertionError(e);
         }
     }
+    static IInterface getServiceOrNull(String service, String type) {
+        try {
+            IBinder binder = (IBinder) GET_SERVICE_METHOD.invoke(null, service);
+            if (binder == null) {
+                return null;
+            }
+            Method asInterfaceMethod = Class.forName(type + "$Stub").getMethod("asInterface", IBinder.class);
+            return (IInterface) asInterfaceMethod.invoke(null, binder);
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    public static IInterface getDeviceStateManager() {
+        return getServiceOrNull("device_state", "android.hardware.devicestate.IDeviceStateManager");
+    }
 
     public static WindowManager getWindowManager() {
         if (windowManager == null) {

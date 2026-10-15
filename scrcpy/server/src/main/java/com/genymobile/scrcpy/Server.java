@@ -18,6 +18,7 @@ import com.genymobile.scrcpy.control.ControlChannel;
 import com.genymobile.scrcpy.control.Controller;
 import com.genymobile.scrcpy.device.DesktopConnection;
 import com.genymobile.scrcpy.device.Device;
+import com.genymobile.scrcpy.device.FoldManager;
 import com.genymobile.scrcpy.device.Streamer;
 import com.genymobile.scrcpy.device.WifiConnection;
 import com.genymobile.scrcpy.device.WifiStreamer;
@@ -991,10 +992,7 @@ public final class Server {
                         Ln.i("Waiting for screen client on port " + screenPort + "...");
                         screenSocket = screenServer.accept();
                         screenSocket.setTcpNoDelay(true);
-                        screenSocket.getOutputStream().write(new byte[]{(byte) 0xAB});
-                        screenSocket.getOutputStream().flush();
                         Ln.i("Screen client connected from " + screenSocket.getRemoteSocketAddress());
-
                         runScreenStream(screenSocket, options);
 
                         Ln.i("Screen stream ended, accepting next connection...");
@@ -1112,17 +1110,24 @@ public final class Server {
      * encode with MediaCodec H.264, stream to client socket via WifiStreamer.
      */
     private static void runScreenStream(java.net.Socket socket, Options options) throws Exception {
-        OutputStream outputStream = socket.getOutputStream();
+        FoldManager foldManager = FoldManager.getInstance();
+        try (FoldManager.FoldSession foldSession = foldManager.prepareScreenSession()) {
+            // Write 0xAB handshake byte ONLY after screen session is prepared and display is ready
+            socket.getOutputStream().write(new byte[]{(byte) 0xAB});
+            socket.getOutputStream().flush();
 
-        // Pass null for VirtualDisplayListener for now — screen can run standalone.
-        ScreenCapture screenCapture = new ScreenCapture(null, options);
-        WifiStreamer streamer = new WifiStreamer(
-                outputStream, options.getVideoCodec(), StreamId.SCREEN,
-                options.getSendStreamMeta(), options.getSendFrameMeta());
-        WifiSurfaceEncoder encoder = new WifiSurfaceEncoder(
-                screenCapture, streamer, options);
+            OutputStream outputStream = socket.getOutputStream();
 
-        runStream(socket, encoder, screenCapture::stop, "Screen");
+            // Pass null for VirtualDisplayListener for now — screen can run standalone.
+            ScreenCapture screenCapture = new ScreenCapture(null, options);
+            WifiStreamer streamer = new WifiStreamer(
+                    outputStream, options.getVideoCodec(), StreamId.SCREEN,
+                    options.getSendStreamMeta(), options.getSendFrameMeta());
+            WifiSurfaceEncoder encoder = new WifiSurfaceEncoder(
+                    screenCapture, streamer, options);
+
+            runStream(socket, encoder, screenCapture::stop, "Screen");
+        }
     }
 
     /**
